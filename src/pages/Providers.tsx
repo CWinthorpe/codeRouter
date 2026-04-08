@@ -7,14 +7,16 @@ import {
   RefreshCw,
   ChevronDown,
   ChevronRight,
-  CheckCircle2,
-  XCircle,
   Loader2,
   AlertTriangle,
+  CheckCircle2,
 } from 'lucide-react';
 import { useStore } from '../store';
+import { ActionButton } from '../components/ActionButton';
+import { Toast } from '../components/Toast';
 import {
   saveProvider,
+  toggleProviderEnabled,
   deleteProvider,
   testProviderConnection,
   refreshProviderModels,
@@ -156,8 +158,8 @@ export default function Providers() {
 
   const handleToggleEnabled = useCallback(
     async (provider: Provider) => {
-      const updated = { ...provider, enabled: !provider.enabled };
-      await saveProvider(updated, '');
+      const newEnabled = !provider.enabled;
+      await toggleProviderEnabled(provider.id, newEnabled);
       const allProviders = await (await import('../lib/ipc')).getProviders();
       setProviders(allProviders);
     },
@@ -342,29 +344,6 @@ function ProviderCard({
   );
 }
 
-function ActionButton({
-  icon,
-  label,
-  onClick,
-  disabled,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed"
-    >
-      {icon}
-      {label}
-    </button>
-  );
-}
-
 function ModelBrowser({ models, providerName }: { models: ProviderModel[]; providerName: string }) {
   if (models.length === 0) {
     return (
@@ -432,10 +411,10 @@ function ProviderModal({
   const [apiKey, setApiKey] = useState('');
   const [showApiKey, setShowApiKey] = useState(false);
   const [dailyTokenQuota, setDailyTokenQuota] = useState(
-    provider?.daily_token_quota != null ? String(provider.daily_token_quota) : '',
+    provider?.dailyTokenQuota != null ? String(provider.dailyTokenQuota) : '',
   );
   const [quotaResetUtcHour, setQuotaResetUtcHour] = useState(
-    provider?.quota_reset_utc_hour != null ? String(provider.quota_reset_utc_hour) : '0',
+    provider?.quotaResetUtcHour != null ? String(provider.quotaResetUtcHour) : '0',
   );
   const [enabled, setEnabled] = useState(provider?.enabled ?? true);
   const [saving, setSaving] = useState(false);
@@ -481,8 +460,8 @@ function ProviderModal({
         protocol,
         baseUrl: baseUrl.trim(),
         credentialKey: provider?.credentialKey ?? generateId(name),
-        daily_token_quota: dailyTokenQuota ? Number(dailyTokenQuota) : undefined,
-        quota_reset_utc_hour: hour,
+        dailyTokenQuota: dailyTokenQuota ? Number(dailyTokenQuota) : undefined,
+        quotaResetUtcHour: hour,
         enabled,
         models: provider?.models ?? [],
       };
@@ -530,7 +509,7 @@ function ProviderModal({
             <label className="mb-1 block text-sm font-medium text-zinc-300">Protocol Type</label>
             <select
               value={protocol}
-              onChange={(e) => setProtocol(e.target.value)}
+              onChange={(e) => setProtocol(e.target.value as 'openai' | 'anthropic')}
               className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
             >
               <option value="openai">OpenAI-compatible</option>
@@ -638,18 +617,6 @@ function ProviderModal({
           </div>
         </form>
       </div>
-    </div>
-  );
-}
-
-function Toast({ type, message }: { type: 'success' | 'error'; message: string }) {
-  const bgColor = type === 'success' ? 'bg-emerald-600' : 'bg-red-600';
-  const icon = type === 'success' ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />;
-
-  return (
-    <div className={`${bgColor} flex items-center gap-2 rounded-md px-4 py-3 text-sm text-white shadow-lg`}>
-      {icon}
-      <span>{message}</span>
     </div>
   );
 }

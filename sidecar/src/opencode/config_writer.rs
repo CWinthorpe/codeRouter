@@ -1,6 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+
+use fs2::FileExt;
+use std::os::unix::fs::PermissionsExt;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
@@ -16,6 +20,12 @@ pub struct AgentMapping {
     pub general: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explore: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -28,6 +38,59 @@ pub fn detect_opencode_config() -> Option<PathBuf> {
     let mut path = dirs::home_dir()?;
     path.push(".config/opencode/opencode.json");
     Some(path)
+}
+
+pub fn opencode_cache_path() -> Option<PathBuf> {
+    let mut path = dirs::config_dir()?;
+    path.push("coderouter/opencode.json");
+    Some(path)
+}
+
+pub fn save_opencode_cache(config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        return Ok(());
+    }
+    let cache_path = match opencode_cache_path() {
+        Some(p) => p,
+        None => return Ok(()),
+    };
+    if let Some(parent) = cache_path.parent() {
+        if !parent.exists() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let contents = fs::read_to_string(config_path)?;
+    fs::write(&cache_path, contents)?;
+    Ok(())
+}
+
+pub fn load_opencode_cache() -> Option<serde_json::Value> {
+    let cache_path = opencode_cache_path()?;
+    if !cache_path.exists() {
+        return None;
+    }
+    let contents = fs::read_to_string(&cache_path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+pub fn resolve_opencode_config_path(stored_path: Option<&str>) -> Option<PathBuf> {
+    if let Some(path) = stored_path {
+        if !path.is_empty() {
+            let p = PathBuf::from(path);
+            if p.exists() || p.parent().map(|p| p.exists()).unwrap_or(true) {
+                return Some(p);
+            }
+        }
+    }
+    detect_opencode_config()
+}
+
+pub fn save_opencode_config_path(path: &str) -> Result<()> {
+    use crate::config::store::{load_app_config, save_app_config};
+    let mut config = load_app_config().unwrap_or_default();
+    config.opencode_config_path = Some(path.to_string());
+    save_app_config(&config)?;
+    Ok(())
 }
 
 pub fn inject_provider(
@@ -98,7 +161,9 @@ pub fn inject_provider(
         }
     }
 
-    write_config(config_path, &config)
+    write_config(config_path, &config)?;
+    let _ = save_opencode_cache(config_path);
+    Ok(())
 }
 
 pub fn remove_provider(config_path: &Path) -> Result<()> {
@@ -125,6 +190,9 @@ pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()
         ("plan", &mapping.plan),
         ("general", &mapping.general),
         ("explore", &mapping.explore),
+        ("compaction", &mapping.compaction),
+        ("title", &mapping.title),
+        ("summary", &mapping.summary),
     ];
 
     for (agent_name, model_alias) in &agent_map {
@@ -278,6 +346,9 @@ pub fn preview_opencode_config(
             ("plan", &mapping.plan),
             ("general", &mapping.general),
             ("explore", &mapping.explore),
+            ("compaction", &mapping.compaction),
+            ("title", &mapping.title),
+            ("summary", &mapping.summary),
         ];
 
         for (agent_name, model_alias) in &agent_map {
@@ -340,8 +411,70 @@ fn write_config(config_path: &Path, config: &serde_json::Value) -> Result<()> {
     }
 
     let content = serde_json::to_string_pretty(config)?;
-    fs::write(config_path, content)?;
+    let tmp_path = config_path.with_extension(format!("tmp.{}", std::process::id()));
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp_path)?;
+
+    file.lock_exclusive()?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+    file.unlock()?;
+
+    let mut perms = file.metadata()?.permissions();
+    perms.set_mode(0o600);
+    file.set_permissions(perms)?;
+
+    fs::rename(&tmp_path, config_path)?;
+
+    if let Ok(metadata) = fs::metadata(config_path) {
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(config_path, perms)?;
+    }
+
     Ok(())
+}
+
+pub fn is_group_alias_referenced(group_alias: &str) -> bool {
+    let path = match detect_opencode_config() {
+        Some(p) => p,
+        None => return false,
+    };
+    if !path.exists() {
+        return false;
+    }
+    let Ok(contents) = fs::read_to_string(&path) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return false;
+    };
+    let Some(obj) = config.as_object() else {
+        return false;
+    };
+    let coderouter_model = format!("coderouter/{}", group_alias);
+    if let Some(serde_json::Value::Object(agents)) = obj.get("agent") {
+        for (_key, value) in agents {
+            if let serde_json::Value::Object(agent_config) = value {
+                if let Some(serde_json::Value::String(model)) = agent_config.get("model") {
+                    if model == &coderouter_model {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    if let Some(serde_json::Value::String(small)) = obj.get("small_model") {
+        if small == &coderouter_model {
+            return true;
+        }
+    }
+    false
 }
 
 fn json_str(s: &str) -> serde_json::Value {
@@ -650,6 +783,9 @@ mod tests {
             plan: Some("fast-model-router".to_string()),
             general: Some("glm-5-router".to_string()),
             explore: Some("fast-model-router".to_string()),
+            compaction: None,
+            title: None,
+            summary: None,
             small_model: Some("fast-model-router".to_string()),
         };
 
@@ -711,6 +847,9 @@ mod tests {
             plan: None,
             general: None,
             explore: None,
+            compaction: None,
+            title: None,
+            summary: None,
             small_model: Some("fast-model-router".to_string()),
         };
 
@@ -896,6 +1035,9 @@ mod tests {
             plan: None,
             general: None,
             explore: None,
+            compaction: None,
+            title: None,
+            summary: None,
             small_model: Some("fast-model-router".to_string()),
         };
 

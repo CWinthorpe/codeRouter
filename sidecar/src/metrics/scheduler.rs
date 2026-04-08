@@ -47,9 +47,8 @@ pub struct ProbeGuard<'a> {
 
 impl Drop for ProbeGuard<'_> {
     fn drop(&mut self) {
-        let _ = self.lock.in_flight.try_lock().map(|mut set| {
-            set.remove(&self.key);
-        });
+        let mut set = self.lock.in_flight.blocking_lock();
+        set.remove(&self.key);
     }
 }
 
@@ -106,19 +105,14 @@ fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
             };
 
             let reset_hour = provider.quota_reset_utc_hour;
-            let today_reset = now
+            let _today_reset = now
                 .date_naive()
                 .and_hms_opt(reset_hour, 0, 0)
                 .unwrap()
                 .and_local_timezone(Utc)
                 .single();
 
-            let should_reset = match today_reset {
-                Some(t) => now >= t,
-                None => now >= now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_local_timezone(Utc).single().unwrap(),
-            };
-
-            if should_reset {
+            if now >= entry_state.daily_reset_at {
                 entry_state.status = EntryStatus::Active;
                 entry_state.daily_tokens_used = 0;
                 let next_reset = now
@@ -155,28 +149,41 @@ async fn run_cooldown_check(
             Err(_) => return,
         };
 
-        for group in groups {
-            for (idx, entry) in group.entries.iter().enumerate() {
-                let key = router::entry_key(&entry.provider_id, idx as u32);
-                let entry_state = match guard.entries.get(&key) {
-                    Some(s) if s.status == EntryStatus::Cooldown => s,
-                    _ => continue,
-                };
+    for group in groups {
+        for (idx, entry) in group.entries.iter().enumerate() {
+            let key = router::entry_key(&entry.provider_id, idx as u32);
+            let entry_state = match guard.entries.get(&key) {
+                Some(s) if s.status == EntryStatus::Cooldown => s,
+                Some(s) if s.status == EntryStatus::QuotaExhausted => {
+                    if let Some(cooldown_until) = s.cooldown_until {
+                        if now >= cooldown_until {
+                            let provider = match providers.iter().find(|p| p.id == entry.provider_id) {
+                                Some(p) => p.clone(),
+                                None => continue,
+                            };
+                            let cooldown_duration = s.cooldown_duration_seconds.unwrap_or(BASE_COOLDOWN_SECONDS);
+                            probes.push((key.clone(), provider, cooldown_duration));
+                        }
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
 
-                let _cooldown_until = match entry_state.cooldown_until {
-                    Some(t) if now >= t => t,
-                    _ => continue,
-                };
+            let _cooldown_until = match entry_state.cooldown_until {
+                Some(t) if now >= t => t,
+                _ => continue,
+            };
 
-                let provider = match providers.iter().find(|p| p.id == entry.provider_id) {
-                    Some(p) => p.clone(),
-                    None => continue,
-                };
+            let provider = match providers.iter().find(|p| p.id == entry.provider_id) {
+                Some(p) => p.clone(),
+                None => continue,
+            };
 
-                let cooldown_duration = entry_state.cooldown_duration_seconds.unwrap_or(BASE_COOLDOWN_SECONDS);
-                probes.push((key.clone(), provider, cooldown_duration));
-            }
+            let cooldown_duration = entry_state.cooldown_duration_seconds.unwrap_or(BASE_COOLDOWN_SECONDS);
+            probes.push((key.clone(), provider, cooldown_duration));
         }
+    }
     }
 
     for (key, provider, cooldown_duration) in probes {
@@ -207,7 +214,7 @@ async fn run_probe(provider: &Provider, client: &Client) -> ProbeResult {
         "anthropic" => client
             .get(&models_url)
             .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01"),
+            .header("anthropic-version", "2024-06-01"),
         _ => client
             .get(&models_url)
             .header("Authorization", format!("Bearer {api_key}")),
@@ -309,13 +316,11 @@ pub fn set_entry_enabled(
         }
     }
 
-    if !enabled {
-        let mut updated_groups = (*groups).clone();
-        if let Some(g) = updated_groups.iter_mut().find(|g| g.id == group_id) {
-            g.entries[entry_index].enabled = false;
-        }
-        store::save_groups(&updated_groups).map_err(|e| e.to_string())?;
+    let mut updated_groups = (*groups).clone();
+    if let Some(g) = updated_groups.iter_mut().find(|g| g.id == group_id) {
+        g.entries[entry_index].enabled = enabled;
     }
+    store::save_groups(&updated_groups).map_err(|e| e.to_string())?;
 
     Ok(())
 }

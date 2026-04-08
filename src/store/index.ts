@@ -7,6 +7,7 @@ interface AppState {
   groups: Group[];
   appConfig: AppConfig | null;
   proxyStatus: ProxyStatus;
+  loadError: string | null;
   setProviders: (providers: Provider[]) => void;
   setGroups: (groups: Group[]) => void;
   setAppConfig: (config: AppConfig) => void;
@@ -19,6 +20,7 @@ export const useStore = create<AppState>((set) => ({
   groups: [],
   appConfig: null,
   proxyStatus: 'unknown',
+  loadError: null,
 
   setProviders: (providers) => set({ providers }),
   setGroups: (groups) => set({ groups }),
@@ -32,9 +34,11 @@ export const useStore = create<AppState>((set) => ({
         getGroups(),
         getAppConfig(),
       ]);
-      set({ providers, groups, appConfig });
-    } catch {
-      // IPC calls may fail when running outside Tauri (e.g. vite dev)
+      set({ providers, groups, appConfig, loadError: null });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error('loadInitialData failed:', message);
+      set({ loadError: message });
     }
   },
 }));

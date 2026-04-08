@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '../store';
 import { getDailySummary, getRecentRequests } from '../lib/ipc';
@@ -6,7 +6,6 @@ import { useGroupStatusPoll } from '../hooks/useGroupStatusPoll';
 import type { DailySummary, RequestRow, Provider, EntryStatusResponse } from '../types';
 import { Server, Power, Terminal, ChevronDown, ChevronRight, AlertTriangle, CheckCircle, MinusCircle } from 'lucide-react';
 
-const PROXY_HEALTH_URL = 'http://localhost:4141/health';
 const POLL_INTERVAL_MS = 5000;
 
 interface HealthData {
@@ -14,9 +13,10 @@ interface HealthData {
   uptime_seconds: number;
 }
 
-function useHealthPoll(proxyStatus: string) {
+function useHealthPoll(proxyStatus: string, proxyPort: number) {
   const [health, setHealth] = useState<HealthData | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const healthUrl = `http://localhost:${proxyPort}/health`;
 
   useEffect(() => {
     if (proxyStatus !== 'running') {
@@ -26,7 +26,7 @@ function useHealthPoll(proxyStatus: string) {
 
     const poll = async () => {
       try {
-        const res = await fetch(PROXY_HEALTH_URL, { signal: AbortSignal.timeout(3000) });
+        const res = await fetch(healthUrl, { signal: AbortSignal.timeout(3000) });
         if (res.ok) {
           const data = await res.json();
           setHealth(data);
@@ -44,7 +44,7 @@ function useHealthPoll(proxyStatus: string) {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [proxyStatus]);
+  }, [proxyStatus, healthUrl]);
 
   return health;
 }
@@ -82,7 +82,7 @@ function getEntryStatusCounts(entries: EntryStatusResponse[], providerId: string
   return {
     active: filtered.filter((e) => e.status === 'active').length,
     cooldown: filtered.filter((e) => e.status === 'cooldown').length,
-    disabled: filtered.filter((e) => e.status === 'disabled').length,
+    disabled: filtered.filter((e) => e.status === 'manually_disabled').length,
   };
 }
 
@@ -132,7 +132,7 @@ function StatusBadge({ status }: { status: string }) {
 
 function ProxyStatusCard() {
   const { proxyStatus, appConfig } = useStore((s) => ({ proxyStatus: s.proxyStatus, appConfig: s.appConfig }));
-  const health = useHealthPoll(proxyStatus);
+  const health = useHealthPoll(proxyStatus, appConfig?.proxy_port ?? 4141);
   const navigate = useNavigate();
 
   return (
@@ -192,7 +192,7 @@ function ProviderHealthCard({
   summary: DailySummary | null;
 }) {
   const overallStatus = getProviderOverallStatus(provider, entryCounts);
-  const quota = provider.daily_token_quota ?? null;
+  const quota = provider.dailyTokenQuota ?? null;
   const totalTokensToday = summary ? summary.total_prompt_tokens + summary.total_output_tokens : 0;
   const progressPct = quota && quota > 0 ? Math.min((totalTokensToday / quota) * 100, 100) : 0;
 
@@ -366,9 +366,8 @@ function RequestFeed() {
               const isExpanded = expandedId === req.id;
               const showExpand = req.status === 'error' || req.status === 'timeout' || req.error_type;
               return (
-                <>
+                <React.Fragment key={req.id}>
                   <tr
-                    key={req.id}
                     className={`cursor-pointer border-b border-zinc-800/50 transition-colors hover:bg-zinc-800/30 ${
                       isExpanded ? 'bg-zinc-800/20' : ''
                     }`}
@@ -407,7 +406,7 @@ function RequestFeed() {
                       </td>
                     </tr>
                   )}
-                </>
+                </React.Fragment>
               );
             })}
           </tbody>

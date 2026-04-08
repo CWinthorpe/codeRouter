@@ -242,7 +242,7 @@ export default function Settings() {
               <label className="mb-1 block text-sm font-medium text-zinc-300">Log verbosity</label>
               <select
                 value={form.log_verbosity}
-                onChange={(e) => updateField('log_verbosity', e.target.value)}
+                onChange={(e) => updateField('log_verbosity', e.target.value as 'Error' | 'Info' | 'Debug')}
                 className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 focus:border-zinc-500 focus:outline-none"
               >
                 {LOG_VERBOSITY_OPTIONS.map((v) => (
