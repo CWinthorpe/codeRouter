@@ -61,7 +61,6 @@ pub fn spawn_scheduler(
 ) -> (tokio::task::JoinHandle<()>, oneshot::Sender<()>) {
     let state_clone = router_state.clone();
     let groups_clone = groups.clone();
-    let _client_clone = client.clone();
 
     let probe_client = Client::builder()
         .timeout(Duration::from_secs(10))
@@ -128,12 +127,6 @@ fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
             };
 
             let reset_hour = provider.quota_reset_utc_hour.min(23);
-            let _today_reset = now
-                .date_naive()
-                .and_hms_opt(reset_hour, 0, 0)
-                .unwrap_or_else(|| now.date_naive().and_hms_opt(0, 0, 0).unwrap())
-                .and_local_timezone(Utc)
-                .single();
 
             if now >= entry_state.daily_reset_at {
                 entry_state.status = EntryStatus::Active;

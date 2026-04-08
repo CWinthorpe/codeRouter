@@ -36,7 +36,16 @@ echo "Sidecar binary copied to $BINARIES_DIR/$SIDECAR_TRIPLE"
 
 echo "=== Step 3: Running tauri build ==="
 cd "$PROJECT_ROOT"
-export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
+if [ -d "/usr/lib/x86_64-linux-gnu/pkgconfig" ]; then
+  export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
+elif [ -d "/usr/lib/aarch64-linux-gnu/pkgconfig" ]; then
+  export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+elif [ -d "/usr/lib64/pkgconfig" ]; then
+  export PKG_CONFIG_PATH=/usr/lib64/pkgconfig
+elif [ -d "/usr/lib/pkgconfig" ]; then
+  export PKG_CONFIG_PATH=/usr/lib/pkgconfig
+fi
+npm install
 npm run tauri build
 
 echo ""

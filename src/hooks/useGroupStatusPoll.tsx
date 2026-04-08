@@ -6,14 +6,20 @@ const POLL_INTERVAL_MS = 5000;
 
 interface GroupStatusContextValue {
   statusData: RouterStatusResponse;
+  loading: boolean;
+  error: string | null;
 }
 
 const GroupStatusContext = createContext<GroupStatusContextValue>({
   statusData: { entries: [] },
+  loading: true,
+  error: null,
 });
 
 export function GroupStatusProvider({ children }: { children: ReactNode }) {
   const [statusData, setStatusData] = useState<RouterStatusResponse>({ entries: [] });
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
@@ -21,8 +27,13 @@ export function GroupStatusProvider({ children }: { children: ReactNode }) {
       try {
         const data = await getRouterStatus();
         setStatusData(data);
-      } catch {
-        // IPC may fail
+        setError(null);
+      } catch (e: unknown) {
+        if (loading) {
+          setError(e instanceof Error ? e.message : 'Failed to fetch router status');
+        }
+      } finally {
+        setLoading(false);
       }
     };
 
@@ -32,10 +43,10 @@ export function GroupStatusProvider({ children }: { children: ReactNode }) {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, []);
+  }, [loading]);
 
   return (
-    <GroupStatusContext.Provider value={{ statusData }}>
+    <GroupStatusContext.Provider value={{ statusData, loading, error }}>
       {children}
     </GroupStatusContext.Provider>
   );

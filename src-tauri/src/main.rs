@@ -133,7 +133,7 @@ fn main() {
         .setup(|app| {
             let app_handle = app.handle().clone();
 
-            let active_icon = make_icon(false).expect("Failed to load tray icon");
+            let inactive_icon = make_icon(false).expect("Failed to load tray icon");
             let (menu, proxy_status_item, toggle_proxy_item) = build_menu(&app_handle, false)?;
 
             app.manage(AppState {
@@ -145,7 +145,7 @@ fn main() {
             });
 
             let _tray = TrayIconBuilder::with_id("main_tray")
-                .icon(active_icon)
+                .icon(inactive_icon)
                 .tooltip("CodeRouter")
                 .menu(&menu)
                 .on_menu_event(move |app, event| {
