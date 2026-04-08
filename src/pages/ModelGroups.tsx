@@ -7,28 +7,30 @@ import {
   GripVertical,
   ChevronDown,
   ChevronUp,
-  CheckCircle2,
   AlertTriangle,
-  XCircle,
   Loader2,
   Clock,
   Zap,
   Ban,
   Settings2,
   Activity,
+  CheckCircle2,
+  XCircle,
 } from 'lucide-react';
 import { useStore } from '../store';
-import { saveGroup, deleteGroup, getGroups, setEntryEnabled } from '../lib/ipc';
+import { ActionButton } from '../components/ActionButton';
+import { Toast } from '../components/Toast';
+import { saveGroup, deleteGroup, getGroups, setEntryEnabled, isGroupReferencedInOpencode } from '../lib/ipc';
 import { useGroupStatusPoll } from '../hooks/useGroupStatusPoll';
 import type { Group, GroupEntry, FailoverConfig, Provider, EntryStatusResponse } from '../types';
 
 const DEFAULT_FAILOVER: FailoverConfig = {
-  on_429: true,
-  on_quota_exhausted: true,
-  on_consecutive_errors: true,
-  consecutive_error_threshold: 5,
-  on_latency_timeout: true,
-  latency_timeout_ms: 30000,
+  on429: true,
+  onQuotaExhausted: true,
+  onConsecutiveErrors: true,
+  consecutiveErrorThreshold: 5,
+  onLatencyTimeout: true,
+  latencyTimeoutMs: 30000,
 };
 
 function formatNumber(n?: number): string {
@@ -139,7 +141,12 @@ export default function ModelGroups() {
 
   const handleDelete = useCallback(
     async (group: Group) => {
-      const openCodeRef = false;
+      let openCodeRef = false;
+      try {
+        openCodeRef = await isGroupReferencedInOpencode(group.alias);
+      } catch {
+        // IPC may fail
+      }
       let message = `Are you sure you want to delete "${group.displayName || group.alias}"?`;
       if (openCodeRef) {
         message += '\n\nWarning: This group is referenced in your OpenCode configuration.';
@@ -273,8 +280,17 @@ function GroupCard({
   }, [statusData.entries]);
 
   const activeEntry = useMemo(() => {
-    return statusData.entries.find((e) => e.status === 'active' && e.entry_index === 0) ?? statusData.entries.find((e) => e.status === 'active');
-  }, [statusData.entries]);
+    const activeEntries = statusData.entries.filter((e) => e.status === 'active');
+    if (activeEntries.length === 0) return undefined;
+    const indexMap = new Map<number, EntryStatusResponse>();
+    statusData.entries.forEach((e) => indexMap.set(e.entry_index, e));
+    const sortedByPriority = [...group.entries]
+      .map((entry, idx) => ({ entry, idx }))
+      .filter(({ idx }) => indexMap.get(idx)?.status === 'active')
+      .sort((a, b) => a.entry.priority - b.entry.priority);
+    if (sortedByPriority.length === 0) return activeEntries[0];
+    return indexMap.get(sortedByPriority[0].idx);
+  }, [statusData.entries, group.entries]);
 
   const providerNameForEntry = useCallback(
     (providerId: string) => {
@@ -348,29 +364,6 @@ function HealthBadge({ label, count, color }: { label: string; count: number; co
   );
 }
 
-function ActionButton({
-  icon,
-  label,
-  onClick,
-  disabled,
-}: {
-  icon: React.ReactNode;
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-800 hover:text-zinc-100 disabled:opacity-50 disabled:cursor-not-allowed"
-    >
-      {icon}
-      {label}
-    </button>
-  );
-}
-
 function LiveStatusPanel({
   groupId,
   entries,
@@ -420,7 +413,7 @@ function LiveStatusPanel({
           const st = statusByIndex.get(idx);
           const status = st?.status ?? (entry.enabled ? 'active' : 'manually_disabled');
           const toggleKey = `${groupId}-${idx}`;
-          const quota = entry.daily_token_quota_override;
+          const quota = entry.dailyTokenQuotaOverride;
           const tokensUsed = st?.daily_tokens_used ?? 0;
 
           return (
@@ -549,7 +542,7 @@ function GroupForm({
       providerId: addProviderId,
       modelId: addModelId,
       priority: entries.length + 1,
-      daily_token_quota_override: addQuotaOverride ? Number(addQuotaOverride) : undefined,
+      dailyTokenQuotaOverride: addQuotaOverride ? Number(addQuotaOverride) : undefined,
       enabled: true,
       status: 'active',
     };
@@ -574,7 +567,7 @@ function GroupForm({
     setEntries((prev) =>
       prev.map((e, i) =>
         i === idx
-          ? { ...e, daily_token_quota_override: value ? Number(value) : undefined }
+          ? { ...e, dailyTokenQuotaOverride: value ? Number(value) : undefined }
           : e,
       ),
     );
@@ -727,7 +720,7 @@ function GroupForm({
                     <div className="flex items-center gap-2">
                       <input
                         type="number"
-                        value={entry.daily_token_quota_override ?? ''}
+                        value={entry.dailyTokenQuotaOverride ?? ''}
                         onChange={(e) => handleQuotaChange(idx, e.target.value)}
                         placeholder="Quota override"
                         className="w-28 rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-100 placeholder-zinc-600 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
@@ -847,29 +840,29 @@ function GroupForm({
                 <div className="flex flex-col gap-4">
                   <ToggleRow
                     label="Failover on 429 / rate limit"
-                    checked={failoverConfig.on_429}
-                    onChange={(v) => setFailoverConfig((c) => ({ ...c, on_429: v }))}
+                    checked={failoverConfig.on429}
+                    onChange={(v) => setFailoverConfig((c) => ({ ...c, on429: v }))}
                   />
                   <ToggleRow
                     label="Failover on daily quota exhausted"
-                    checked={failoverConfig.on_quota_exhausted}
-                    onChange={(v) => setFailoverConfig((c) => ({ ...c, on_quota_exhausted: v }))}
+                    checked={failoverConfig.onQuotaExhausted}
+                    onChange={(v) => setFailoverConfig((c) => ({ ...c, onQuotaExhausted: v }))}
                   />
                   <ToggleRow
                     label="Failover on consecutive errors"
-                    checked={failoverConfig.on_consecutive_errors}
-                    onChange={(v) => setFailoverConfig((c) => ({ ...c, on_consecutive_errors: v }))}
+                    checked={failoverConfig.onConsecutiveErrors}
+                    onChange={(v) => setFailoverConfig((c) => ({ ...c, onConsecutiveErrors: v }))}
                   />
-                  {failoverConfig.on_consecutive_errors && (
+                  {failoverConfig.onConsecutiveErrors && (
                     <div className="ml-7">
                       <label className="mb-1 block text-xs font-medium text-zinc-400">Error threshold</label>
                       <input
                         type="number"
-                        value={failoverConfig.consecutive_error_threshold}
+                        value={failoverConfig.consecutiveErrorThreshold}
                         onChange={(e) =>
                           setFailoverConfig((c) => ({
                             ...c,
-                            consecutive_error_threshold: Math.max(1, Number(e.target.value)),
+                            consecutiveErrorThreshold: Math.max(1, Number(e.target.value)),
                           }))
                         }
                         className="w-24 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
@@ -879,19 +872,19 @@ function GroupForm({
                   )}
                   <ToggleRow
                     label="Failover on latency timeout"
-                    checked={failoverConfig.on_latency_timeout}
-                    onChange={(v) => setFailoverConfig((c) => ({ ...c, on_latency_timeout: v }))}
+                    checked={failoverConfig.onLatencyTimeout}
+                    onChange={(v) => setFailoverConfig((c) => ({ ...c, onLatencyTimeout: v }))}
                   />
-                  {failoverConfig.on_latency_timeout && (
+                  {failoverConfig.onLatencyTimeout && (
                     <div className="ml-7">
                       <label className="mb-1 block text-xs font-medium text-zinc-400">Timeout (ms)</label>
                       <input
                         type="number"
-                        value={failoverConfig.latency_timeout_ms}
+                        value={failoverConfig.latencyTimeoutMs}
                         onChange={(e) =>
                           setFailoverConfig((c) => ({
                             ...c,
-                            latency_timeout_ms: Math.max(1000, Number(e.target.value)),
+                            latencyTimeoutMs: Math.max(1000, Number(e.target.value)),
                           }))
                         }
                         className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
@@ -955,18 +948,6 @@ function ToggleRow({
         />
         <div className="peer h-5 w-9 rounded-full bg-zinc-700 after:absolute after:start-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:border after:border-zinc-600 after:bg-zinc-400 after:transition-all peer-checked:bg-emerald-600 peer-checked:after:translate-x-full peer-checked:after:border-white peer-focus:outline-none" />
       </label>
-    </div>
-  );
-}
-
-function Toast({ type, message }: { type: 'success' | 'error'; message: string }) {
-  const bgColor = type === 'success' ? 'bg-emerald-600' : 'bg-red-600';
-  const icon = type === 'success' ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />;
-
-  return (
-    <div className={`${bgColor} flex items-center gap-2 rounded-md px-4 py-3 text-sm text-white shadow-lg`}>
-      {icon}
-      <span>{message}</span>
     </div>
   );
 }

@@ -24,9 +24,9 @@ pub struct Provider {
     pub base_url: String,
     #[serde(rename = "credentialKey")]
     pub credential_key: String,
-    #[serde(default)]
+    #[serde(default, rename = "dailyTokenQuota")]
     pub daily_token_quota: Option<u64>,
-    #[serde(default = "default_quota_reset_hour")]
+    #[serde(default = "default_quota_reset_hour", rename = "quotaResetUtcHour")]
     pub quota_reset_utc_hour: u32,
     #[serde(default = "default_true")]
     pub enabled: bool,
@@ -51,13 +51,13 @@ pub struct GroupEntry {
     #[serde(rename = "modelId")]
     pub model_id: String,
     pub priority: u32,
-    #[serde(default)]
+    #[serde(default, rename = "dailyTokenQuotaOverride")]
     pub daily_token_quota_override: Option<u64>,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_active_status")]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, rename = "cooldownUntil")]
     pub cooldown_until: Option<String>,
 }
 
@@ -67,17 +67,20 @@ fn default_active_status() -> String {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct FailoverConfig {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", rename = "on429")]
     pub on_429: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", rename = "onQuotaExhausted")]
     pub on_quota_exhausted: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", rename = "onConsecutiveErrors")]
     pub on_consecutive_errors: bool,
-    #[serde(default = "default_error_threshold")]
+    #[serde(
+        default = "default_error_threshold",
+        rename = "consecutiveErrorThreshold"
+    )]
     pub consecutive_error_threshold: u32,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", rename = "onLatencyTimeout")]
     pub on_latency_timeout: bool,
-    #[serde(default = "default_latency_timeout_ms")]
+    #[serde(default = "default_latency_timeout_ms", rename = "latencyTimeoutMs")]
     pub latency_timeout_ms: u64,
 }
 
@@ -110,6 +113,8 @@ pub struct AppConfig {
     pub refresh_interval_hours: u32,
     #[serde(default = "default_log_verbosity")]
     pub log_verbosity: String,
+    #[serde(default)]
+    pub opencode_config_path: Option<String>,
 }
 
 fn default_proxy_port() -> u16 {
@@ -135,6 +140,7 @@ impl Default for AppConfig {
             proxy_host: default_proxy_host(),
             refresh_interval_hours: default_refresh_interval(),
             log_verbosity: default_log_verbosity(),
+            opencode_config_path: None,
         }
     }
 }

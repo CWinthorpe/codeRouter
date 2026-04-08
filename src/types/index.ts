@@ -1,3 +1,11 @@
+export type Protocol = 'openai' | 'anthropic';
+
+export type EntryStatus = 'active' | 'cooldown' | 'manually_disabled' | 'quota_exhausted';
+
+export type LogVerbosity = 'Error' | 'Info' | 'Debug';
+
+export type RequestStatus = 'success' | 'error' | 'timeout' | 'failover';
+
 export interface ProviderModel {
   id: string;
   context_window?: number;
@@ -10,11 +18,11 @@ export interface ProviderModel {
 export interface Provider {
   id: string;
   name: string;
-  protocol: string;
+  protocol: Protocol;
   baseUrl: string;
   credentialKey: string;
-  daily_token_quota?: number;
-  quota_reset_utc_hour: number;
+  dailyTokenQuota?: number;
+  quotaResetUtcHour: number;
   enabled: boolean;
   models: ProviderModel[];
 }
@@ -23,19 +31,19 @@ export interface GroupEntry {
   providerId: string;
   modelId: string;
   priority: number;
-  daily_token_quota_override?: number;
+  dailyTokenQuotaOverride?: number;
   enabled: boolean;
-  status: string;
-  cooldown_until?: string;
+  status: EntryStatus;
+  cooldownUntil?: string;
 }
 
 export interface FailoverConfig {
-  on_429: boolean;
-  on_quota_exhausted: boolean;
-  on_consecutive_errors: boolean;
-  consecutive_error_threshold: number;
-  on_latency_timeout: boolean;
-  latency_timeout_ms: number;
+  on429: boolean;
+  onQuotaExhausted: boolean;
+  onConsecutiveErrors: boolean;
+  consecutiveErrorThreshold: number;
+  onLatencyTimeout: boolean;
+  latencyTimeoutMs: number;
 }
 
 export interface Group {
@@ -50,7 +58,7 @@ export interface AppConfig {
   proxy_port: number;
   proxy_host: string;
   refresh_interval_hours: number;
-  log_verbosity: string;
+  log_verbosity: LogVerbosity;
 }
 
 export type ProxyStatus = 'running' | 'stopped' | 'unknown';
@@ -62,7 +70,7 @@ export interface EntryStatusResponse {
   model_id: string;
   priority: number;
   entry_index: number;
-  status: string;
+  status: EntryStatus;
   cooldown_until?: string;
   consecutive_errors: number;
   daily_tokens_used: number;
@@ -92,6 +100,6 @@ export interface RequestRow {
   output_tokens: number;
   cost_usd: number;
   latency_ms: number;
-  status: string;
+  status: RequestStatus;
   error_type: string | null;
 }

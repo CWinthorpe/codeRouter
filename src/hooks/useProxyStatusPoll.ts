@@ -1,17 +1,19 @@
 import { useEffect, useRef } from 'react';
 import { useStore } from '../store';
 
-const PROXY_HEALTH_URL = 'http://localhost:4141/health';
 const POLL_INTERVAL_MS = 5000;
 
 export function useProxyStatusPoll() {
   const setProxyStatus = useStore((s) => s.setProxyStatus);
+  const appConfig = useStore((s) => s.appConfig);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const proxyPort = appConfig?.proxy_port ?? 4141;
+  const healthUrl = `http://localhost:${proxyPort}/health`;
 
   useEffect(() => {
     const poll = async () => {
       try {
-        const res = await fetch(PROXY_HEALTH_URL, { signal: AbortSignal.timeout(3000) });
+        const res = await fetch(healthUrl, { signal: AbortSignal.timeout(3000) });
         if (res.ok) {
           setProxyStatus('running');
         } else {
@@ -28,5 +30,5 @@ export function useProxyStatusPoll() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [setProxyStatus]);
+  }, [setProxyStatus, healthUrl]);
 }

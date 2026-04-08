@@ -11,12 +11,15 @@ import {
   Code2,
 } from 'lucide-react';
 import { useStore } from '../store';
+import { Toast } from '../components/Toast';
 import {
   getOpencodeConfigPath,
+  setOpencodeConfigPath,
   injectOpencodeProvider,
   removeOpencodeProvider,
   setOpencodeAgentModels,
   removeOpencodeAgentModels,
+  removeCoderouterFromOpencode,
   previewOpencodeConfig,
   type OpenCodeAgentMapping,
 } from '../lib/ipc';
@@ -26,12 +29,15 @@ const AGENT_LABELS: Record<string, string> = {
   plan: 'Plan agent',
   general: 'General subagent',
   explore: 'Explore subagent',
+  compaction: 'Compaction (system)',
+  title: 'Title (system)',
+  summary: 'Summary (system)',
 };
 
-const AGENT_KEYS = ['build', 'plan', 'general', 'explore'] as const;
+const AGENT_KEYS = ['build', 'plan', 'general', 'explore', 'compaction', 'title', 'summary'] as const;
 
 function emptyMapping(): OpenCodeAgentMapping {
-  return { build: null, plan: null, general: null, explore: null, small_model: null };
+  return { build: null, plan: null, general: null, explore: null, compaction: null, title: null, summary: null, small_model: null };
 }
 
 export default function OpenCodeSetup() {
@@ -55,6 +61,8 @@ export default function OpenCodeSetup() {
   const [previewLoading, setPreviewLoading] = useState(false);
 
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
+
+  const [removing, setRemoving] = useState(false);
 
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -88,20 +96,12 @@ export default function OpenCodeSetup() {
       plan: mapping.plan || null,
       general: mapping.general || null,
       explore: mapping.explore || null,
+      compaction: mapping.compaction || null,
+      title: mapping.title || null,
+      summary: mapping.summary || null,
       small_model: mapping.small_model || null,
     };
   }, [mapping]);
-
-  // Debounced preview update
-  useEffect(() => {
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    debounceRef.current = setTimeout(() => {
-      fetchPreview();
-    }, 500);
-    return () => {
-      if (debounceRef.current) clearTimeout(debounceRef.current);
-    };
-  }, [mapping, groups, proxyPort]);
 
   const fetchPreview = useCallback(async () => {
     setPreviewLoading(true);
@@ -116,6 +116,17 @@ export default function OpenCodeSetup() {
       setPreviewLoading(false);
     }
   }, [mappingForPreview, proxyPort]);
+
+  // Debounced preview update
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => {
+      fetchPreview();
+    }, 500);
+    return () => {
+      if (debounceRef.current) clearTimeout(debounceRef.current);
+    };
+  }, [mapping, groups, proxyPort, fetchPreview]);
 
   // Initial preview fetch
   useEffect(() => {
@@ -204,6 +215,17 @@ export default function OpenCodeSetup() {
                 type="text"
                 value={manualPath}
                 onChange={(e) => setManualPath(e.target.value)}
+                onBlur={async () => {
+                  if (manualPath && manualPath !== configPath) {
+                    try {
+                      await setOpencodeConfigPath(manualPath);
+                      setConfigPath(manualPath);
+                      addToast('success', 'Config path saved');
+                    } catch {
+                      addToast('error', 'Failed to save config path');
+                    }
+                  }
+                }}
                 placeholder="~/.config/opencode/opencode.json"
                 className="flex-1 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
               />
@@ -250,6 +272,28 @@ export default function OpenCodeSetup() {
               )}
               {providerEnabled ? 'Configured' : 'Not configured'}
             </span>
+          </div>
+
+          <div className="mt-4 flex items-center gap-3">
+            <button
+              onClick={async () => {
+                setRemoving(true);
+                try {
+                  await removeCoderouterFromOpencode();
+                  setProviderEnabled(false);
+                  addToast('success', 'CodeRouter removed from OpenCode config');
+                } catch (e: unknown) {
+                  addToast('error', e instanceof Error ? e.message : String(e));
+                } finally {
+                  setRemoving(false);
+                }
+              }}
+              disabled={removing}
+              className="flex items-center gap-2 rounded-md border border-red-800 bg-red-900/30 px-4 py-2 text-sm font-medium text-red-300 transition-colors hover:bg-red-900/50 disabled:opacity-50"
+            >
+              {removing && <Loader2 className="h-4 w-4 animate-spin" />}
+              Remove CodeRouter from OpenCode config
+            </button>
           </div>
         </SectionCard>
 
@@ -367,17 +411,5 @@ export default function OpenCodeSetup() {
 function SectionCard({ children }: { children: React.ReactNode }) {
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-5">{children}</div>
-  );
-}
-
-function Toast({ type, message }: { type: 'success' | 'error'; message: string }) {
-  const bgColor = type === 'success' ? 'bg-emerald-600' : 'bg-red-600';
-  const icon = type === 'success' ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />;
-
-  return (
-    <div className={`${bgColor} flex items-center gap-2 rounded-md px-4 py-3 text-sm text-white shadow-lg`}>
-      {icon}
-      <span>{message}</span>
-    </div>
   );
 }

@@ -80,6 +80,75 @@ function generateColors(n: number): string[] {
   return Array.from({ length: n }, (_, i) => palette[i % palette.length]);
 }
 
+function SortHeader({ column, children, sortColumn, sortDirection, onSort }: { column: keyof RequestRow; children: React.ReactNode; sortColumn: keyof RequestRow; sortDirection: 'asc' | 'desc'; onSort: (column: keyof RequestRow) => void }) {
+  return (
+    <th
+      className="cursor-pointer select-none px-4 py-3 text-xs uppercase text-zinc-500 hover:text-zinc-300"
+      onClick={() => onSort(column)}
+    >
+      <span className="inline-flex items-center gap-1">
+        {children}
+        {sortColumn === column && (
+          <span className="text-zinc-300">{sortDirection === 'asc' ? '↑' : '↓'}</span>
+        )}
+      </span>
+    </th>
+  );
+}
+
+function FilterDropdown({
+  label,
+  options,
+  selected,
+  show,
+  onToggle,
+  onToggleOption,
+}: {
+  label: string;
+  options: string[];
+  selected: string[];
+  show: boolean;
+  onToggle: () => void;
+  onToggleOption: (value: string) => void;
+}) {
+  return (
+    <div className="relative">
+      <button
+        onClick={onToggle}
+        className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm transition-colors ${
+          selected.length > 0
+            ? 'border-blue-500/50 bg-blue-500/10 text-blue-400'
+            : 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:border-zinc-600'
+        }`}
+      >
+        <Filter className="h-3.5 w-3.5" />
+        {label}
+        {selected.length > 0 && (
+          <span className="rounded-full bg-blue-500/30 px-1.5 text-xs">{selected.length}</span>
+        )}
+      </button>
+      {show && (
+        <div className="absolute left-0 top-full z-50 mt-1 w-56 rounded-md border border-zinc-700 bg-zinc-800 p-2 shadow-xl">
+          {options.length === 0 && (
+            <p className="px-2 py-1 text-xs text-zinc-500">No options available</p>
+          )}
+          {options.map((opt) => (
+            <label key={opt} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-700">
+              <input
+                type="checkbox"
+                checked={selected.includes(opt)}
+                onChange={() => onToggleOption(opt)}
+                className="accent-blue-500"
+              />
+              <span className="truncate">{opt}</span>
+            </label>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function UsageMetrics() {
   const [preset, setPreset] = useState<Preset>('last7');
   const [customStart, setCustomStart] = useState(formatDate(new Date(Date.now() - 7 * 86400000)));
@@ -91,7 +160,7 @@ export default function UsageMetrics() {
   const [filterGroups, setFilterGroups] = useState<string[]>([]);
   const [filterStatuses, setFilterStatuses] = useState<string[]>([]);
 
-  const [sortColumn, setSortColumn] = useState<string>('ts');
+  const [sortColumn, setSortColumn] = useState<keyof RequestRow>('ts');
   const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
 
   const [page, setPage] = useState(1);
@@ -144,9 +213,8 @@ export default function UsageMetrics() {
 
   const sortedRequests = useMemo(() => {
     return [...filteredRequests].sort((a, b) => {
-      const col = sortColumn as keyof RequestRow;
-      const aVal = a[col];
-      const bVal = b[col];
+      const aVal = a[sortColumn];
+      const bVal = b[sortColumn];
       if (aVal == null && bVal == null) return 0;
       if (aVal == null) return sortDirection === 'asc' ? 1 : -1;
       if (bVal == null) return sortDirection === 'asc' ? -1 : 1;
@@ -170,7 +238,7 @@ export default function UsageMetrics() {
     setPage(1);
   }, [dateRange, filterProviders, filterGroups, filterStatuses, sortColumn, sortDirection]);
 
-  const handleSort = (column: string) => {
+  const handleSort = (column: keyof RequestRow) => {
     if (sortColumn === column) {
       setSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
     } else {
@@ -267,71 +335,6 @@ export default function UsageMetrics() {
   const uniqueProviders = useMemo(() => [...new Set(allRequests.map((r) => r.provider_id))].sort(), [allRequests]);
   const uniqueGroups = useMemo(() => [...new Set(allRequests.map((r) => r.group_alias))].sort(), [allRequests]);
   const uniqueStatuses = useMemo(() => [...new Set(allRequests.map((r) => r.status))].sort(), [allRequests]);
-
-  const SortHeader = ({ column, children }: { column: string; children: React.ReactNode }) => (
-    <th
-      className="cursor-pointer select-none px-4 py-3 text-xs uppercase text-zinc-500 hover:text-zinc-300"
-      onClick={() => handleSort(column)}
-    >
-      <span className="inline-flex items-center gap-1">
-        {children}
-        {sortColumn === column && (
-          <span className="text-zinc-300">{sortDirection === 'asc' ? '↑' : '↓'}</span>
-        )}
-      </span>
-    </th>
-  );
-
-  const FilterDropdown = ({
-    label,
-    options,
-    selected,
-    show,
-    onToggle,
-    onToggleOption,
-  }: {
-    label: string;
-    options: string[];
-    selected: string[];
-    show: boolean;
-    onToggle: () => void;
-    onToggleOption: (value: string) => void;
-  }) => (
-    <div className="relative">
-      <button
-        onClick={onToggle}
-        className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm transition-colors ${
-          selected.length > 0
-            ? 'border-blue-500/50 bg-blue-500/10 text-blue-400'
-            : 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:border-zinc-600'
-        }`}
-      >
-        <Filter className="h-3.5 w-3.5" />
-        {label}
-        {selected.length > 0 && (
-          <span className="rounded-full bg-blue-500/30 px-1.5 text-xs">{selected.length}</span>
-        )}
-      </button>
-      {show && (
-        <div className="absolute left-0 top-full z-50 mt-1 w-56 rounded-md border border-zinc-700 bg-zinc-800 p-2 shadow-xl">
-          {options.length === 0 && (
-            <p className="px-2 py-1 text-xs text-zinc-500">No options available</p>
-          )}
-          {options.map((opt) => (
-            <label key={opt} className="flex cursor-pointer items-center gap-2 rounded px-2 py-1 text-sm hover:bg-zinc-700">
-              <input
-                type="checkbox"
-                checked={selected.includes(opt)}
-                onChange={() => onToggleOption(opt)}
-                className="accent-blue-500"
-              />
-              <span className="truncate">{opt}</span>
-            </label>
-          ))}
-        </div>
-      )}
-    </div>
-  );
 
   return (
     <div className="mx-auto max-w-7xl space-y-6">
@@ -523,16 +526,16 @@ export default function UsageMetrics() {
               <table className="w-full text-left text-sm">
                 <thead>
                   <tr className="border-b border-zinc-800">
-                    <SortHeader column="ts">Timestamp</SortHeader>
-                    <SortHeader column="group_alias">Group</SortHeader>
-                    <SortHeader column="provider_id">Provider</SortHeader>
-                    <SortHeader column="model_id">Model</SortHeader>
-                    <SortHeader column="prompt_tokens">Prompt Tokens</SortHeader>
-                    <SortHeader column="output_tokens">Output Tokens</SortHeader>
-                    <SortHeader column="cost_usd">Cost</SortHeader>
-                    <SortHeader column="latency_ms">Latency (ms)</SortHeader>
-                    <SortHeader column="status">Status</SortHeader>
-                    <SortHeader column="error_type">Error</SortHeader>
+                    <SortHeader column="ts" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Timestamp</SortHeader>
+                    <SortHeader column="group_alias" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Group</SortHeader>
+                    <SortHeader column="provider_id" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Provider</SortHeader>
+                    <SortHeader column="model_id" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Model</SortHeader>
+                    <SortHeader column="prompt_tokens" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Prompt Tokens</SortHeader>
+                    <SortHeader column="output_tokens" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Output Tokens</SortHeader>
+                    <SortHeader column="cost_usd" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Cost</SortHeader>
+                    <SortHeader column="latency_ms" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Latency (ms)</SortHeader>
+                    <SortHeader column="status" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Status</SortHeader>
+                    <SortHeader column="error_type" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Error</SortHeader>
                   </tr>
                 </thead>
                 <tbody>

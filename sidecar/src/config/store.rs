@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+use std::os::unix::fs::PermissionsExt;
 
 use crate::config::models::{AppConfig, Group, Provider};
 
@@ -29,7 +30,7 @@ fn config_file(name: &str) -> PathBuf {
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
 
     if let Some(parent) = path.parent() {
         if !parent.exists() {
@@ -49,7 +50,18 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     file.sync_all()?;
     file.unlock()?;
 
+    let mut perms = file.metadata()?.permissions();
+    perms.set_mode(0o600);
+    file.set_permissions(perms)?;
+
     fs::rename(&tmp_path, path)?;
+
+    // Ensure the final file also has 0600 permissions (rename preserves perms, but be explicit)
+    if let Ok(metadata) = fs::metadata(path) {
+        let mut perms = metadata.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(path, perms)?;
+    }
 
     Ok(())
 }
@@ -259,6 +271,7 @@ mod tests {
             proxy_host: "0.0.0.0".to_string(),
             refresh_interval_hours: 12,
             log_verbosity: "Debug".to_string(),
+            opencode_config_path: None,
         };
         let config_path = test_dir.join("config.json");
 

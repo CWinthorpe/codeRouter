@@ -6,6 +6,7 @@ use coderouter_proxy::metrics::queries;
 use coderouter_proxy::metrics::scheduler;
 use coderouter_proxy::opencode::config_writer::{self, AgentMapping};
 use coderouter_proxy::proxy::router;
+use coderouter_proxy::proxy::ssrf;
 use chrono::NaiveDate;
 use reqwest::Client;
 use rusqlite::Connection;
@@ -38,9 +39,9 @@ pub struct ProviderResponse {
     pub base_url: String,
     #[serde(rename = "credentialKey")]
     pub credential_key: String,
-    #[serde(default)]
+    #[serde(default, rename = "dailyTokenQuota")]
     pub daily_token_quota: Option<u64>,
-    #[serde(default)]
+    #[serde(default, rename = "quotaResetUtcHour")]
     pub quota_reset_utc_hour: u32,
     #[serde(default)]
     pub enabled: bool,
@@ -94,6 +95,8 @@ pub async fn get_providers() -> Result<Vec<ProviderResponse>, String> {
 
 #[tauri::command]
 pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), String> {
+    ssrf::validate_base_url(&provider.base_url)?;
+
     let mut providers = store::load_providers().unwrap_or_default();
 
     if let Some(pos) = providers.iter().position(|p| p.id == provider.id) {
@@ -104,11 +107,22 @@ pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), St
 
     store::save_providers(&providers).map_err(|e| e.to_string())?;
 
-    keychain::store_credential(&provider.id, &api_key)
-        .await
-        .map_err(|e| e.to_string())?;
+    if !api_key.is_empty() {
+        keychain::store_credential(&provider.id, &api_key)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     Ok(())
+}
+
+#[tauri::command]
+pub async fn toggle_provider_enabled(provider_id: String, enabled: bool) -> Result<(), String> {
+    let mut providers = store::load_providers().map_err(|e| e.to_string())?;
+    if let Some(provider) = providers.iter_mut().find(|p| p.id == provider_id) {
+        provider.enabled = enabled;
+    }
+    store::save_providers(&providers).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -192,7 +206,7 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
         "anthropic" => client
             .get(&models_url)
             .header("x-api-key", &api_key)
-            .header("anthropic-version", "2023-06-01"),
+            .header("anthropic-version", "2024-06-01"),
         _ => client
             .get(&models_url)
             .header("Authorization", format!("Bearer {}", api_key)),
@@ -314,6 +328,12 @@ pub struct OpenCodeAgentMapping {
     #[serde(default)]
     pub explore: Option<String>,
     #[serde(default)]
+    pub compaction: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
     pub small_model: Option<String>,
 }
 
@@ -324,6 +344,9 @@ impl From<OpenCodeAgentMapping> for AgentMapping {
             plan: m.plan,
             general: m.general,
             explore: m.explore,
+            compaction: m.compaction,
+            title: m.title,
+            summary: m.summary,
             small_model: m.small_model,
         }
     }
@@ -331,14 +354,22 @@ impl From<OpenCodeAgentMapping> for AgentMapping {
 
 #[tauri::command]
 pub fn get_opencode_config_path() -> Option<String> {
-    config_writer::detect_opencode_config()
+    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    config_writer::resolve_opencode_config_path(stored.as_deref())
         .map(|p| p.to_string_lossy().to_string())
 }
 
 #[tauri::command]
+pub fn set_opencode_config_path(path: String) -> Result<(), String> {
+    config_writer::save_opencode_config_path(&path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
-    let config_path = config_writer::detect_opencode_config()
-        .ok_or_else(|| "Could not determine home directory".to_string())?;
+    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
+        .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
     let groups = store::load_groups().unwrap_or_default();
     let providers = store::load_providers().unwrap_or_default();
@@ -349,8 +380,9 @@ pub fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
 
 #[tauri::command]
 pub fn remove_opencode_provider() -> Result<(), String> {
-    let config_path = config_writer::detect_opencode_config()
-        .ok_or_else(|| "Could not determine home directory".to_string())?;
+    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
+        .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
     config_writer::remove_provider(&config_path)
         .map_err(|e| e.to_string())
@@ -358,8 +390,9 @@ pub fn remove_opencode_provider() -> Result<(), String> {
 
 #[tauri::command]
 pub fn set_opencode_agent_models(mapping: OpenCodeAgentMapping) -> Result<(), String> {
-    let config_path = config_writer::detect_opencode_config()
-        .ok_or_else(|| "Could not determine home directory".to_string())?;
+    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
+        .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
     config_writer::set_agent_models(&config_path, &mapping.into())
         .map_err(|e| e.to_string())
@@ -367,8 +400,9 @@ pub fn set_opencode_agent_models(mapping: OpenCodeAgentMapping) -> Result<(), St
 
 #[tauri::command]
 pub fn remove_opencode_agent_models() -> Result<(), String> {
-    let config_path = config_writer::detect_opencode_config()
-        .ok_or_else(|| "Could not determine home directory".to_string())?;
+    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
+        .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
     config_writer::remove_agent_models(&config_path)
         .map_err(|e| e.to_string())
@@ -386,6 +420,31 @@ pub fn preview_opencode_config(proxy_port: u16, mapping: Option<OpenCodeAgentMap
 }
 
 #[tauri::command]
+pub fn is_group_referenced_in_opencode(group_alias: String) -> bool {
+    config_writer::is_group_alias_referenced(&group_alias)
+}
+
+#[tauri::command]
+pub fn get_latency_percentiles(provider_id: String, date: String) -> Result<Option<queries::LatencyPercentiles>, String> {
+    let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
+        .map_err(|e| format!("Invalid date format (expected YYYY-MM-DD): {}", e))?;
+    with_metrics_db(|conn| {
+        queries::get_latency_percentiles(conn, &provider_id, date)
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+pub fn remove_coderouter_from_opencode() -> Result<(), String> {
+    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
+        .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
+
+    config_writer::remove_provider(&config_path).map_err(|e| e.to_string())?;
+    config_writer::remove_agent_models(&config_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 pub fn clear_metrics_data() -> Result<(), String> {
     db::clear_metrics().map_err(|e| e.to_string())
 }
@@ -396,6 +455,7 @@ pub fn reset_all_config() -> Result<(), String> {
 }
 
 pub struct AppState {
+    pub app_handle: tauri::AppHandle,
     pub sidecar: Mutex<Option<Child>>,
     pub proxy_running: Mutex<bool>,
     pub proxy_status_item: MenuItem<tauri::Wry>,
@@ -418,16 +478,45 @@ pub fn spawn_sidecar() -> Result<Child, String> {
             std::path::PathBuf::from("coderouter-proxy")
         }
     } else {
-        std::env::current_exe()
-            .map_err(|e| e.to_string())?
-            .parent()
-            .ok_or_else(|| "No parent dir".to_string())?
-            .join("sidecar/coderouter-proxy")
+        // Check multiple possible paths for the sidecar binary:
+        // 1. AppImage-extracted path (/tmp/.mount_*/usr/bin/sidecar/)
+        // 2. Release path (next to the main binary in sidecar/)
+        // 3. Fallback to PATH
+
+        // Check for AppImage mount point
+        if let Ok(tmp) = std::env::var("APPIMAGE") {
+            if let Some(mount_dir) = std::path::Path::new(&tmp).parent() {
+                let appimage_sidecar = mount_dir.join("usr/bin/sidecar/coderouter-proxy");
+                if appimage_sidecar.exists() {
+                    appimage_sidecar
+                } else {
+                    find_sidecar_fallback()
+                }
+            } else {
+                find_sidecar_fallback()
+            }
+        } else {
+            find_sidecar_fallback()
+        }
     };
 
     std::process::Command::new(&sidecar_path)
         .spawn()
         .map_err(|e| format!("Failed to spawn sidecar {}: {}", sidecar_path.display(), e))
+}
+
+fn find_sidecar_fallback() -> std::path::PathBuf {
+    // Try release layout: sidecar/ next to the main binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let release_path = parent.join("sidecar/coderouter-proxy");
+            if release_path.exists() {
+                return release_path;
+            }
+        }
+    }
+    // Last resort: assume it's in PATH
+    std::path::PathBuf::from("coderouter-proxy")
 }
 
 #[tauri::command]
@@ -442,6 +531,9 @@ pub fn restart_proxy(state: tauri::State<AppState>) -> Result<(), String> {
     let child = spawn_sidecar()?;
     *sidecar_guard = Some(child);
     *state.proxy_running.lock().map_err(|e| e.to_string())? = true;
+
+    crate::update_tray_icon(&state.app_handle, true);
+    crate::update_menu_labels(&state, true);
 
     Ok(())
 }

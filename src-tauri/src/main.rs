@@ -3,6 +3,7 @@
 mod commands;
 
 use commands::{AppState, kill_sidecar, spawn_sidecar};
+use coderouter_proxy::config::store::load_app_config;
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -33,7 +34,7 @@ fn make_icon(running: bool) -> Option<tauri::image::Image<'static>> {
     Some(tauri::image::Image::new_owned(rgba, w, h))
 }
 
-fn update_tray_icon(app: &tauri::AppHandle, running: bool) {
+pub(crate) fn update_tray_icon(app: &tauri::AppHandle, running: bool) {
     if let Some(tray) = app.tray_by_id("main_tray") {
         if let Some(icon) = make_icon(running) {
             let _ = tray.set_icon(Some(icon));
@@ -41,7 +42,7 @@ fn update_tray_icon(app: &tauri::AppHandle, running: bool) {
     }
 }
 
-fn update_menu_labels(state: &AppState, running: bool) {
+pub(crate) fn update_menu_labels(state: &AppState, running: bool) {
     let _ = state.proxy_status_item.set_text(if running { "Proxy: Running" } else { "Proxy: Stopped" });
     let _ = state.toggle_proxy_item.set_text(if running { "Stop Proxy" } else { "Start Proxy" });
 }
@@ -93,8 +94,13 @@ fn build_menu(app_handle: &tauri::AppHandle, running: bool) -> Result<(Menu<taur
 
 async fn poll_health(app: tauri::AppHandle) {
     let client = reqwest::Client::new();
+    let port = match load_app_config() {
+        Ok(config) => config.proxy_port,
+        Err(_) => 4141,
+    };
+    let health_url = format!("http://localhost:{port}/health");
     loop {
-        let running = match client.get("http://localhost:4141/health").send().await {
+        let running = match client.get(&health_url).send().await {
             Ok(resp) => resp.status().is_success(),
             Err(_) => false,
         };
@@ -129,6 +135,7 @@ fn main() {
             let (menu, proxy_status_item, toggle_proxy_item) = build_menu(&app_handle, false)?;
 
             app.manage(AppState {
+                app_handle: app_handle.clone(),
                 sidecar: Mutex::new(None),
                 proxy_running: Mutex::new(false),
                 proxy_status_item,
@@ -236,6 +243,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_providers,
             commands::save_provider,
+            commands::toggle_provider_enabled,
             commands::delete_provider,
             commands::get_groups,
             commands::save_group,
@@ -259,6 +267,10 @@ fn main() {
             commands::clear_metrics_data,
             commands::reset_all_config,
             commands::restart_proxy,
+            commands::is_group_referenced_in_opencode,
+            commands::set_opencode_config_path,
+            commands::get_latency_percentiles,
+            commands::remove_coderouter_from_opencode,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

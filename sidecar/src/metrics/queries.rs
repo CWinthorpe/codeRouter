@@ -185,6 +185,81 @@ pub fn get_usage_by_group(conn: &Connection, days: u32) -> Result<Vec<GroupUsage
         .map_err(|e| anyhow::anyhow!("Failed to collect group usage: {}", e))
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct LatencyPercentiles {
+    pub p50: i64,
+    pub p95: i64,
+}
+
+pub fn get_latency_percentiles(
+    conn: &Connection,
+    provider_id: &str,
+    date: NaiveDate,
+) -> Result<Option<LatencyPercentiles>> {
+    let start_ts = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
+    let end_ts = date
+        .succ_opt()
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+
+    let mut stmt = conn.prepare(
+        "SELECT latency_ms FROM requests
+         WHERE provider_id = ?1 AND ts >= ?2 AND ts < ?3 AND latency_ms > 0
+         ORDER BY latency_ms",
+    )?;
+
+    let latencies: Result<Vec<i64>> = stmt
+        .query_map(
+            [provider_id, &start_ts.to_string(), &end_ts.to_string()],
+            |row| row.get(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to collect latencies: {}", e));
+
+    let latencies = latencies?;
+    if latencies.is_empty() {
+        return Ok(None);
+    }
+
+    let n = latencies.len();
+    let p50_idx = (n as f64 * 0.50).ceil() as usize - 1;
+    let p95_idx = (n as f64 * 0.95).ceil() as usize - 1;
+
+    Ok(Some(LatencyPercentiles {
+        p50: latencies[p50_idx.min(n - 1)],
+        p95: latencies[p95_idx.min(n - 1)],
+    }))
+}
+
+pub fn get_today_token_totals(conn: &Connection) -> Result<Vec<(String, u64)>> {
+    let now = Utc::now();
+    let start_ts = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+
+    let mut stmt = conn.prepare(
+        "SELECT provider_id, COALESCE(SUM(prompt_tokens + output_tokens), 0) as total_tokens
+         FROM requests
+         WHERE ts >= ?1
+         GROUP BY provider_id",
+    )?;
+
+    let rows = stmt.query_map([&start_ts.to_string()], |row| {
+        let provider_id: String = row.get(0)?;
+        let total_tokens: i64 = row.get(1)?;
+        Ok((provider_id, total_tokens as u64))
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to collect today's token totals: {}", e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

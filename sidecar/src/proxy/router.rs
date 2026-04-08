@@ -96,6 +96,34 @@ pub fn init_and_set_global_router_state(
     state
 }
 
+pub fn init_daily_totals_from_db(state: &SharedRouterState) {
+    use crate::metrics::db::init_db;
+    use crate::metrics::queries::get_today_token_totals;
+
+    let conn = match init_db() {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let totals = match get_today_token_totals(&conn) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let mut guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+
+    for (provider_id, tokens) in totals {
+        for (key, entry_state) in guard.entries.iter_mut() {
+            if key.starts_with(&format!("{provider_id}:")) {
+                entry_state.daily_tokens_used = tokens;
+            }
+        }
+    }
+}
+
 pub fn select_entry<'a>(
     group: &'a Group,
     state: &RouterState,
@@ -223,12 +251,17 @@ pub fn record_429(
     state: &mut RouterState,
     provider_id: &str,
     entry_index: u32,
-    backoff_seconds: i64,
+    base_backoff_seconds: i64,
 ) {
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
+        let current_backoff = entry_state
+            .cooldown_duration_seconds
+            .unwrap_or(base_backoff_seconds);
+        let new_backoff = (current_backoff * 2).min(3600).max(base_backoff_seconds);
+        entry_state.cooldown_duration_seconds = Some(new_backoff);
         entry_state.status = EntryStatus::Cooldown;
-        entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::seconds(backoff_seconds));
+        entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::seconds(new_backoff));
     }
 }
 
@@ -252,15 +285,23 @@ pub fn record_consecutive_error(
         if trigger_enabled && entry_state.consecutive_errors >= threshold {
             entry_state.status = EntryStatus::Cooldown;
             entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::minutes(10));
+            entry_state.consecutive_errors = 0;
         }
     }
 }
 
-pub fn record_latency_timeout(state: &mut RouterState, provider_id: &str, entry_index: u32) {
+pub fn record_latency_timeout(
+    state: &mut RouterState,
+    provider_id: &str,
+    entry_index: u32,
+) -> Result<(), &'static str> {
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.status = EntryStatus::Cooldown;
         entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        Ok(())
+    } else {
+        Err("entry state not found")
     }
 }
 
@@ -429,7 +470,7 @@ mod tests {
         let state = state.lock().unwrap();
         let entry = state.entries.get("p1:0").unwrap();
         assert_eq!(entry.status, EntryStatus::Cooldown);
-        assert_eq!(entry.consecutive_errors, 3);
+        assert_eq!(entry.consecutive_errors, 0);
     }
 
     #[test]
@@ -455,7 +496,8 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_latency_timeout(&mut s, "p1", 0);
+            let result = record_latency_timeout(&mut s, "p1", 0);
+            assert!(result.is_ok());
         }
         let state = state.lock().unwrap();
         let entry = state.entries.get("p1:0").unwrap();

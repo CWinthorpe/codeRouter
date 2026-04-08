@@ -448,7 +448,7 @@ where
 pub fn anthropic_headers(api_key: &str) -> Vec<(String, String)> {
     vec![
         ("x-api-key".to_string(), api_key.to_string()),
-        ("anthropic-version".to_string(), "2023-06-01".to_string()),
+        ("anthropic-version".to_string(), "2024-06-01".to_string()),
         ("content-type".to_string(), "application/json".to_string()),
     ]
 }
@@ -610,7 +610,7 @@ mod tests {
         );
         assert_eq!(
             headers[1],
-            ("anthropic-version".to_string(), "2023-06-01".to_string())
+            ("anthropic-version".to_string(), "2024-06-01".to_string())
         );
         assert_eq!(
             headers[2],
