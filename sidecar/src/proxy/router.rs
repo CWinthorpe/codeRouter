@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::config::models::{Group, GroupEntry, Provider};
 
@@ -37,11 +37,11 @@ pub struct EntryState {
 impl EntryState {
     fn new(provider: &Provider) -> Self {
         let now = Utc::now();
-        let reset_hour = provider.quota_reset_utc_hour;
+        let reset_hour = provider.quota_reset_utc_hour.min(23);
         let mut daily_reset_at = now
             .date_naive()
             .and_hms_opt(reset_hour, 0, 0)
-            .unwrap()
+            .unwrap_or_else(|| now.date_naive().and_hms_opt(0, 0, 0).unwrap())
             .and_local_timezone(Utc)
             .single()
             .unwrap_or(now);
@@ -96,7 +96,7 @@ pub fn init_and_set_global_router_state(
     state
 }
 
-pub fn init_daily_totals_from_db(state: &SharedRouterState) {
+pub fn init_daily_totals_from_db(state: &SharedRouterState, providers: &[Provider]) {
     use crate::metrics::db::init_db;
     use crate::metrics::queries::get_today_token_totals;
 
@@ -105,20 +105,24 @@ pub fn init_daily_totals_from_db(state: &SharedRouterState) {
         Err(_) => return,
     };
 
-    let totals = match get_today_token_totals(&conn) {
-        Ok(t) => t,
-        Err(_) => return,
-    };
-
     let mut guard = match state.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
 
-    for (provider_id, tokens) in totals {
-        for (key, entry_state) in guard.entries.iter_mut() {
-            if key.starts_with(&format!("{provider_id}:")) {
-                entry_state.daily_tokens_used = tokens;
+    for provider in providers {
+        let totals = match get_today_token_totals(&conn, provider.quota_reset_utc_hour) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+
+        for (provider_id, tokens) in totals {
+            if provider_id == provider.id {
+                for (key, entry_state) in guard.entries.iter_mut() {
+                    if key.starts_with(&format!("{provider_id}:")) {
+                        entry_state.daily_tokens_used = tokens;
+                    }
+                }
             }
         }
     }
@@ -177,7 +181,7 @@ pub fn select_entry<'a>(
     candidates.into_iter().next()
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntryStatusResponse {
     pub group_id: String,
     pub group_alias: String,
@@ -193,7 +197,7 @@ pub struct EntryStatusResponse {
     pub cooldown_duration_seconds: Option<i64>,
 }
 
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RouterStatusResponse {
     pub entries: Vec<EntryStatusResponse>,
 }
@@ -244,6 +248,10 @@ pub fn record_success(
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.consecutive_errors = 0;
         entry_state.daily_tokens_used += tokens_used;
+        if entry_state.status == EntryStatus::Cooldown {
+            entry_state.status = EntryStatus::Active;
+            entry_state.cooldown_until = None;
+        }
     }
 }
 
@@ -255,10 +263,15 @@ pub fn record_429(
 ) {
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
+        let was_in_cooldown = entry_state.status == EntryStatus::Cooldown;
         let current_backoff = entry_state
             .cooldown_duration_seconds
             .unwrap_or(base_backoff_seconds);
-        let new_backoff = (current_backoff * 2).min(3600).max(base_backoff_seconds);
+        let new_backoff = if !was_in_cooldown {
+            base_backoff_seconds
+        } else {
+            (current_backoff * 2).min(3600).max(base_backoff_seconds)
+        };
         entry_state.cooldown_duration_seconds = Some(new_backoff);
         entry_state.status = EntryStatus::Cooldown;
         entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::seconds(new_backoff));
@@ -269,6 +282,7 @@ pub fn record_quota_exhausted(state: &mut RouterState, provider_id: &str, entry_
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.status = EntryStatus::QuotaExhausted;
+        entry_state.cooldown_until = None;
     }
 }
 
@@ -543,5 +557,71 @@ mod tests {
         assert_eq!(status.entries[0].group_alias, "test-group");
         assert_eq!(status.entries[0].provider_id, "p1");
         assert_eq!(status.entries[0].status, "active");
+    }
+
+    #[test]
+    fn test_record_success_transitions_cooldown_to_active() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::Cooldown);
+            assert!(entry.cooldown_until.is_some());
+            record_success(&mut s, "p1", 0, 50);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::Active);
+            assert!(entry.cooldown_until.is_none());
+        }
+    }
+
+    #[test]
+    fn test_record_429_first_backoff_starts_at_base() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.cooldown_duration_seconds, Some(60));
+        }
+    }
+
+    #[test]
+    fn test_record_429_subsequent_backoff_doubles() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+            record_429(&mut s, "p1", 0, 60);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.cooldown_duration_seconds, Some(120));
+        }
+    }
+
+    #[test]
+    fn test_record_quota_exhausted_clears_cooldown_until() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert!(entry.cooldown_until.is_some());
+            record_quota_exhausted(&mut s, "p1", 0);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::QuotaExhausted);
+            assert!(entry.cooldown_until.is_none());
+        }
     }
 }

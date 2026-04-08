@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Plus,
   Edit2,
@@ -92,7 +92,7 @@ function statusLabel(status: string): string {
   }
 }
 
-function cooldownCountdown(cooldownUntil?: string): string {
+function cooldownCountdown(cooldownUntil?: string, _tick?: number): string {
   if (!cooldownUntil) return '';
   try {
     const diff = new Date(cooldownUntil).getTime() - Date.now();
@@ -375,6 +375,12 @@ function LiveStatusPanel({
 }) {
   const statusData = useGroupStatusPoll(groupId);
   const [toggling, setToggling] = useState<string | null>(null);
+  const [tick, setTick] = useState(0);
+
+  useEffect(() => {
+    const interval = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   const statusByIndex = useMemo(() => {
     const map = new Map<number, EntryStatusResponse>();
@@ -418,7 +424,7 @@ function LiveStatusPanel({
 
           return (
             <div
-              key={idx}
+              key={`${entry.providerId}-${entry.modelId}-${idx}`}
               className="flex items-center gap-4 rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3"
             >
               <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs font-mono text-zinc-400">
@@ -438,7 +444,7 @@ function LiveStatusPanel({
                     {statusIcon(status)}
                     {statusLabel(status)}
                     {status === 'cooldown' && st?.cooldown_until && (
-                      <span className="ml-1 font-mono">{cooldownCountdown(st.cooldown_until)}</span>
+                      <span className="ml-1 font-mono">{cooldownCountdown(st.cooldown_until, tick)}</span>
                     )}
                     {status === 'quota_exhausted' && st?.daily_reset_at && (
                       <span className="ml-1 text-zinc-400">resets {formatTimestamp(st.daily_reset_at)}</span>
@@ -503,6 +509,10 @@ function GroupForm({
   const [showAddEntry, setShowAddEntry] = useState(false);
   const [showFailover, setShowFailover] = useState(false);
   const [dragIdx, setDragIdx] = useState<number | null>(null);
+
+  useEffect(() => {
+    setShowFailover(false);
+  }, [group?.id]);
 
   // Add entry sub-form state
   const [addProviderId, setAddProviderId] = useState('');
@@ -694,7 +704,7 @@ function GroupForm({
               <div className="flex flex-col gap-2">
                 {entries.map((entry, idx) => (
                   <div
-                    key={idx}
+                    key={`${entry.providerId}-${entry.modelId}-${idx}`}
                     draggable
                     onDragStart={() => handleDragStart(idx)}
                     onDragOver={(e) => handleDragOver(e, idx)}

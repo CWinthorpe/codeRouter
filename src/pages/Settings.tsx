@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useState } from 'react';
 import { AlertTriangle, RotateCcw, Trash2, Eye, RotateCw } from 'lucide-react';
 import { useStore } from '../store';
+import { Toast } from '../components/Toast';
+import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '../components/ui/card';
+import { Button } from '../components/ui/button';
 import { getAppConfig, saveAppConfig, clearMetricsData, resetAllConfig, restartProxy } from '../lib/ipc';
 import type { AppConfig } from '../types';
 
@@ -55,8 +58,9 @@ export default function Settings() {
     e.preventDefault();
     if (!form) return;
 
-    if (form.proxy_port < 1024 || form.proxy_port > 65535) {
-      addToast('error', 'Port must be between 1024 and 65535');
+    const port = parseInt(String(form.proxy_port), 10);
+    if (isNaN(port) || port < 1024 || port > 65535) {
+      addToast('error', 'Port must be an integer between 1024 and 65535');
       return;
     }
 
@@ -152,39 +156,32 @@ export default function Settings() {
       {toasts.length > 0 && (
         <div className="fixed right-4 top-4 z-50 space-y-2">
           {toasts.map((t) => (
-            <div
-              key={t.id}
-              className={`rounded-md px-4 py-3 text-sm font-medium ${
-                t.type === 'success' ? 'bg-green-600/20 text-green-400 border border-green-600/30' : 'bg-red-600/20 text-red-400 border border-red-600/30'
-              }`}
-            >
-              {t.message}
-            </div>
+            <Toast key={t.id} type={t.type} message={t.message} />
           ))}
         </div>
       )}
 
       {showRestartBanner && (
-        <div className="flex items-center justify-between rounded-lg border border-yellow-600/30 bg-yellow-600/10 px-6 py-4">
-          <div className="flex items-center gap-3">
-            <AlertTriangle className="h-5 w-5 text-yellow-400" />
-            <p className="text-sm text-yellow-200">Proxy restart required. Restart now?</p>
-          </div>
-          <button
-            onClick={handleRestartProxy}
-            disabled={restarting}
-            className="inline-flex items-center gap-2 rounded-md bg-yellow-600/20 px-4 py-2 text-sm font-medium text-yellow-200 transition-colors hover:bg-yellow-600/30 disabled:opacity-50"
-          >
-            <RotateCw className={`h-4 w-4 ${restarting ? 'animate-spin' : ''}`} />
-            {restarting ? 'Restarting...' : 'Restart Proxy'}
-          </button>
-        </div>
+        <Card className="border-yellow-600/30 bg-yellow-600/10">
+          <CardContent className="flex items-center justify-between pt-6">
+            <div className="flex items-center gap-3">
+              <AlertTriangle className="h-5 w-5 text-yellow-400" />
+              <p className="text-sm text-yellow-200">Proxy restart required. Restart now?</p>
+            </div>
+            <Button variant="outline" onClick={handleRestartProxy} disabled={restarting}>
+              <RotateCw className={`h-4 w-4 ${restarting ? 'animate-spin' : ''}`} />
+              {restarting ? 'Restarting...' : 'Restart Proxy'}
+            </Button>
+          </CardContent>
+        </Card>
       )}
 
       <form onSubmit={handleSave} className="space-y-8">
-        <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-          <h2 className="text-lg font-semibold">Proxy Settings</h2>
-          <div className="mt-4 space-y-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>Proxy Settings</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
             <div>
               <label className="mb-1 block text-sm font-medium text-zinc-300">Port</label>
               <input
@@ -192,7 +189,7 @@ export default function Settings() {
                 min={1024}
                 max={65535}
                 value={form.proxy_port}
-                onChange={(e) => updateField('proxy_port', Number(e.target.value))}
+                onChange={(e) => updateField('proxy_port', parseInt(e.target.value, 10) || 0)}
                 className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 focus:border-zinc-500 focus:outline-none"
               />
               <p className="mt-1 text-xs text-zinc-500">Range: 1024–65535 (default: 4141)</p>
@@ -214,12 +211,14 @@ export default function Settings() {
               <p className="mt-1 text-xs text-zinc-500">Default: 127.0.0.1</p>
             </div>
             <p className="text-xs text-zinc-500">Restart the proxy after changing port or address for changes to take effect.</p>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
 
-        <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-          <h2 className="text-lg font-semibold">Model Refresh</h2>
-          <div className="mt-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>Model Refresh</CardTitle>
+          </CardHeader>
+          <CardContent>
             <label className="mb-1 block text-sm font-medium text-zinc-300">Auto-refresh interval</label>
             <select
               value={form.refresh_interval_hours}
@@ -232,12 +231,14 @@ export default function Settings() {
                 </option>
               ))}
             </select>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
 
-        <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-          <h2 className="text-lg font-semibold">Logging</h2>
-          <div className="mt-4 space-y-4">
+        <Card>
+          <CardHeader>
+            <CardTitle>Logging</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
             <div>
               <label className="mb-1 block text-sm font-medium text-zinc-300">Log verbosity</label>
               <select
@@ -252,62 +253,46 @@ export default function Settings() {
                 ))}
               </select>
             </div>
-            <div>
-              <button
-                type="button"
-                onClick={handleViewLogs}
-                className="inline-flex items-center gap-2 rounded-md bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-200 transition-colors hover:bg-zinc-700"
-              >
-                <Eye className="h-4 w-4" />
-                View Logs
-              </button>
-            </div>
-          </div>
-        </div>
+            <Button variant="outline" type="button" onClick={handleViewLogs}>
+              <Eye className="h-4 w-4" />
+              View Logs
+            </Button>
+          </CardContent>
+        </Card>
 
         <div className="flex justify-end">
-          <button
-            type="submit"
-            disabled={saving}
-            className="inline-flex items-center gap-2 rounded-md bg-blue-600 px-6 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
-          >
+          <Button type="submit" disabled={saving}>
             {saving ? 'Saving...' : 'Save Settings'}
-          </button>
+          </Button>
         </div>
 
-        <div className="rounded-lg border border-red-800/50 bg-red-900/10 p-6">
-          <h2 className="text-lg font-semibold text-red-400">Danger Zone</h2>
-          <div className="mt-4 space-y-4">
+        <Card className="border-red-800/50">
+          <CardHeader>
+            <CardTitle className="text-red-400">Danger Zone</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
             <div className="flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3">
               <div>
                 <p className="text-sm font-medium text-zinc-200">Reset All Usage Data</p>
-                <p className="text-xs text-zinc-500">Permanently delete all request metrics and usage data.</p>
+                <CardDescription>Permanently delete all request metrics and usage data.</CardDescription>
               </div>
-              <button
-                type="button"
-                onClick={handleResetUsageData}
-                className="inline-flex items-center gap-2 rounded-md bg-red-600/20 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-600/30"
-              >
+              <Button variant="destructive" type="button" onClick={handleResetUsageData}>
                 <Trash2 className="h-4 w-4" />
                 Reset Usage Data
-              </button>
+              </Button>
             </div>
             <div className="flex items-center justify-between rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3">
               <div>
                 <p className="text-sm font-medium text-zinc-200">Reset All Settings</p>
-                <p className="text-xs text-zinc-500">Restore config.json, providers.json, and groups.json to empty defaults. Does NOT affect OpenCode config.</p>
+                <CardDescription>Restore config.json, providers.json, and groups.json to empty defaults. Does NOT affect OpenCode config.</CardDescription>
               </div>
-              <button
-                type="button"
-                onClick={handleResetSettings}
-                className="inline-flex items-center gap-2 rounded-md bg-red-600/20 px-4 py-2 text-sm font-medium text-red-400 transition-colors hover:bg-red-600/30"
-              >
+              <Button variant="destructive" type="button" onClick={handleResetSettings}>
                 <RotateCcw className="h-4 w-4" />
                 Reset Settings
-              </button>
+              </Button>
             </div>
-          </div>
-        </div>
+          </CardContent>
+        </Card>
       </form>
     </div>
   );

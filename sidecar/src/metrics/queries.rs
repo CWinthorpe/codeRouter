@@ -234,14 +234,21 @@ pub fn get_latency_percentiles(
     }))
 }
 
-pub fn get_today_token_totals(conn: &Connection) -> Result<Vec<(String, u64)>> {
+pub fn get_today_token_totals(
+    conn: &Connection,
+    quota_reset_utc_hour: u32,
+) -> Result<Vec<(String, u64)>> {
     let now = Utc::now();
-    let start_ts = now
+    let today_start = now
         .date_naive()
-        .and_hms_opt(0, 0, 0)
+        .and_hms_opt(quota_reset_utc_hour, 0, 0)
         .unwrap()
-        .and_utc()
-        .timestamp();
+        .and_utc();
+    let start_ts = if today_start <= now {
+        today_start.timestamp()
+    } else {
+        (today_start - chrono::Duration::days(1)).timestamp()
+    };
 
     let mut stmt = conn.prepare(
         "SELECT provider_id, COALESCE(SUM(prompt_tokens + output_tokens), 0) as total_tokens

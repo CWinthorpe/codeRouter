@@ -104,11 +104,11 @@ fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
                 None => continue,
             };
 
-            let reset_hour = provider.quota_reset_utc_hour;
+            let reset_hour = provider.quota_reset_utc_hour.min(23);
             let _today_reset = now
                 .date_naive()
                 .and_hms_opt(reset_hour, 0, 0)
-                .unwrap()
+                .unwrap_or_else(|| now.date_naive().and_hms_opt(0, 0, 0).unwrap())
                 .and_local_timezone(Utc)
                 .single();
 
@@ -118,7 +118,7 @@ fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
                 let next_reset = now
                     .date_naive()
                     .and_hms_opt(reset_hour, 0, 0)
-                    .unwrap()
+                    .unwrap_or_else(|| now.date_naive().and_hms_opt(0, 0, 0).unwrap())
                     .and_local_timezone(Utc)
                     .single()
                     .unwrap_or(now)
@@ -154,19 +154,6 @@ async fn run_cooldown_check(
             let key = router::entry_key(&entry.provider_id, idx as u32);
             let entry_state = match guard.entries.get(&key) {
                 Some(s) if s.status == EntryStatus::Cooldown => s,
-                Some(s) if s.status == EntryStatus::QuotaExhausted => {
-                    if let Some(cooldown_until) = s.cooldown_until {
-                        if now >= cooldown_until {
-                            let provider = match providers.iter().find(|p| p.id == entry.provider_id) {
-                                Some(p) => p.clone(),
-                                None => continue,
-                            };
-                            let cooldown_duration = s.cooldown_duration_seconds.unwrap_or(BASE_COOLDOWN_SECONDS);
-                            probes.push((key.clone(), provider, cooldown_duration));
-                        }
-                    }
-                    continue;
-                }
                 _ => continue,
             };
 
@@ -205,7 +192,7 @@ async fn run_cooldown_check(
 async fn run_probe(provider: &Provider, client: &Client) -> ProbeResult {
     let api_key = match keychain::get_credential(&provider.credential_key).await {
         Ok(k) => k,
-        Err(e) => return ProbeResult::Error(format!("credential error: {e}")),
+        Err(_) => return ProbeResult::Error,
     };
 
     let models_url = format!("{}/v1/models", provider.base_url.trim_end_matches('/'));
@@ -228,18 +215,17 @@ async fn run_probe(provider: &Provider, client: &Client) -> ProbeResult {
             } else if resp.status().is_success() {
                 ProbeResult::Success
             } else {
-                let body = resp.text().await.unwrap_or_default();
-                ProbeResult::Error(format!("HTTP {status}: {body}"))
+                ProbeResult::Error
             }
         }
-        Err(e) => ProbeResult::Error(format!("network error: {e}")),
+        Err(_) => ProbeResult::Error,
     }
 }
 
 enum ProbeResult {
     Success,
     RateLimited,
-    Error(String),
+    Error,
 }
 
 fn handle_probe_result(
@@ -270,7 +256,7 @@ fn handle_probe_result(
             entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::seconds(new_duration));
             entry_state.cooldown_duration_seconds = Some(new_duration);
         }
-        ProbeResult::Error(_) => {
+        ProbeResult::Error => {
             let new_until = Utc::now() + chrono::Duration::seconds(current_cooldown);
             entry_state.cooldown_until = Some(new_until);
             entry_state.cooldown_duration_seconds = Some(current_cooldown);

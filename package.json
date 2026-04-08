@@ -7,7 +7,11 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "echo \"No test runner configured\"",
+    "lint": "echo \"No linter configured\"",
+    "typecheck": "tsc --noEmit",
+    "format": "echo \"No formatter configured\""
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

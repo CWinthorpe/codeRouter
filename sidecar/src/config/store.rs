@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
@@ -48,11 +48,12 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     file.write_all(content.as_bytes())?;
     file.flush()?;
     file.sync_all()?;
-    file.unlock()?;
 
     let mut perms = file.metadata()?.permissions();
     perms.set_mode(0o600);
     file.set_permissions(perms)?;
+
+    file.unlock()?;
 
     fs::rename(&tmp_path, path)?;
 
@@ -110,6 +111,45 @@ pub fn load_providers() -> Result<Vec<Provider>> {
 pub fn save_providers(providers: &[Provider]) -> Result<()> {
     ensure_config_dir()?;
     write_json(&providers_path(), providers)
+}
+
+pub fn update_providers_with_lock<F: FnOnce(&mut Vec<Provider>)>(f: F) -> Result<()> {
+    let path = providers_path();
+    ensure_config_dir()?;
+
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)?;
+
+    file.lock_exclusive()?;
+
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)?;
+
+    let mut providers: Vec<Provider> = if contents.is_empty() {
+        Vec::new()
+    } else {
+        serde_json::from_str(&contents)?
+    };
+
+    f(&mut providers);
+
+    let content = serde_json::to_string_pretty(&providers)?;
+    file.set_len(0)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
+    file.write_all(content.as_bytes())?;
+    file.flush()?;
+    file.sync_all()?;
+
+    let mut perms = file.metadata()?.permissions();
+    perms.set_mode(0o600);
+    file.set_permissions(perms)?;
+
+    file.unlock()?;
+
+    Ok(())
 }
 
 pub fn load_groups() -> Result<Vec<Group>> {

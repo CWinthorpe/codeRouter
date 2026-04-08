@@ -1,8 +1,8 @@
-use axum::response::sse::{Event, Sse};
 use bytes::Bytes;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 // ── Anthropic request types ──
@@ -244,12 +244,18 @@ pub fn anthropic_to_openai(
 
 // ── Streaming SSE translator ──
 
+pub struct StreamTokenCounts {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 pub struct AnthropicToOpenAIStream<S> {
     inner: S,
     group_alias: String,
     chat_id: String,
     buffer: Vec<u8>,
     state: StreamState,
+    token_counts: Arc<Mutex<StreamTokenCounts>>,
 }
 
 enum StreamState {
@@ -261,17 +267,18 @@ impl<S> AnthropicToOpenAIStream<S>
 where
     S: Stream<Item = Result<bytes::Bytes, std::io::Error>>,
 {
-    pub fn new(inner: S, group_alias: String) -> Self {
+    pub fn new(inner: S, group_alias: String, token_counts: Arc<Mutex<StreamTokenCounts>>) -> Self {
         Self {
             inner,
             group_alias,
             chat_id: format!("chatcmpl-{}", uuid_short()),
             buffer: Vec::new(),
             state: StreamState::Waiting,
+            token_counts,
         }
     }
 
-    fn translate_event(&self, data: &str) -> Option<String> {
+    fn translate_event(&mut self, data: &str) -> Option<String> {
         let event: AnthropicStreamEvent = match serde_json::from_str(data) {
             Ok(e) => e,
             Err(_) => return None,
@@ -279,6 +286,14 @@ where
 
         match event.event_type.as_str() {
             "message_start" => {
+                if let Some(msg) = &event.message {
+                    if let Some(usage) = msg.get("usage") {
+                        let mut counts = self.token_counts.lock().unwrap();
+                        if let Some(inp) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                            counts.input_tokens = inp;
+                        }
+                    }
+                }
                 let chunk = ChatCompletionChunk {
                     id: self.chat_id.clone(),
                     object: "chat.completion.chunk".to_string(),
@@ -327,6 +342,13 @@ where
                     .and_then(|d| d.get("stop_reason"))
                     .and_then(|v| v.as_str());
 
+                if let Some(usage) = event.delta.as_ref().and_then(|d| d.get("usage")) {
+                    if let Some(out) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        let mut counts = self.token_counts.lock().unwrap();
+                        counts.output_tokens = out;
+                    }
+                }
+
                 let finish_reason = match stop_reason {
                     Some("end_turn") => Some("stop".to_string()),
                     Some("max_tokens") => Some("length".to_string()),
@@ -363,7 +385,7 @@ impl<S> Stream for AnthropicToOpenAIStream<S>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
 {
-    type Item = Result<Event, std::io::Error>;
+    type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         if matches!(self.state, StreamState::Done) {
@@ -386,14 +408,14 @@ where
                             let data = &line[6..];
                             if !data.is_empty() {
                                 if let Some(output) = self.translate_event(data) {
-                                    return Poll::Ready(Some(Ok(Event::default().data(&output))));
+                                    return Poll::Ready(Some(Ok(Bytes::from(output))));
                                 }
                             }
                         } else if line.starts_with("data:") {
                             let data = &line[5..];
                             if !data.is_empty() {
                                 if let Some(output) = self.translate_event(data) {
-                                    return Poll::Ready(Some(Ok(Event::default().data(&output))));
+                                    return Poll::Ready(Some(Ok(Bytes::from(output))));
                                 }
                             }
                         }
@@ -403,21 +425,21 @@ where
                 Poll::Ready(None) => {
                     if !self.buffer.is_empty() {
                         let remaining = String::from_utf8_lossy(&self.buffer);
-                        let remaining = remaining.trim();
+                        let remaining = remaining.trim().to_string();
                         if remaining.starts_with("data: ") {
-                            let data = &remaining[6..];
+                            let data = remaining[6..].to_string();
                             if !data.is_empty() {
-                                if let Some(output) = self.translate_event(data) {
+                                if let Some(output) = self.translate_event(&data) {
                                     self.buffer.clear();
-                                    return Poll::Ready(Some(Ok(Event::default().data(&output))));
+                                    return Poll::Ready(Some(Ok(Bytes::from(output))));
                                 }
                             }
                         } else if remaining.starts_with("data:") {
-                            let data = &remaining[5..];
+                            let data = remaining[5..].to_string();
                             if !data.is_empty() {
-                                if let Some(output) = self.translate_event(data) {
+                                if let Some(output) = self.translate_event(&data) {
                                     self.buffer.clear();
-                                    return Poll::Ready(Some(Ok(Event::default().data(&output))));
+                                    return Poll::Ready(Some(Ok(Bytes::from(output))));
                                 }
                             }
                         }
@@ -435,12 +457,21 @@ where
 pub fn translate_anthropic_stream<S>(
     stream: S,
     group_alias: String,
-) -> Sse<AnthropicToOpenAIStream<S>>
+    token_counts: Arc<Mutex<StreamTokenCounts>>,
+) -> (axum::body::Body, Arc<Mutex<StreamTokenCounts>>)
 where
     S: Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + Unpin + 'static,
 {
-    let translated = AnthropicToOpenAIStream::new(stream, group_alias);
-    Sse::new(translated)
+    let translated = AnthropicToOpenAIStream::new(stream, group_alias, token_counts.clone());
+    let raw_stream = futures::stream::unfold(translated, |mut stream| async move {
+        match futures::StreamExt::next(&mut stream).await {
+            Some(Ok(bytes)) => Some((Ok::<_, std::io::Error>(bytes), stream)),
+            Some(Err(e)) => Some((Err(e), stream)),
+            None => None,
+        }
+    });
+    let body = axum::body::Body::from_stream(raw_stream);
+    (body, token_counts)
 }
 
 // ── HTTP headers helper ──
@@ -456,13 +487,7 @@ pub fn anthropic_headers(api_key: &str) -> Vec<(String, String)> {
 // ── UUID helper ──
 
 fn uuid_short() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let ts = duration.as_millis();
-    let rand = fastrand::u64(..);
-    format!("{:x}{:x}", ts, rand & 0xFFFFFFFF)
+    uuid::Uuid::new_v4().simple().to_string()
 }
 
 // ── Tests ──
@@ -620,8 +645,9 @@ mod tests {
 
     #[test]
     fn test_stream_translation_message_start() {
+        let counts = Arc::new(Mutex::new(StreamTokenCounts { input_tokens: 0, output_tokens: 0 }));
         let mut streamer =
-            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string());
+            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string(), counts);
         streamer.chat_id = "chatcmpl-test".to_string();
 
         let data = r#"{"type":"message_start","message":{"id":"msg_123"}}"#;
@@ -635,8 +661,9 @@ mod tests {
 
     #[test]
     fn test_stream_translation_content_delta() {
+        let counts = Arc::new(Mutex::new(StreamTokenCounts { input_tokens: 0, output_tokens: 0 }));
         let mut streamer =
-            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string());
+            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string(), counts);
         streamer.chat_id = "chatcmpl-test".to_string();
 
         let data = r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}"#;
@@ -648,8 +675,9 @@ mod tests {
 
     #[test]
     fn test_stream_translation_message_delta_stop() {
+        let counts = Arc::new(Mutex::new(StreamTokenCounts { input_tokens: 0, output_tokens: 0 }));
         let mut streamer =
-            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string());
+            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string(), counts);
         streamer.chat_id = "chatcmpl-test".to_string();
 
         let data = r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":10}}"#;
@@ -660,8 +688,9 @@ mod tests {
 
     #[test]
     fn test_stream_translation_message_stop() {
-        let streamer =
-            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string());
+        let counts = Arc::new(Mutex::new(StreamTokenCounts { input_tokens: 0, output_tokens: 0 }));
+        let mut streamer =
+            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string(), counts);
 
         let data = r#"{"type":"message_stop"}"#;
         let result = streamer.translate_event(data).unwrap();
@@ -671,8 +700,9 @@ mod tests {
 
     #[test]
     fn test_stream_translation_unknown_event_skipped() {
-        let streamer =
-            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string());
+        let counts = Arc::new(Mutex::new(StreamTokenCounts { input_tokens: 0, output_tokens: 0 }));
+        let mut streamer =
+            AnthropicToOpenAIStream::new(futures::stream::empty(), "test-group".to_string(), counts);
 
         let data = r#"{"type":"ping"}"#;
         let result = streamer.translate_event(data);

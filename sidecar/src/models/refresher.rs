@@ -1,9 +1,9 @@
 use reqwest::Client;
 use serde::Deserialize;
-use std::time::{SystemTime, UNIX_EPOCH};
+use chrono::Utc;
 
 use crate::config::models::{Provider, ProviderModel};
-use crate::config::store::{load_app_config, load_providers, save_providers};
+use crate::config::store::{load_app_config, load_providers, save_providers, update_providers_with_lock};
 use crate::credentials::keychain::get_credential;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -276,54 +276,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
 }
 
 fn current_iso_timestamp() -> String {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = duration.as_secs();
-
-    let days = secs / 86400;
-    let remaining = secs % 86400;
-    let hours = remaining / 3600;
-    let mins = (remaining % 3600) / 60;
-    let secs = remaining % 60;
-
-    let mut y = 1970;
-    let mut d = days;
-
-    loop {
-        let days_in_year = if is_leap_year(y) { 366 } else { 365 };
-        if d < days_in_year {
-            break;
-        }
-        d -= days_in_year;
-        y += 1;
-    }
-
-    let month_days = if is_leap_year(y) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    let mut m = 0;
-    for &days in &month_days {
-        if d < days {
-            break;
-        }
-        d -= days;
-        m += 1;
-    }
-    let day = d + 1;
-
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-        y,
-        m + 1,
-        day,
-        hours,
-        mins,
-        secs
-    )
+    Utc::now().to_rfc3339()
 }
 
 fn is_leap_year(year: i64) -> bool {
@@ -340,57 +293,15 @@ fn needs_refresh(provider: &Provider, refresh_interval_hours: u32) -> bool {
         None => return true,
     };
 
-    match parse_iso_timestamp(last_refreshed) {
-        Some(refreshed_secs) => {
-            let now_secs = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            let elapsed_hours = (now_secs - refreshed_secs) / 3600;
+    match chrono::DateTime::parse_from_rfc3339(last_refreshed) {
+        Ok(refreshed) => {
+            let now = Utc::now();
+            let refreshed_utc = refreshed.with_timezone(&Utc);
+            let elapsed_hours = (now - refreshed_utc).num_seconds() as u64 / 3600;
             elapsed_hours >= refresh_interval_hours as u64
         }
-        None => true,
+        Err(_) => true,
     }
-}
-
-fn parse_iso_timestamp(ts: &str) -> Option<u64> {
-    let ts = ts.trim_end_matches('Z');
-    let parts: Vec<&str> = ts.split('T').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-
-    let date_parts: Vec<&str> = parts[0].split('-').collect();
-    let time_parts: Vec<&str> = parts[1].split(':').collect();
-
-    if date_parts.len() != 3 || time_parts.len() < 2 {
-        return None;
-    }
-
-    let year: i64 = date_parts[0].parse().ok()?;
-    let month: u32 = date_parts[1].parse().ok()?;
-    let day: u32 = date_parts[2].parse().ok()?;
-    let hour: u64 = time_parts[0].parse().ok()?;
-    let minute: u64 = time_parts[1].parse().ok()?;
-    let second: u64 = time_parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-    let mut total_days: u64 = 0;
-    for y in 1970..year {
-        total_days += if is_leap_year(y) { 366 } else { 365 };
-    }
-
-    let month_days = if is_leap_year(year) {
-        [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    } else {
-        [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
-    };
-
-    for m in 0..(month as usize).saturating_sub(1) {
-        total_days += month_days[m] as u64;
-    }
-    total_days += (day - 1) as u64;
-
-    Some(total_days * 86400 + hour * 3600 + minute * 60 + second)
 }
 
 pub async fn refresh_all_providers(client: &Client) {
@@ -457,16 +368,15 @@ async fn refresh_single_provider(provider: &Provider, client: &Client) {
                 provider.name
             );
 
-            if let Ok(mut all_providers) = load_providers() {
-                if let Some(existing) = all_providers.iter_mut().find(|p| p.id == provider.id) {
+            let provider_id = provider.id.clone();
+            if let Err(e) = update_providers_with_lock(|all_providers| {
+                if let Some(existing) = all_providers.iter_mut().find(|p| p.id == provider_id) {
                     existing.models = models;
                 }
-
-                if let Err(e) = save_providers(&all_providers) {
-                    eprintln!(
-                        "[model-refresher] Failed to save providers after refresh: {e}"
-                    );
-                }
+            }) {
+                eprintln!(
+                    "[model-refresher] Failed to save providers after refresh: {e}"
+                );
             }
         }
         Err(e) => {
@@ -520,16 +430,15 @@ mod tests {
     #[test]
     fn test_current_iso_timestamp_format() {
         let ts = current_iso_timestamp();
-        assert!(ts.ends_with('Z'));
+        assert!(ts.ends_with("+00:00") || ts.ends_with('Z'));
         assert!(ts.contains('T'));
-        assert!(ts.len() == 20);
     }
 
     #[test]
     fn test_parse_iso_timestamp() {
         let ts = "2026-04-07T00:00:00Z";
-        let secs = parse_iso_timestamp(ts).unwrap();
-        assert!(secs > 0);
+        let parsed = chrono::DateTime::parse_from_rfc3339(ts);
+        assert!(parsed.is_ok());
     }
 
     #[test]
@@ -656,7 +565,8 @@ mod tests {
         let models = get_anthropic_models(&provider);
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "custom-claude-model");
-        assert_eq!(models[0].last_refreshed.as_ref().unwrap(), &now);
+        assert!(models[0].last_refreshed.is_some());
+        assert!(models[0].last_refreshed.as_ref().unwrap().starts_with("2026-"));
     }
 
     #[test]

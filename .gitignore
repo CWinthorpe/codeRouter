@@ -26,6 +26,7 @@ tsconfig.tsbuildinfo
 
 # ── Tauri build artifacts ──────────────────────────────────────────────────────
 src-tauri/gen/
+src-tauri/sidecar/
 *.AppImage
 *.deb
 *.rpm

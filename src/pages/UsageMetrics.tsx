@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react';
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import {
   BarChart,
   Bar,
@@ -26,19 +26,24 @@ const PAGE_SIZE = 50;
 const FETCH_LIMIT = 1000;
 
 function startOfDay(d: Date): Date {
-  const copy = new Date(d);
-  copy.setHours(0, 0, 0, 0);
+  const copy = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   return copy;
 }
 
 function endOfDay(d: Date): Date {
-  const copy = new Date(d);
-  copy.setHours(23, 59, 59, 999);
+  const copy = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
   return copy;
 }
 
 function formatDate(d: Date): string {
   return d.toISOString().slice(0, 10);
+}
+
+function formatUTCDate(d: Date): string {
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
 }
 
 function formatDisplayDate(d: Date): string {
@@ -65,8 +70,8 @@ function getDaysInRange(start: Date, end: Date): string[] {
   const current = startOfDay(start);
   const last = startOfDay(end);
   while (current <= last) {
-    days.push(formatDate(current));
-    current.setDate(current.getDate() + 1);
+    days.push(formatUTCDate(current));
+    current.setUTCDate(current.getUTCDate() + 1);
   }
   return days;
 }
@@ -111,8 +116,21 @@ function FilterDropdown({
   onToggle: () => void;
   onToggleOption: (value: string) => void;
 }) {
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!show) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        onToggle();
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [show, onToggle]);
+
   return (
-    <div className="relative">
+    <div className="relative" ref={ref}>
       <button
         onClick={onToggle}
         className={`flex items-center gap-2 rounded-md border px-3 py-1.5 text-sm transition-colors ${
@@ -196,6 +214,8 @@ export default function UsageMetrics() {
       }
     };
     loadData();
+    const interval = setInterval(loadData, 30000);
+    return () => clearInterval(interval);
   }, []);
 
   const filteredRequests = useMemo(() => {

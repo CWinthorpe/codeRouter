@@ -1,11 +1,15 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useLocation, Link } from 'react-router-dom';
 import { LayoutDashboard, Server, Layers, Terminal, BarChart3, Settings } from 'lucide-react';
 import { useStore } from '../store';
 import { useProxyStatusPoll } from '../hooks/useProxyStatusPoll';
+import { Onboarding } from './Onboarding';
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const loadInitialData = useStore((s) => s.loadInitialData);
+  const providers = useStore((s) => s.providers);
+  const groups = useStore((s) => s.groups);
+  const [showOnboarding, setShowOnboarding] = useState(true);
   useProxyStatusPoll();
 
   useEffect(() => {
@@ -16,6 +20,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     <div className="flex h-screen w-screen bg-zinc-950 text-zinc-100">
       <Sidebar />
       <main className="flex-1 overflow-auto p-8">{children}</main>
+      {showOnboarding && (
+        <Onboarding
+          providersCount={providers.length}
+          groupsCount={groups.length}
+          onDismiss={() => setShowOnboarding(false)}
+        />
+      )}
     </div>
   );
 }
