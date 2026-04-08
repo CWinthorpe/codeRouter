@@ -562,6 +562,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "coderouter-proxy",
+ "nix",
  "png",
  "reqwest 0.12.28",
  "rusqlite",

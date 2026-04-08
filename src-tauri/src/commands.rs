@@ -92,6 +92,15 @@ pub async fn get_providers() -> Result<Vec<ProviderResponse>, String> {
     Ok(providers.iter().map(|p| p.into()).collect())
 }
 
+async fn notify_sidecar_config_reload() {
+    let config = store::load_app_config().unwrap_or_default();
+    let url = format!("http://{}:{}/internal/config/reload", config.proxy_host, config.proxy_port);
+    let client = Client::new();
+    if let Err(e) = client.post(&url).send().await {
+        eprintln!("[notify-sidecar] failed to notify config reload: {e}");
+    }
+}
+
 #[tauri::command]
 pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), String> {
     if provider.protocol != "openai" && provider.protocol != "anthropic" {
@@ -122,6 +131,8 @@ pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), St
             .map_err(|e| e.to_string())?;
     }
 
+    notify_sidecar_config_reload().await;
+
     Ok(())
 }
 
@@ -131,7 +142,9 @@ pub async fn toggle_provider_enabled(provider_id: String, enabled: bool) -> Resu
     if let Some(provider) = providers.iter_mut().find(|p| p.id == provider_id) {
         provider.enabled = enabled;
     }
-    store::save_providers(&providers).map_err(|e| e.to_string())
+    store::save_providers(&providers).map_err(|e| e.to_string())?;
+    notify_sidecar_config_reload().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -153,6 +166,7 @@ pub async fn delete_provider(provider_id: String) -> Result<(), String> {
         .await
         .map_err(|e| e.to_string())?;
 
+    notify_sidecar_config_reload().await;
     Ok(())
 }
 
@@ -177,14 +191,18 @@ pub async fn save_group(group: Group) -> Result<(), String> {
         groups.push(group);
     }
 
-    store::save_groups(&groups).map_err(|e| e.to_string())
+    store::save_groups(&groups).map_err(|e| e.to_string())?;
+    notify_sidecar_config_reload().await;
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn delete_group(group_id: String) -> Result<(), String> {
     let mut groups = store::load_groups().map_err(|e| e.to_string())?;
     groups.retain(|g| g.id != group_id);
-    store::save_groups(&groups).map_err(|e| e.to_string())
+    store::save_groups(&groups).map_err(|e| e.to_string())?;
+    notify_sidecar_config_reload().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -194,7 +212,9 @@ pub async fn get_app_config() -> Result<AppConfig, String> {
 
 #[tauri::command]
 pub async fn save_app_config(config: AppConfig) -> Result<(), String> {
-    store::save_app_config(&config).map_err(|e| e.to_string())
+    store::save_app_config(&config).map_err(|e| e.to_string())?;
+    notify_sidecar_config_reload().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -513,6 +533,21 @@ pub struct AppState {
 }
 
 pub fn kill_sidecar(child: &mut Child) {
+    let pid = child.id() as i32;
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(_) => break,
+        }
+    }
     let _ = child.kill();
     let _ = child.wait();
 }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::RwLock;
@@ -43,7 +43,7 @@ use crate::proxy::upstream::{self, UpstreamError};
 
 #[derive(Clone)]
 pub struct AppState {
-    pub config: Arc<AppConfig>,
+    pub config: Arc<RwLock<Arc<AppConfig>>>,
     pub groups: Arc<RwLock<Arc<Vec<Group>>>>,
     pub providers: Arc<RwLock<Arc<Vec<Provider>>>>,
     pub client: Client,
@@ -77,7 +77,7 @@ pub async fn start_server() -> anyhow::Result<()> {
     let metrics_recorder = Arc::new(metrics_recorder);
 
     let state = AppState {
-        config: Arc::new(config),
+        config: Arc::new(RwLock::new(Arc::new(config))),
         groups: Arc::new(RwLock::new(Arc::new(groups))),
         providers: Arc::new(RwLock::new(Arc::new(providers))),
         client,
@@ -91,7 +91,10 @@ pub async fn start_server() -> anyhow::Result<()> {
     let (_scheduler_handle, scheduler_shutdown) = spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
 
     let refresh_client = state.client.clone();
-    let refresh_interval = state.config.refresh_interval_hours.max(1);
+    let refresh_interval = {
+        let config = state.config.read().unwrap();
+        config.refresh_interval_hours.max(1)
+    };
     let (refresh_shutdown, mut refresh_shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         loop {
@@ -109,8 +112,14 @@ pub async fn start_server() -> anyhow::Result<()> {
         }
     });
 
-    let host = state.config.proxy_host.clone();
-    let port = state.config.proxy_port;
+    let host = {
+        let config = state.config.read().unwrap();
+        config.proxy_host.clone()
+    };
+    let port = {
+        let config = state.config.read().unwrap();
+        config.proxy_port
+    };
     let addr = format!("{host}:{port}");
     let state = Arc::new(state);
     let app = Router::new()
@@ -120,6 +129,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         .route("/health", get(handle_health))
         .route("/internal/router/status", get(handle_internal_router_status))
         .route("/internal/router/entry", post(handle_internal_router_set_entry))
+        .route("/internal/config/reload", post(handle_internal_config_reload))
         .with_state(state.clone());
 
     let listener = TcpListener::bind(&addr).await?;
@@ -261,6 +271,9 @@ async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
+    if !body.is_object() {
+        return Err(AppError::BadRequest("request body must be a JSON object".into()));
+    }
     route_request(&state, body, "chat/completions").await
 }
 
@@ -268,6 +281,9 @@ async fn handle_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
+    if !body.is_object() {
+        return Err(AppError::BadRequest("request body must be a JSON object".into()));
+    }
     route_request(&state, body, "completions").await
 }
 
@@ -295,7 +311,10 @@ async fn route_request(
             .ok_or_else(|| AppError::NotFound(format!("no group found for model '{model}'")))?
     };
 
-    let providers = state.providers.read().map_err(|_| AppError::InternalError("providers lock poisoned".into()))?.clone();
+    let providers = {
+        let guard = state.providers.read().map_err(|_| AppError::InternalError("providers lock poisoned".into()))?;
+        guard.clone()
+    };
 
     let max_retries = group.entries.len();
     let mut skip_indices = HashSet::new();
@@ -344,7 +363,7 @@ async fn route_request(
         };
 
         let result = match upstream::send_with_timeout(req, timeout_ms, group.failover_config.on_latency_timeout).await {
-            Ok(resp) => process_response(resp, stream, &group.alias, is_anthropic).await,
+            Ok(resp) => process_response(resp, stream, &group.alias, is_anthropic, timeout_ms).await,
             Err(UpstreamError::Timeout) => {
                 eprintln!("request timed out for provider {}", provider.id);
                 {
@@ -522,10 +541,12 @@ async fn process_response(
     stream: bool,
     group_alias: &str,
     is_anthropic: bool,
+    latency_timeout_ms: u64,
 ) -> Result<StreamProcessResult, RequestError> {
     let status = resp.status();
 
     if status.as_u16() == 429 {
+        let _ = resp.bytes().await;
         return Err(RequestError::RateLimited);
     }
 
@@ -551,9 +572,12 @@ async fn process_response(
                 output_tokens: 0,
             }));
 
-            let raw_stream = resp.bytes_stream().map(|result| {
-                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-            });
+            let raw_stream = TimeoutStream::new(
+                resp.bytes_stream().map(|result| {
+                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                }),
+                latency_timeout_ms,
+            );
 
             if is_anthropic {
                 let (body, token_counts) = translator::translate_anthropic_stream(raw_stream, group_alias.to_string(), token_counts);
@@ -647,6 +671,45 @@ fn extract_anthropic_tokens(resp: &translator::MessagesResponse) -> (u64, u64) {
     (prompt_tokens, output_tokens)
 }
 
+struct TimeoutStream<S> {
+    inner: S,
+    timeout: std::time::Duration,
+    last_chunk: Instant,
+}
+
+impl<S> TimeoutStream<S> {
+    fn new(inner: S, timeout_ms: u64) -> Self {
+        Self {
+            inner,
+            timeout: std::time::Duration::from_millis(timeout_ms),
+            last_chunk: Instant::now(),
+        }
+    }
+}
+
+impl<S> Stream for TimeoutStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.last_chunk.elapsed() > self.timeout {
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "streaming response timed out",
+            ))));
+        }
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                self.last_chunk = Instant::now();
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            other => other,
+        }
+    }
+}
+
 struct MetricsRecordingStream<S> {
     inner: S,
     on_complete: Option<Box<dyn FnOnce(u64, u64) + Send + 'static>>,
@@ -672,7 +735,13 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
+            Poll::Ready(Some(Err(e))) => {
+                if let Some(cb) = self.on_complete.take() {
+                    cb(0, 0);
+                }
+                Poll::Ready(Some(Err(e)))
+            }
             Poll::Ready(None) => {
                 if let Some(cb) = self.on_complete.take() {
                     cb(0, 0);
@@ -822,4 +891,82 @@ async fn handle_internal_router_set_entry(
             Json(serde_json::json!({ "error": e })),
         )),
     }
+}
+
+async fn handle_internal_config_reload(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let new_config = match load_app_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[config-reload] failed to load app config: {e}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to load app config: {e}") })),
+            ));
+        }
+    };
+    let new_groups = match load_groups() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[config-reload] failed to load groups: {e}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to load groups: {e}") })),
+            ));
+        }
+    };
+    let new_providers = match load_providers() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[config-reload] failed to load providers: {e}");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("failed to load providers: {e}") })),
+            ));
+        }
+    };
+
+    let old_counters = {
+        let guard = state.router_state.lock().unwrap();
+        let mut map: HashMap<String, (u64, u64)> = HashMap::new();
+        for (key, entry) in guard.entries.iter() {
+            map.insert(key.clone(), (entry.daily_tokens_used, entry.daily_requests_used));
+        }
+        map
+    };
+
+    *state.config.write().unwrap() = Arc::new(new_config);
+    *state.groups.write().unwrap() = Arc::new(new_groups.clone());
+    *state.providers.write().unwrap() = Arc::new(new_providers.clone());
+
+    let new_router_state = router::init_router_state(&new_groups, &new_providers);
+
+    {
+        let new_entries = {
+            let new_guard = new_router_state.lock().unwrap();
+            new_guard.entries.clone()
+        };
+        let mut guard = state.router_state.lock().unwrap();
+        for (key, new_entry) in new_entries {
+            if let Some(existing) = guard.entries.get_mut(&key) {
+                if let Some((tokens, requests)) = old_counters.get(&key) {
+                    existing.daily_tokens_used = *tokens;
+                    existing.daily_requests_used = *requests;
+                }
+            } else {
+                let mut entry = new_entry;
+                if let Some((tokens, requests)) = old_counters.get(&key) {
+                    entry.daily_tokens_used = *tokens;
+                    entry.daily_requests_used = *requests;
+                }
+                guard.entries.insert(key, entry);
+            }
+        }
+    }
+
+    router::init_daily_totals_from_db(&state.router_state, &new_providers);
+
+    eprintln!("[config-reload] config reloaded successfully");
+    Ok(Json(serde_json::json!({ "status": "ok" })))
 }

@@ -38,33 +38,41 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
         }
     }
 
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&tmp_path)?;
+    let write_result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)?;
 
-    file.lock_exclusive()?;
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    file.sync_all()?;
+        file.lock_exclusive()?;
+        file.write_all(content.as_bytes())?;
+        file.flush()?;
+        file.sync_all()?;
 
-    let mut perms = file.metadata()?.permissions();
-    perms.set_mode(0o600);
-    file.set_permissions(perms)?;
-
-    file.unlock()?;
-
-    fs::rename(&tmp_path, path)?;
-
-    // Ensure the final file also has 0600 permissions (rename preserves perms, but be explicit)
-    if let Ok(metadata) = fs::metadata(path) {
-        let mut perms = metadata.permissions();
+        let mut perms = file.metadata()?.permissions();
         perms.set_mode(0o600);
-        fs::set_permissions(path, perms)?;
+        file.set_permissions(perms)?;
+
+        file.unlock()?;
+
+        fs::rename(&tmp_path, path)?;
+
+        // Ensure the final file also has 0600 permissions (rename preserves perms, but be explicit)
+        if let Ok(metadata) = fs::metadata(path) {
+            let mut perms = metadata.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(path, perms)?;
+        }
+
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp_path);
     }
 
-    Ok(())
+    write_result
 }
 
 fn read_locked(path: &Path) -> Result<String> {

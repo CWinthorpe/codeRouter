@@ -50,14 +50,16 @@ pub fn get_daily_summary(
     provider_id: &str,
     date: NaiveDate,
 ) -> Result<DailySummary> {
-    let start_ts = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
-    let end_ts = date
+    let reset_hour = 0u32;
+    let start_dt = date.and_hms_opt(reset_hour, 0, 0).unwrap().and_utc();
+    let end_dt = date
         .succ_opt()
         .unwrap()
-        .and_hms_opt(0, 0, 0)
+        .and_hms_opt(reset_hour, 0, 0)
         .unwrap()
-        .and_utc()
-        .timestamp();
+        .and_utc();
+    let start_ts = start_dt.timestamp();
+    let end_ts = end_dt.timestamp();
 
     let mut stmt = conn.prepare(
         "SELECT 
@@ -120,9 +122,10 @@ pub fn get_usage_by_day(
     days: u32,
 ) -> Result<Vec<DailyUsage>> {
     let now = Utc::now();
+    let reset_hour = 0u32;
     let start_date = (now - chrono::Duration::days(days as i64)).date_naive();
     let start_ts = start_date
-        .and_hms_opt(0, 0, 0)
+        .and_hms_opt(reset_hour, 0, 0)
         .unwrap()
         .and_utc()
         .timestamp();
@@ -196,14 +199,16 @@ pub fn get_latency_percentiles(
     provider_id: &str,
     date: NaiveDate,
 ) -> Result<Option<LatencyPercentiles>> {
-    let start_ts = date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp();
-    let end_ts = date
+    let reset_hour = 0u32;
+    let start_dt = date.and_hms_opt(reset_hour, 0, 0).unwrap().and_utc();
+    let end_dt = date
         .succ_opt()
         .unwrap()
-        .and_hms_opt(0, 0, 0)
+        .and_hms_opt(reset_hour, 0, 0)
         .unwrap()
-        .and_utc()
-        .timestamp();
+        .and_utc();
+    let start_ts = start_dt.timestamp();
+    let end_ts = end_dt.timestamp();
 
     let mut stmt = conn.prepare(
         "SELECT latency_ms FROM requests
@@ -265,6 +270,39 @@ pub fn get_today_token_totals(
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Failed to collect today's token totals: {}", e))
+}
+
+pub fn get_today_request_counts(
+    conn: &Connection,
+    quota_reset_utc_hour: u32,
+) -> Result<Vec<(String, u64)>> {
+    let now = Utc::now();
+    let today_start = now
+        .date_naive()
+        .and_hms_opt(quota_reset_utc_hour, 0, 0)
+        .unwrap()
+        .and_utc();
+    let start_ts = if today_start <= now {
+        today_start.timestamp()
+    } else {
+        (today_start - chrono::Duration::days(1)).timestamp()
+    };
+
+    let mut stmt = conn.prepare(
+        "SELECT provider_id, COUNT(*) as total_requests
+         FROM requests
+         WHERE ts >= ?1
+         GROUP BY provider_id",
+    )?;
+
+    let rows = stmt.query_map([&start_ts.to_string()], |row| {
+        let provider_id: String = row.get(0)?;
+        let total_requests: i64 = row.get(1)?;
+        Ok((provider_id, total_requests as u64))
+    })?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to collect today's request counts: {}", e))
 }
 
 #[cfg(test)]

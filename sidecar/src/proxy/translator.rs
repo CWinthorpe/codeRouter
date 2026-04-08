@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -402,7 +402,7 @@ where
                         self.buffer.drain(..=newline_pos);
 
                         let line = String::from_utf8_lossy(&line_bytes);
-                        let line = line.trim();
+                        let line = line.strip_suffix('\r').unwrap_or(&line).trim();
 
                         if line.starts_with("data: ") {
                             let data = &line[6..];
@@ -547,7 +547,7 @@ where
                         let line_bytes = self.buffer[..newline_pos].to_vec();
                         self.buffer.drain(..=newline_pos);
                         let line = String::from_utf8_lossy(&line_bytes);
-                        let line = line.trim();
+                        let line = line.strip_suffix('\r').unwrap_or(&line).trim();
 
                         if line.starts_with("data: ") {
                             let data = &line[6..];
@@ -602,6 +602,10 @@ where
     }
 }
 
+// Crude heuristic: ~4 characters per token for English text.
+// This is acceptable for estimation purposes (e.g. output token
+// counting in streams where the provider does not report usage).
+// Actual token counts from the provider should be preferred when available.
 fn estimate_tokens_from_text(text: &str) -> u64 {
     let char_count = text.chars().count() as u64;
     char_count.saturating_div(4).max(1)

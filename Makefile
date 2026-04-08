@@ -13,3 +13,6 @@ clean:
 	cargo clean
 	rm -rf dist/
 	rm -rf node_modules/.vite/
+	rm -rf src-tauri/gen/
+	rm -rf src-tauri/target/
+	rm -rf target/

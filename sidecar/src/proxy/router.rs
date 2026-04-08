@@ -100,7 +100,7 @@ pub fn init_and_set_global_router_state(
 
 pub fn init_daily_totals_from_db(state: &SharedRouterState, providers: &[Provider]) {
     use crate::metrics::db::init_db;
-    use crate::metrics::queries::get_today_token_totals;
+    use crate::metrics::queries::{get_today_request_counts, get_today_token_totals};
 
     let conn = match init_db() {
         Ok(c) => c,
@@ -123,6 +123,21 @@ pub fn init_daily_totals_from_db(state: &SharedRouterState, providers: &[Provide
                 for (key, entry_state) in guard.entries.iter_mut() {
                     if key.starts_with(&format!("{provider_id}:")) {
                         entry_state.daily_tokens_used = tokens;
+                    }
+                }
+            }
+        }
+
+        let request_counts = match get_today_request_counts(&conn, provider.quota_reset_utc_hour) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for (provider_id, requests) in request_counts {
+            if provider_id == provider.id {
+                for (key, entry_state) in guard.entries.iter_mut() {
+                    if key.starts_with(&format!("{provider_id}:")) {
+                        entry_state.daily_requests_used = requests;
                     }
                 }
             }
