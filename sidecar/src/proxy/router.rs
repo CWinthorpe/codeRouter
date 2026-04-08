@@ -30,6 +30,7 @@ pub struct EntryState {
     pub cooldown_until: Option<DateTime<Utc>>,
     pub consecutive_errors: u32,
     pub daily_tokens_used: u64,
+    pub daily_requests_used: u64,
     pub daily_reset_at: DateTime<Utc>,
     pub cooldown_duration_seconds: Option<i64>,
 }
@@ -53,6 +54,7 @@ impl EntryState {
             cooldown_until: None,
             consecutive_errors: 0,
             daily_tokens_used: 0,
+            daily_requests_used: 0,
             daily_reset_at,
             cooldown_duration_seconds: Some(60),
         }
@@ -168,6 +170,15 @@ pub fn select_entry<'a>(
                         return false;
                     }
                 }
+                let effective_request_quota = providers
+                    .iter()
+                    .find(|p| p.id == entry.provider_id)
+                    .and_then(|p| p.daily_request_quota);
+                if let Some(quota) = effective_request_quota {
+                    if entry_state.daily_requests_used >= quota {
+                        return false;
+                    }
+                }
                 true
             } else {
                 true
@@ -193,6 +204,7 @@ pub struct EntryStatusResponse {
     pub cooldown_until: Option<DateTime<Utc>>,
     pub consecutive_errors: u32,
     pub daily_tokens_used: u64,
+    pub daily_requests_used: u64,
     pub daily_reset_at: DateTime<Utc>,
     pub cooldown_duration_seconds: Option<i64>,
 }
@@ -216,6 +228,7 @@ pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusR
                     cooldown_until: None,
                     consecutive_errors: 0,
                     daily_tokens_used: 0,
+                    daily_requests_used: 0,
                     daily_reset_at: Utc::now(),
                     cooldown_duration_seconds: Some(60),
                 });
@@ -230,6 +243,7 @@ pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusR
                 cooldown_until: entry_state.cooldown_until,
                 consecutive_errors: entry_state.consecutive_errors,
                 daily_tokens_used: entry_state.daily_tokens_used,
+                daily_requests_used: entry_state.daily_requests_used,
                 daily_reset_at: entry_state.daily_reset_at,
                 cooldown_duration_seconds: entry_state.cooldown_duration_seconds,
             });
@@ -243,14 +257,23 @@ pub fn record_success(
     provider_id: &str,
     entry_index: u32,
     tokens_used: u64,
+    effective_quota: Option<u64>,
+    on_quota_exhausted: bool,
 ) {
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.consecutive_errors = 0;
         entry_state.daily_tokens_used += tokens_used;
+        entry_state.daily_requests_used += 1;
         if entry_state.status == EntryStatus::Cooldown {
             entry_state.status = EntryStatus::Active;
             entry_state.cooldown_until = None;
+        }
+        if let Some(quota) = effective_quota {
+            if entry_state.daily_tokens_used >= quota && on_quota_exhausted {
+                entry_state.status = EntryStatus::QuotaExhausted;
+                entry_state.cooldown_until = None;
+            }
         }
     }
 }
@@ -292,13 +315,15 @@ pub fn record_consecutive_error(
     entry_index: u32,
     threshold: u32,
     trigger_enabled: bool,
+    cooldown_ms: u64,
 ) {
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.consecutive_errors += 1;
         if trigger_enabled && entry_state.consecutive_errors >= threshold {
             entry_state.status = EntryStatus::Cooldown;
-            entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::minutes(10));
+            entry_state.cooldown_until =
+                Some(Utc::now() + chrono::Duration::milliseconds(cooldown_ms as i64));
             entry_state.consecutive_errors = 0;
         }
     }
@@ -308,11 +333,14 @@ pub fn record_latency_timeout(
     state: &mut RouterState,
     provider_id: &str,
     entry_index: u32,
+    cooldown_ms: u64,
 ) -> Result<(), &'static str> {
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.status = EntryStatus::Cooldown;
-        entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::minutes(5));
+        entry_state.cooldown_until =
+            Some(Utc::now() + chrono::Duration::milliseconds(cooldown_ms as i64));
+        entry_state.consecutive_errors = 0;
         Ok(())
     } else {
         Err("entry state not found")
@@ -341,6 +369,7 @@ mod tests {
             base_url: "https://api.test.com/v1".to_string(),
             credential_key: id.to_string(),
             daily_token_quota: quota,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![],
@@ -361,6 +390,8 @@ mod tests {
                 consecutive_error_threshold: 3,
                 on_latency_timeout: true,
                 latency_timeout_ms: 30000,
+                latency_timeout_cooldown_ms: 300000,
+                consecutive_error_cooldown_ms: 600000,
             },
         }
     }
@@ -427,7 +458,7 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_success(&mut s, "p1", 0, 100);
+            record_success(&mut s, "p1", 0, 100, Some(100), true);
         }
         let state = state.lock().unwrap();
         let skip = std::collections::HashSet::new();
@@ -443,9 +474,9 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_consecutive_error(&mut s, "p1", 0, 3, true);
-            record_consecutive_error(&mut s, "p1", 0, 3, true);
-            record_success(&mut s, "p1", 0, 50);
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            record_success(&mut s, "p1", 0, 50, None, false);
         }
         let state = state.lock().unwrap();
         let entry = state.entries.get("p1:0").unwrap();
@@ -477,9 +508,9 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_consecutive_error(&mut s, "p1", 0, 3, true);
-            record_consecutive_error(&mut s, "p1", 0, 3, true);
-            record_consecutive_error(&mut s, "p1", 0, 3, true);
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
         }
         let state = state.lock().unwrap();
         let entry = state.entries.get("p1:0").unwrap();
@@ -510,7 +541,7 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            let result = record_latency_timeout(&mut s, "p1", 0);
+            let result = record_latency_timeout(&mut s, "p1", 0, 300000);
             assert!(result.is_ok());
         }
         let state = state.lock().unwrap();
@@ -571,7 +602,7 @@ mod tests {
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::Cooldown);
             assert!(entry.cooldown_until.is_some());
-            record_success(&mut s, "p1", 0, 50);
+            record_success(&mut s, "p1", 0, 50, None, false);
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert!(entry.cooldown_until.is_none());
@@ -622,6 +653,40 @@ mod tests {
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::QuotaExhausted);
             assert!(entry.cooldown_until.is_none());
+        }
+    }
+
+    #[test]
+    fn test_record_success_sets_quota_exhausted_when_exceeded() {
+        let providers = vec![test_provider("p1", Some(100))];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_success(&mut s, "p1", 0, 60, Some(100), true);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::Active);
+            assert_eq!(entry.daily_tokens_used, 60);
+            record_success(&mut s, "p1", 0, 50, Some(100), true);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::QuotaExhausted);
+            assert_eq!(entry.daily_tokens_used, 110);
+        }
+    }
+
+    #[test]
+    fn test_record_success_does_not_set_quota_exhausted_when_disabled() {
+        let providers = vec![test_provider("p1", Some(100))];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_success(&mut s, "p1", 0, 150, Some(100), false);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::Active);
+            assert_eq!(entry.daily_tokens_used, 150);
         }
     }
 }

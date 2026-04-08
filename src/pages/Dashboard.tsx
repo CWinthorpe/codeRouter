@@ -5,6 +5,9 @@ import { getDailySummary, getRecentRequests } from '../lib/ipc';
 import { useGroupStatusPoll } from '../hooks/useGroupStatusPoll';
 import type { DailySummary, RequestRow, Provider, EntryStatusResponse } from '../types';
 import { Server, Power, Terminal, ChevronDown, ChevronRight, AlertTriangle, CheckCircle, MinusCircle } from 'lucide-react';
+import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -115,20 +118,7 @@ function getProviderCardSortSubKey(
   return 2;
 }
 
-function StatusBadge({ status }: { status: string }) {
-  const colors: Record<string, string> = {
-    success: 'bg-green-500/20 text-green-400 border-green-500/30',
-    failover: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',
-    error: 'bg-red-500/20 text-red-400 border-red-500/30',
-    timeout: 'bg-zinc-500/20 text-zinc-400 border-zinc-500/30',
-  };
-  const color = colors[status] ?? colors.error;
-  return (
-    <span className={`inline-flex items-center rounded border px-2 py-0.5 text-xs font-medium capitalize ${color}`}>
-      {status}
-    </span>
-  );
-}
+import { StatusBadge } from '@/components/StatusBadge';
 
 function ProxyStatusCard() {
   const { proxyStatus, appConfig } = useStore((s) => ({ proxyStatus: s.proxyStatus, appConfig: s.appConfig }));
@@ -136,49 +126,53 @@ function ProxyStatusCard() {
   const navigate = useNavigate();
 
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-6">
-      <div className="flex items-start justify-between">
-        <div>
-          <div className="flex items-center gap-3">
-            <Server className="h-5 w-5 text-zinc-400" />
-            <h2 className="text-lg font-semibold">Proxy Status</h2>
-          </div>
-          <div className="mt-4 flex items-center gap-4">
-            <span
-              className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-medium ${
-                proxyStatus === 'running'
-                  ? 'bg-green-500/20 text-green-400'
-                  : 'bg-red-500/20 text-red-400'
-              }`}
-            >
-              <Power className="h-4 w-4" />
-              {proxyStatus === 'running' ? 'Running' : 'Stopped'}
-            </span>
-          </div>
-          <div className="mt-3 space-y-1 text-sm text-zinc-400">
-            {appConfig && (
-              <>
-                <p>
-                  Listening on <span className="text-zinc-200">{appConfig.proxy_host}:{appConfig.proxy_port}</span>
-                </p>
-                {health && health.uptime_seconds > 0 && (
+    <Card className="bg-zinc-900 border-zinc-800">
+      <CardHeader>
+        <div className="flex items-start justify-between">
+          <div>
+            <CardTitle className="flex items-center gap-3 text-lg">
+              <Server className="h-5 w-5 text-zinc-400" />
+              Proxy Status
+            </CardTitle>
+            <div className="mt-4 flex items-center gap-4">
+              <Badge
+                variant="outline"
+                className={`gap-2 rounded-full px-3 py-1 text-sm font-medium ${
+                  proxyStatus === 'running'
+                    ? 'bg-green-500/20 text-green-400 border-green-500/30'
+                    : 'bg-red-500/20 text-red-400 border-red-500/30'
+                }`}
+              >
+                <Power className="h-4 w-4" />
+                {proxyStatus === 'running' ? 'Running' : 'Stopped'}
+              </Badge>
+            </div>
+            <div className="mt-3 space-y-1 text-sm text-zinc-400">
+              {appConfig && (
+                <>
                   <p>
-                    Uptime: <span className="text-zinc-200">{formatUptime(health.uptime_seconds)}</span>
+                    Listening on <span className="text-zinc-200">{appConfig.proxy_host}:{appConfig.proxy_port}</span>
                   </p>
-                )}
-              </>
-            )}
+                  {health && health.uptime_seconds > 0 && (
+                    <p>
+                      Uptime: <span className="text-zinc-200">{formatUptime(health.uptime_seconds)}</span>
+                    </p>
+                  )}
+                </>
+              )}
+            </div>
           </div>
+          <Button
+            variant="outline"
+            onClick={() => navigate('/opencode')}
+            className="gap-2 bg-zinc-800 text-zinc-200 hover:bg-zinc-700"
+          >
+            <Terminal className="h-4 w-4" />
+            Configure OpenCode
+          </Button>
         </div>
-        <button
-          onClick={() => navigate('/opencode')}
-          className="inline-flex items-center gap-2 rounded-md bg-zinc-800 px-4 py-2 text-sm font-medium text-zinc-200 transition-colors hover:bg-zinc-700"
-        >
-          <Terminal className="h-4 w-4" />
-          Configure OpenCode
-        </button>
-      </div>
-    </div>
+      </CardHeader>
+    </Card>
   );
 }
 
@@ -206,58 +200,60 @@ function ProviderHealthCard({
           : 'text-zinc-500';
 
   return (
-    <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-5">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <h3 className="font-medium">{provider.name}</h3>
-          <span className="rounded bg-zinc-800 px-2 py-0.5 text-xs text-zinc-400">{provider.protocol}</span>
-        </div>
-        <span className={`text-sm font-medium ${statusColor}`}>{overallStatus}</span>
-      </div>
-
-      <div className="mt-3 flex gap-4 text-xs text-zinc-400">
-        <span>
-          <CheckCircle className="mr-1 inline h-3 w-3 text-green-500" />
-          {entryCounts.active} Active
-        </span>
-        <span>
-          <AlertTriangle className="mr-1 inline h-3 w-3 text-yellow-500" />
-          {entryCounts.cooldown} Cooldown
-        </span>
-        <span>
-          <MinusCircle className="mr-1 inline h-3 w-3 text-zinc-500" />
-          {entryCounts.disabled} Disabled
-        </span>
-      </div>
-
-      {quota && quota > 0 && (
-        <div className="mt-4">
-          <div className="mb-1 flex items-center justify-between text-xs text-zinc-400">
-            <span>Tokens today</span>
-            <span>
-              {formatTokens(totalTokensToday)} / {formatTokens(quota)}
-            </span>
+    <Card className="bg-zinc-900 border-zinc-800">
+      <CardContent className="p-5">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium">{provider.name}</h3>
+            <Badge variant="secondary" className="bg-zinc-800 text-zinc-400">{provider.protocol}</Badge>
           </div>
-          <div className="h-2 overflow-hidden rounded-full bg-zinc-800">
-            <div
-              className={`h-full rounded-full transition-all ${
-                progressPct > 90 ? 'bg-red-500' : progressPct > 70 ? 'bg-yellow-500' : 'bg-green-500'
-              }`}
-              style={{ width: `${progressPct}%` }}
-            />
-          </div>
+          <span className={`text-sm font-medium ${statusColor}`}>{overallStatus}</span>
         </div>
-      )}
 
-      {summary && summary.total_cost > 0 && (
-        <p className="mt-2 text-xs text-zinc-400">
-          Est. cost today:{' '}
-          <span className="text-zinc-200">
-            ${summary.total_cost.toFixed(4)}
+        <div className="mt-3 flex gap-4 text-xs text-zinc-400">
+          <span>
+            <CheckCircle className="mr-1 inline h-3 w-3 text-green-500" />
+            {entryCounts.active} Active
           </span>
-        </p>
-      )}
-    </div>
+          <span>
+            <AlertTriangle className="mr-1 inline h-3 w-3 text-yellow-500" />
+            {entryCounts.cooldown} Cooldown
+          </span>
+          <span>
+            <MinusCircle className="mr-1 inline h-3 w-3 text-zinc-500" />
+            {entryCounts.disabled} Disabled
+          </span>
+        </div>
+
+        {quota && quota > 0 && (
+          <div className="mt-4">
+            <div className="mb-1 flex items-center justify-between text-xs text-zinc-400">
+              <span>Tokens today</span>
+              <span>
+                {formatTokens(totalTokensToday)} / {formatTokens(quota)}
+              </span>
+            </div>
+            <div className="h-2 overflow-hidden rounded-full bg-zinc-800">
+              <div
+                className={`h-full rounded-full transition-all ${
+                  progressPct > 90 ? 'bg-red-500' : progressPct > 70 ? 'bg-yellow-500' : 'bg-green-500'
+                }`}
+                style={{ width: `${progressPct}%` }}
+              />
+            </div>
+          </div>
+        )}
+
+        {summary && summary.total_cost > 0 && (
+          <p className="mt-2 text-xs text-zinc-400">
+            Est. cost today:{' '}
+            <span className="text-zinc-200">
+              ${summary.total_cost.toFixed(4)}
+            </span>
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 
@@ -266,22 +262,28 @@ function ProviderHealthCards() {
   const entryStatusData = useGroupStatusPoll();
   const [summaries, setSummaries] = useState<Record<string, DailySummary | null>>({});
 
-  useEffect(() => {
+  const fetchSummaries = async () => {
     const today = new Date().toISOString().slice(0, 10);
-    const fetchSummaries = async () => {
-      const results: Record<string, DailySummary | null> = {};
-      await Promise.all(
-        providers.map(async (p) => {
-          try {
-            results[p.id] = await getDailySummary(p.id, today);
-          } catch {
-            results[p.id] = null;
-          }
-        }),
-      );
-      setSummaries(results);
-    };
+    const results: Record<string, DailySummary | null> = {};
+    await Promise.all(
+      providers.map(async (p) => {
+        try {
+          results[p.id] = await getDailySummary(p.id, today);
+        } catch {
+          results[p.id] = null;
+        }
+      }),
+    );
+    setSummaries(results);
+  };
+
+  useEffect(() => {
     fetchSummaries();
+  }, [providers]);
+
+  useEffect(() => {
+    const interval = setInterval(fetchSummaries, 60000);
+    return () => clearInterval(interval);
   }, [providers]);
 
   const sortedProviders = [...providers].sort((a, b) => {

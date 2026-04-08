@@ -9,6 +9,8 @@ use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::Manager;
 
+type TrayMenuResult = Result<(Menu<tauri::Wry>, MenuItem<tauri::Wry>, MenuItem<tauri::Wry>), String>;
+
 fn load_icon_bytes(running: bool) -> &'static [u8] {
     if running {
         include_bytes!("../icons/tray-active.png")
@@ -47,7 +49,7 @@ pub(crate) fn update_menu_labels(state: &AppState, running: bool) {
     let _ = state.toggle_proxy_item.set_text(if running { "Stop Proxy" } else { "Start Proxy" });
 }
 
-fn build_menu(app_handle: &tauri::AppHandle, running: bool) -> Result<(Menu<tauri::Wry>, MenuItem<tauri::Wry>, MenuItem<tauri::Wry>), String> {
+fn build_menu(app_handle: &tauri::AppHandle, running: bool) -> TrayMenuResult {
     let open_item = MenuItem::with_id(app_handle, "open_window", "Open CodeRouter", true, None::<&str>)
         .map_err(|e| e.to_string())?;
     let sep1 = PredefinedMenuItem::separator(app_handle).map_err(|e| e.to_string())?;
@@ -107,7 +109,7 @@ async fn poll_health(app: tauri::AppHandle) {
 
         {
             let state = app.state::<AppState>();
-            let mut proxy_running = state.proxy_running.lock().unwrap();
+            let mut proxy_running = state.proxy_running.lock().unwrap_or_else(|e| e.into_inner());
             *proxy_running = running;
         }
 
@@ -271,6 +273,7 @@ fn main() {
             commands::set_opencode_config_path,
             commands::get_latency_percentiles,
             commands::remove_coderouter_from_opencode,
+            commands::dismiss_onboarding,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

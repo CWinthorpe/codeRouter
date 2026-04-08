@@ -2,6 +2,12 @@ use url::Host;
 
 /// Validate that a base_url is safe for upstream requests.
 /// Rejects private/reserved IP ranges to prevent SSRF attacks.
+///
+/// NOTE: This validation checks the URL string at parse time only.
+/// It does NOT protect against DNS rebinding attacks, where a domain
+/// initially resolves to a public IP but later resolves to a private IP.
+/// For full DNS rebinding protection, resolve the hostname at request
+/// time and validate the IP address before each connection.
 pub fn validate_base_url(base_url: &str) -> Result<(), String> {
     let parsed =
         url::Url::parse(base_url).map_err(|e| format!("Invalid URL '{}': {}", base_url, e))?;

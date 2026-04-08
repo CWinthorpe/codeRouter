@@ -125,3 +125,7 @@ export async function isGroupReferencedInOpencode(groupAlias: string): Promise<b
 export async function removeCoderouterFromOpencode(): Promise<void> {
   return invoke<void>('remove_coderouter_from_opencode');
 }
+
+export async function dismissOnboarding(): Promise<void> {
+  return invoke<void>('dismiss_onboarding');
+}

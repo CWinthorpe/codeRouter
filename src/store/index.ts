@@ -28,17 +28,35 @@ export const useStore = create<AppState>((set) => ({
   setProxyStatus: (proxyStatus) => set({ proxyStatus }),
 
   loadInitialData: async () => {
-    try {
-      const [providers, groups, appConfig] = await Promise.all([
-        getProviders(),
-        getGroups(),
-        getAppConfig(),
-      ]);
-      set({ providers, groups, appConfig, loadError: null });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      console.error('loadInitialData failed:', message);
-      set({ loadError: message });
+    const results = await Promise.allSettled([
+      getProviders(),
+      getGroups(),
+      getAppConfig(),
+    ]);
+
+    const errors: string[] = [];
+
+    if (results[0].status === 'fulfilled') {
+      set({ providers: results[0].value, loadError: null });
+    } else {
+      errors.push(`providers: ${results[0].reason}`);
+    }
+
+    if (results[1].status === 'fulfilled') {
+      set({ groups: results[1].value, loadError: null });
+    } else {
+      errors.push(`groups: ${results[1].reason}`);
+    }
+
+    if (results[2].status === 'fulfilled') {
+      set({ appConfig: results[2].value, loadError: null });
+    } else {
+      errors.push(`appConfig: ${results[2].reason}`);
+    }
+
+    if (errors.length > 0) {
+      console.error('loadInitialData partial failures:', errors);
+      set({ loadError: errors.join('; ') });
     }
   },
 }));

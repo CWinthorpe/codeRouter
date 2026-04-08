@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::RwLock;
 use std::time::Instant;
 
 use axum::{
@@ -11,15 +12,20 @@ use axum::{
     Json, Router,
 };
 use axum::response::Response;
+use bytes::Bytes;
+use futures::stream::Stream;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::oneshot;
 
 use crate::config::{
-    models::{AppConfig, Group},
+    models::{AppConfig, Group, Provider},
     store::{load_app_config, load_groups, load_providers},
 };
 use crate::credentials::keychain::get_credential;
@@ -38,7 +44,8 @@ use crate::proxy::upstream::{self, UpstreamError};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<AppConfig>,
-    pub groups: Arc<Vec<Group>>,
+    pub groups: Arc<RwLock<Arc<Vec<Group>>>>,
+    pub providers: Arc<RwLock<Arc<Vec<Provider>>>>,
     pub client: Client,
     pub router_state: SharedRouterState,
     pub metrics_recorder: Arc<MetricsRecorder>,
@@ -71,7 +78,8 @@ pub async fn start_server() -> anyhow::Result<()> {
 
     let state = AppState {
         config: Arc::new(config),
-        groups: Arc::new(groups),
+        groups: Arc::new(RwLock::new(Arc::new(groups))),
+        providers: Arc::new(RwLock::new(Arc::new(providers))),
         client,
         router_state,
         metrics_recorder: metrics_recorder.clone(),
@@ -80,13 +88,20 @@ pub async fn start_server() -> anyhow::Result<()> {
     let scheduler_groups = state.groups.clone();
     let scheduler_client = state.client.clone();
     let scheduler_state = state.router_state.clone();
-    let _scheduler_handle = spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
+    let (_scheduler_handle, scheduler_shutdown) = spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
 
     let refresh_client = state.client.clone();
-    let refresh_interval = state.config.refresh_interval_hours;
+    let refresh_interval = state.config.refresh_interval_hours.max(1);
+    let (refresh_shutdown, mut refresh_shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         loop {
-            refresh_all_providers(&refresh_client).await;
+            tokio::select! {
+                _ = &mut refresh_shutdown_rx => {
+                    eprintln!("[model-refresher] Shutting down gracefully");
+                    break;
+                }
+                _ = refresh_all_providers(&refresh_client) => {}
+            }
             tokio::time::sleep(std::time::Duration::from_secs(
                 (refresh_interval as u64).saturating_mul(3600),
             ))
@@ -123,6 +138,10 @@ pub async fn start_server() -> anyhow::Result<()> {
                 eprintln!("Received SIGINT, shutting down gracefully");
             }
         }
+        let _ = scheduler_shutdown.send(());
+        let _ = refresh_shutdown.send(());
+        drop(state.metrics_recorder.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     });
 
     server.await?;
@@ -149,10 +168,10 @@ struct ModelObject {
 }
 
 async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse> {
-    let providers = load_providers().unwrap_or_default();
+    let providers = state.providers.read().unwrap();
     let router_state = state.router_state.lock().unwrap();
-    let data = state
-        .groups
+    let groups = state.groups.read().unwrap();
+    let data = groups
         .iter()
         .filter(|g| {
             g.entries.iter().enumerate().any(|(idx, e)| {
@@ -161,7 +180,30 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
                 }
                 let key = format!("{}:{}", e.provider_id, idx);
                 if let Some(entry_state) = router_state.entries.get(&key) {
-                    entry_state.status == router::EntryStatus::Active
+                    if entry_state.status != router::EntryStatus::Active {
+                        return false;
+                    }
+                    let effective_quota = e.daily_token_quota_override.or_else(|| {
+                        providers
+                            .iter()
+                            .find(|p| p.id == e.provider_id)
+                            .and_then(|p| p.daily_token_quota)
+                    });
+                    if let Some(quota) = effective_quota {
+                        if entry_state.daily_tokens_used >= quota {
+                            return false;
+                        }
+                    }
+                    let effective_request_quota = providers
+                        .iter()
+                        .find(|p| p.id == e.provider_id)
+                        .and_then(|p| p.daily_request_quota);
+                    if let Some(quota) = effective_request_quota {
+                        if entry_state.daily_requests_used >= quota {
+                            return false;
+                        }
+                    }
+                    true
                 } else {
                     true
                 }
@@ -244,16 +286,16 @@ async fn route_request(
 
     let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let group = state
-        .groups
-        .iter()
-        .find(|g| g.alias == model)
-        .ok_or_else(|| AppError::NotFound(format!("no group found for model '{model}'")))?;
+    let group = {
+        let groups = state.groups.read().map_err(|_| AppError::InternalError("groups lock poisoned".into()))?;
+        groups
+            .iter()
+            .find(|g| g.alias == model)
+            .cloned()
+            .ok_or_else(|| AppError::NotFound(format!("no group found for model '{model}'")))?
+    };
 
-    let providers = load_providers().map_err(|e| {
-        eprintln!("failed to load providers: {e}");
-        AppError::InternalError(e.to_string())
-    })?;
+    let providers = state.providers.read().map_err(|_| AppError::InternalError("providers lock poisoned".into()))?.clone();
 
     let max_retries = group.entries.len();
     let mut skip_indices = HashSet::new();
@@ -261,7 +303,7 @@ async fn route_request(
     for _attempt in 0..max_retries {
         let (entry, entry_index) = {
             let router_state = state.router_state.lock().unwrap();
-            match router::select_entry(group, &router_state, &providers, &skip_indices) {
+            match router::select_entry(&group, &router_state, &providers, &skip_indices) {
                 Some(result) => result,
                 None => break,
             }
@@ -305,9 +347,9 @@ async fn route_request(
             Ok(resp) => process_response(resp, stream, &group.alias, is_anthropic).await,
             Err(UpstreamError::Timeout) => {
                 eprintln!("request timed out for provider {}", provider.id);
-                if group.failover_config.on_latency_timeout {
+                {
                     let mut rs = state.router_state.lock().unwrap();
-                    let _ = router::record_latency_timeout(&mut rs, &provider.id, entry_index);
+                    let _ = router::record_latency_timeout(&mut rs, &provider.id, entry_index, group.failover_config.latency_timeout_cooldown_ms);
                 }
                 skip_indices.insert(entry_index);
                 continue;
@@ -319,12 +361,70 @@ async fn route_request(
         };
 
         match result {
-            Ok((resp, prompt_tokens, output_tokens)) => {
+            Ok(StreamProcessResult::Streaming(raw_stream, token_counts)) => {
+                let provider_id = provider.id.clone();
+                let model_id = entry.model_id.clone();
+                let group_alias_str = group.alias.clone();
+                let router_state = state.router_state.clone();
+                let metrics_recorder = state.metrics_recorder.clone();
+                let entry_index_clone = entry_index;
+                let effective_quota = entry.daily_token_quota_override.or_else(|| {
+                    providers
+                        .iter()
+                        .find(|p| p.id == entry.provider_id)
+                        .and_then(|p| p.daily_token_quota)
+                });
+                let on_quota_exhausted = group.failover_config.on_quota_exhausted;
+                let latency_ms = start.elapsed().as_millis() as i64;
+
+                let body_with_metrics = MetricsRecordingStream::new(raw_stream, move |_, _| {
+                    let counts = token_counts.lock().unwrap();
+                    let prompt_tokens = counts.input_tokens;
+                    let output_tokens = counts.output_tokens;
+                    let tokens_used = prompt_tokens + output_tokens;
+                    drop(counts);
+
+                    let event = RequestEvent {
+                        ts: chrono::Utc::now().timestamp(),
+                        group_alias: group_alias_str.clone(),
+                        provider_id: provider_id.clone(),
+                        model_id: model_id.clone(),
+                        prompt_tokens: prompt_tokens as i64,
+                        output_tokens: output_tokens as i64,
+                        latency_ms,
+                        status: "success".to_string(),
+                        error_type: None,
+                        input_cost_per_1m: None,
+                        output_cost_per_1m: None,
+                    };
+                    let _ = metrics_recorder.record_request_sync(event);
+
+                    if tokens_used > 0 {
+                        let mut rs = router_state.lock().unwrap();
+                        router::record_success(&mut rs, &provider_id, entry_index_clone, tokens_used, effective_quota, on_quota_exhausted);
+                    }
+                });
+
+                let body = axum::body::Body::from_stream(body_with_metrics);
+                let mut final_resp = Response::new(body);
+                final_resp.headers_mut().insert(
+                    CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("text/event-stream"),
+                );
+                return Ok(final_resp);
+            }
+            Ok(StreamProcessResult::NonStreaming(resp, prompt_tokens, output_tokens)) => {
                 let latency_ms = start.elapsed().as_millis() as i64;
                 let tokens_used = prompt_tokens + output_tokens;
                 {
                     let mut rs = state.router_state.lock().unwrap();
-                    router::record_success(&mut rs, &provider.id, entry_index, tokens_used);
+                    let effective_quota = entry.daily_token_quota_override.or_else(|| {
+                        providers
+                            .iter()
+                            .find(|p| p.id == entry.provider_id)
+                            .and_then(|p| p.daily_token_quota)
+                    });
+                    router::record_success(&mut rs, &provider.id, entry_index, tokens_used, effective_quota, group.failover_config.on_quota_exhausted);
                 }
                 let model_id = entry.model_id.clone();
                 let provider_id = provider.id.clone();
@@ -365,28 +465,30 @@ async fn route_request(
                 continue;
             }
             Err(RequestError::Network(_msg)) => {
-                if group.failover_config.on_consecutive_errors {
+                {
                     let mut rs = state.router_state.lock().unwrap();
                     router::record_consecutive_error(
                         &mut rs,
                         &provider.id,
                         entry_index,
                         group.failover_config.consecutive_error_threshold,
-                        true,
+                        group.failover_config.on_consecutive_errors,
+                        group.failover_config.consecutive_error_cooldown_ms,
                     );
                 }
                 skip_indices.insert(entry_index);
                 continue;
             }
             Err(RequestError::ServerError(_msg)) => {
-                if group.failover_config.on_consecutive_errors {
+                {
                     let mut rs = state.router_state.lock().unwrap();
                     router::record_consecutive_error(
                         &mut rs,
                         &provider.id,
                         entry_index,
                         group.failover_config.consecutive_error_threshold,
-                        true,
+                        group.failover_config.on_consecutive_errors,
+                        group.failover_config.consecutive_error_cooldown_ms,
                     );
                 }
                 skip_indices.insert(entry_index);
@@ -407,12 +509,20 @@ enum RequestError {
     ServerError(String),
 }
 
+enum StreamProcessResult {
+    Streaming(
+        Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
+        Arc<std::sync::Mutex<translator::StreamTokenCounts>>,
+    ),
+    NonStreaming(Response, u64, u64),
+}
+
 async fn process_response(
     resp: reqwest::Response,
     stream: bool,
     group_alias: &str,
     is_anthropic: bool,
-) -> Result<(Response, u64, u64), RequestError> {
+) -> Result<StreamProcessResult, RequestError> {
     let status = resp.status();
 
     if status.as_u16() == 429 {
@@ -420,7 +530,10 @@ async fn process_response(
     }
 
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let body = match tokio::time::timeout(std::time::Duration::from_secs(10), resp.text()).await {
+            Ok(text) => text.unwrap_or_default(),
+            Err(_) => "timed out reading error body".to_string(),
+        };
         return Err(RequestError::ServerError(format!("HTTP {}: {}", status, body)));
     }
 
@@ -433,36 +546,25 @@ async fn process_response(
             .to_string();
 
         if content_type.contains("text/event-stream") {
+            let token_counts = Arc::new(std::sync::Mutex::new(translator::StreamTokenCounts {
+                input_tokens: 0,
+                output_tokens: 0,
+            }));
+
+            let raw_stream = resp.bytes_stream().map(|result| {
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            });
+
             if is_anthropic {
-                let token_counts = Arc::new(std::sync::Mutex::new(translator::StreamTokenCounts {
-                    input_tokens: 0,
-                    output_tokens: 0,
-                }));
-                let (body, token_counts) = translator::translate_anthropic_stream(
-                    resp.bytes_stream().map(|result| {
-                        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                    }),
-                    group_alias.to_string(),
-                    token_counts,
-                );
-                let mut resp = Response::new(body);
-                resp.headers_mut().insert(
-                    CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("text/event-stream"),
-                );
-                let counts = token_counts.lock().unwrap();
-                return Ok((resp, counts.input_tokens, counts.output_tokens));
+                let (body, token_counts) = translator::translate_anthropic_stream(raw_stream, group_alias.to_string(), token_counts);
+                let stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static> =
+                    Box::new(body.into_data_stream().map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+                return Ok(StreamProcessResult::Streaming(stream, token_counts));
             } else {
-                let body = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                });
-                let body = axum::body::Body::from_stream(body);
-                let mut resp = Response::new(body);
-                resp.headers_mut().insert(
-                    CONTENT_TYPE,
-                    axum::http::HeaderValue::from_static("text/event-stream"),
-                );
-                return Ok((resp, 0, 0));
+                let (body, token_counts) = translator::translate_openai_stream(raw_stream, token_counts);
+                let stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static> =
+                    Box::new(body.into_data_stream().map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+                return Ok(StreamProcessResult::Streaming(stream, token_counts));
             }
         } else {
             let bytes = resp.bytes().await.map_err(|e| {
@@ -478,7 +580,7 @@ async fn process_response(
                     })?;
                 let (prompt_tokens, output_tokens) = extract_anthropic_tokens(&anthropic_resp);
                 let openai_resp = translator::anthropic_to_openai(&anthropic_resp, group_alias);
-                return Ok((Json(openai_resp).into_response(), prompt_tokens, output_tokens));
+                return Ok(StreamProcessResult::NonStreaming(Json(openai_resp).into_response(), prompt_tokens, output_tokens));
             } else {
                 let mut json: Value = serde_json::from_slice(&bytes).map_err(|e| {
                     eprintln!("failed to parse upstream JSON response: {e}");
@@ -490,7 +592,7 @@ async fn process_response(
                 }
                 let mut resp = Json(json).into_response();
                 *resp.status_mut() = status;
-                return Ok((resp, prompt_tokens, output_tokens));
+                return Ok(StreamProcessResult::NonStreaming(resp, prompt_tokens, output_tokens));
             }
         }
     } else {
@@ -507,7 +609,7 @@ async fn process_response(
                 })?;
             let (prompt_tokens, output_tokens) = extract_anthropic_tokens(&anthropic_resp);
             let openai_resp = translator::anthropic_to_openai(&anthropic_resp, group_alias);
-            return Ok((Json(openai_resp).into_response(), prompt_tokens, output_tokens));
+            return Ok(StreamProcessResult::NonStreaming(Json(openai_resp).into_response(), prompt_tokens, output_tokens));
         } else {
             let mut json: Value = serde_json::from_slice(&bytes).map_err(|e| {
                 eprintln!("failed to parse upstream JSON response: {e}");
@@ -520,7 +622,7 @@ async fn process_response(
 
             let mut resp = Json(json).into_response();
             *resp.status_mut() = status;
-            return Ok((resp, prompt_tokens, output_tokens));
+            return Ok(StreamProcessResult::NonStreaming(resp, prompt_tokens, output_tokens));
         }
     }
 }
@@ -545,6 +647,43 @@ fn extract_anthropic_tokens(resp: &translator::MessagesResponse) -> (u64, u64) {
     (prompt_tokens, output_tokens)
 }
 
+struct MetricsRecordingStream<S> {
+    inner: S,
+    on_complete: Option<Box<dyn FnOnce(u64, u64) + Send + 'static>>,
+}
+
+impl<S> MetricsRecordingStream<S> {
+    fn new<F>(inner: S, on_complete: F) -> Self
+    where
+        F: FnOnce(u64, u64) + Send + 'static,
+    {
+        Self {
+            inner,
+            on_complete: Some(Box::new(on_complete)),
+        }
+    }
+}
+
+impl<S> Stream for MetricsRecordingStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Ready(None) => {
+                if let Some(cb) = self.on_complete.take() {
+                    cb(0, 0);
+                }
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let start = START_TIME.load(Ordering::Relaxed);
     let now = std::time::SystemTime::now()
@@ -553,8 +692,8 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         .as_secs() as i64;
     let uptime_seconds = if start > 0 { now - start } else { 0 };
 
-    let providers = load_providers().unwrap_or_default();
-    let groups = load_groups().unwrap_or_default();
+    let providers = state.providers.read().unwrap().clone();
+    let groups = state.groups.read().unwrap().clone();
     let router_state = state.router_state.lock().unwrap();
 
     let providers_info: Vec<serde_json::Value> = providers
@@ -570,7 +709,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         .collect();
 
     let mut failover_states = Vec::new();
-    for group in &groups {
+    for group in groups.iter() {
         for (idx, entry) in group.entries.iter().enumerate() {
             let key = format!("{}:{}", entry.provider_id, idx);
             let entry_state = router_state.entries.get(&key);
@@ -659,7 +798,7 @@ async fn handle_internal_router_set_entry(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InternalSetEntryRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let groups = state.groups.clone();
+    let groups = state.groups.read().unwrap().clone();
     match scheduler::set_entry_enabled(
         &state.router_state,
         groups,
@@ -667,7 +806,17 @@ async fn handle_internal_router_set_entry(
         req.entry_index,
         req.enabled,
     ) {
-        Ok(()) => Ok(Json(serde_json::json!({ "status": "ok" }))),
+        Ok(()) => {
+            let reloaded = load_groups().unwrap_or_else(|_| {
+                state.groups.read().unwrap().as_ref().clone()
+            });
+            *state.groups.write().unwrap() = Arc::new(reloaded);
+            let reloaded_providers = load_providers().unwrap_or_else(|_| {
+                state.providers.read().unwrap().as_ref().clone()
+            });
+            *state.providers.write().unwrap() = Arc::new(reloaded_providers);
+            Ok(Json(serde_json::json!({ "status": "ok" })))
+        }
         Err(e) => Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": e })),

@@ -541,6 +541,8 @@ mod tests {
                 consecutive_error_threshold: 5,
                 on_latency_timeout: true,
                 latency_timeout_ms: 30000,
+                latency_timeout_cooldown_ms: 300000,
+                consecutive_error_cooldown_ms: 600000,
             },
         }
     }
@@ -553,6 +555,7 @@ mod tests {
             base_url: "https://api.test.com/v1".to_string(),
             credential_key: "test-provider".to_string(),
             daily_token_quota: Some(1_000_000),
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![ProviderModel {
@@ -980,6 +983,7 @@ mod tests {
             base_url: "https://api.test.com/v1".to_string(),
             credential_key: "test-provider".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![ProviderModel {
@@ -1108,6 +1112,7 @@ mod tests {
             base_url: "https://api.test2.com/v1".to_string(),
             credential_key: "test-provider-2".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![ProviderModel {

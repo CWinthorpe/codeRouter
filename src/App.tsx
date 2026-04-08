@@ -1,5 +1,6 @@
 import { createBrowserRouter, RouterProvider, Outlet } from 'react-router-dom';
 import { AppShell } from './components/AppShell';
+import { GroupStatusProvider } from './hooks/useGroupStatusPoll';
 import Dashboard from './pages/Dashboard';
 import Providers from './pages/Providers';
 import ModelGroups from './pages/ModelGroups';
@@ -10,7 +11,9 @@ import Settings from './pages/Settings';
 function Layout() {
   return (
     <AppShell>
-      <Outlet />
+      <GroupStatusProvider>
+        <Outlet />
+      </GroupStatusProvider>
     </AppShell>
   );
 }

@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useRef, useState } from 'react';
 import {
   Plus,
   Edit2,
@@ -21,9 +21,13 @@ import {
   testProviderConnection,
   refreshProviderModels,
   getGroups,
+  getProviders,
 } from '../lib/ipc';
 import type { Provider, ProviderModel } from '../types';
 import type { TestConnectionResult } from '../lib/ipc';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
 
 function generateId(name: string): string {
   return name
@@ -62,9 +66,10 @@ export default function Providers() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
+  const toastCounterRef = useRef(0);
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
-    const id = Date.now();
+    const id = Date.now() * 1000 + (++toastCounterRef.current);
     setToasts((prev) => [...prev, { id, type, message }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
   }, []);
@@ -130,7 +135,7 @@ export default function Providers() {
 
       try {
         await deleteProvider(provider.id);
-        const updated = await (await import('../lib/ipc')).getProviders();
+        const updated = await getProviders();
         setProviders(updated);
         addToast('success', `Deleted provider "${provider.name}"`);
       } catch (e: unknown) {
@@ -143,7 +148,7 @@ export default function Providers() {
   const handleSave = useCallback(
     async (provider: Provider, apiKey: string) => {
       await saveProvider(provider, apiKey);
-      const updated = await (await import('../lib/ipc')).getProviders();
+      const updated = await getProviders();
       setProviders(updated);
       setShowAddModal(false);
       setEditingProvider(null);
@@ -156,7 +161,7 @@ export default function Providers() {
     async (provider: Provider) => {
       const newEnabled = !provider.enabled;
       await toggleProviderEnabled(provider.id, newEnabled);
-      const allProviders = await (await import('../lib/ipc')).getProviders();
+      const allProviders = await getProviders();
       setProviders(allProviders);
     },
     [setProviders],
@@ -171,24 +176,26 @@ export default function Providers() {
             Manage upstream LLM providers and browse their available models.
           </p>
         </div>
-        <button
+        <Button
           onClick={() => {
             setEditingProvider(null);
             setShowAddModal(true);
           }}
-          className="flex items-center gap-2 rounded-md bg-emerald-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-emerald-500"
+          className="gap-2 bg-emerald-600 hover:bg-emerald-500"
         >
           <Plus className="h-4 w-4" />
           Add Provider
-        </button>
+        </Button>
       </div>
 
       {providers.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-lg border border-dashed border-zinc-700 py-16 text-zinc-500">
-          <Zap className="mb-3 h-10 w-10" />
-          <p className="text-lg font-medium">No providers configured</p>
-          <p className="mt-1 text-sm">Add your first upstream provider to get started.</p>
-        </div>
+        <Card className="border-dashed border-zinc-700">
+          <CardContent className="flex flex-col items-center justify-center py-16 text-zinc-500">
+            <Zap className="mb-3 h-10 w-10" />
+            <p className="text-lg font-medium">No providers configured</p>
+            <p className="mt-1 text-sm">Add your first upstream provider to get started.</p>
+          </CardContent>
+        </Card>
       ) : (
         <div className="flex flex-col gap-4">
           {providers.map((provider) => (
@@ -262,81 +269,86 @@ function ProviderCard({
   const modelCount = provider.models.length;
 
   return (
-    <div className={`rounded-lg border border-zinc-800 bg-zinc-900/60 transition-opacity ${!provider.enabled ? 'opacity-60' : ''}`}>
-      <div className="flex items-start gap-4 p-5">
-        <button onClick={onToggleExpand} className="mt-1 text-zinc-500 transition-colors hover:text-zinc-300">
-          {isExpanded ? <ChevronDown className="h-5 w-5" /> : <ChevronRight className="h-5 w-5" />}
-        </button>
+    <Card className={`bg-zinc-900/60 border-zinc-800 transition-opacity ${!provider.enabled ? 'opacity-60' : ''}`}>
+      <CardContent className="p-0">
+        <div className="flex items-start gap-4 p-5">
+          <button onClick={onToggleExpand} className="mt-1 text-zinc-500 transition-colors hover:text-zinc-300">
+            {isExpanded ? <ChevronDown className="h-5 w-5" /> : <ChevronRight className="h-5 w-5" />}
+          </button>
 
-        <div className="flex-1">
-          <div className="flex items-center gap-3">
-            <h3 className="text-base font-semibold">{provider.name}</h3>
-            <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium ${protocolColor}`}>
-              {protocolLabel}
-            </span>
-            <span
-              className={`flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium ${
-                provider.enabled ? 'bg-green-600/20 text-green-300' : 'bg-red-600/20 text-red-300'
-              }`}
-            >
-              <span className={`h-1.5 w-1.5 rounded-full ${provider.enabled ? 'bg-green-400' : 'bg-red-400'}`} />
-              {provider.enabled ? 'Enabled' : 'Disabled'}
-            </span>
+          <div className="flex-1">
+            <div className="flex items-center gap-3">
+              <h3 className="text-base font-semibold">{provider.name}</h3>
+              <Badge className={`rounded-full text-xs font-medium ${protocolColor}`}>
+                {protocolLabel}
+              </Badge>
+              <Badge
+                variant="outline"
+                className={`flex items-center gap-1.5 rounded-full text-xs font-medium ${
+                  provider.enabled ? 'bg-green-600/20 text-green-300 border-green-600/30' : 'bg-red-600/20 text-red-300 border-red-600/30'
+                }`}
+              >
+                <span className={`h-1.5 w-1.5 rounded-full ${provider.enabled ? 'bg-green-400' : 'bg-red-400'}`} />
+                {provider.enabled ? 'Enabled' : 'Disabled'}
+              </Badge>
+            </div>
+
+            <p className="mt-1 text-sm text-zinc-400 font-mono">{provider.baseUrl}</p>
+
+            <div className="mt-3 flex items-center gap-6 text-sm text-zinc-400">
+              <span className="flex items-center gap-1.5">
+                <CheckCircle2 className="h-4 w-4 text-zinc-500" />
+                {modelCount} model{modelCount !== 1 ? 's' : ''}
+              </span>
+              <span className="flex items-center gap-1.5">
+                <RefreshCw className="h-4 w-4 text-zinc-500" />
+                {lastRefresh ? formatTimestamp(lastRefresh) : 'Never refreshed'}
+              </span>
+            </div>
           </div>
 
-          <p className="mt-1 text-sm text-zinc-400 font-mono">{provider.baseUrl}</p>
-
-          <div className="mt-3 flex items-center gap-6 text-sm text-zinc-400">
-            <span className="flex items-center gap-1.5">
-              <CheckCircle2 className="h-4 w-4 text-zinc-500" />
-              {modelCount} model{modelCount !== 1 ? 's' : ''}
-            </span>
-            <span className="flex items-center gap-1.5">
-              <RefreshCw className="h-4 w-4 text-zinc-500" />
-              {lastRefresh ? formatTimestamp(lastRefresh) : 'Never refreshed'}
-            </span>
+          <div className="flex flex-col items-end gap-2">
+            <label className="relative inline-flex cursor-pointer items-center">
+              <input
+                type="checkbox"
+                checked={provider.enabled}
+                onChange={onToggleEnabled}
+                className="peer sr-only"
+              />
+              <div className="peer h-5 w-9 rounded-full bg-zinc-700 after:absolute after:start-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:border after:border-zinc-600 after:bg-zinc-400 after:transition-all peer-checked:bg-emerald-600 peer-checked:after:translate-x-full peer-checked:after:border-white peer-focus:outline-none" />
+            </label>
           </div>
         </div>
 
-        <div className="flex flex-col items-end gap-2">
-          <label className="relative inline-flex cursor-pointer items-center">
-            <input
-              type="checkbox"
-              checked={provider.enabled}
-              onChange={onToggleEnabled}
-              className="peer sr-only"
-            />
-            <div className="peer h-5 w-9 rounded-full bg-zinc-700 after:absolute after:start-[2px] after:top-[2px] after:h-4 after:w-4 after:rounded-full after:border after:border-zinc-600 after:bg-zinc-400 after:transition-all peer-checked:bg-emerald-600 peer-checked:after:translate-x-full peer-checked:after:border-white peer-focus:outline-none" />
-          </label>
+        <div className="flex items-center gap-2 border-t border-zinc-800 px-5 py-3">
+          <ActionButton icon={<Edit2 className="h-3.5 w-3.5" />} label="Edit" onClick={onEdit} />
+          <ActionButton
+            icon={isTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
+            label={isTesting ? 'Testing…' : 'Test Connection'}
+            onClick={onTestConnection}
+            disabled={isTesting}
+          />
+          <ActionButton
+            icon={isRefreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            label={isRefreshing ? 'Refreshing…' : 'Refresh Models'}
+            onClick={onRefreshModels}
+            disabled={isRefreshing}
+          />
+          <div className="flex-1" />
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={onDelete}
+            className="gap-1.5 text-xs font-medium text-red-400 hover:bg-red-600/10 hover:text-red-300"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Delete
+          </Button>
         </div>
-      </div>
 
-      <div className="flex items-center gap-2 border-t border-zinc-800 px-5 py-3">
-        <ActionButton icon={<Edit2 className="h-3.5 w-3.5" />} label="Edit" onClick={onEdit} />
-        <ActionButton
-          icon={isTesting ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Zap className="h-3.5 w-3.5" />}
-          label={isTesting ? 'Testing…' : 'Test Connection'}
-          onClick={onTestConnection}
-          disabled={isTesting}
-        />
-        <ActionButton
-          icon={isRefreshing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-          label={isRefreshing ? 'Refreshing…' : 'Refresh Models'}
-          onClick={onRefreshModels}
-          disabled={isRefreshing}
-        />
-        <div className="flex-1" />
-        <button
-          onClick={onDelete}
-          className="flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium text-red-400 transition-colors hover:bg-red-600/10 hover:text-red-300"
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-          Delete
-        </button>
-      </div>
-
-      {isExpanded && <ModelBrowser models={provider.models} providerName={provider.name} />}
-    </div>
+        {isExpanded && <ModelBrowser models={provider.models} providerName={provider.name} />}
+      </CardContent>
+    </Card>
   );
 }
 

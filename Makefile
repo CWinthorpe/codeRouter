@@ -1,4 +1,4 @@
-.PHONY: build dev test
+.PHONY: build dev test clean
 
 build:
 	@bash build.sh
@@ -8,3 +8,8 @@ dev:
 
 test:
 	@cargo test --workspace
+
+clean:
+	cargo clean
+	rm -rf dist/
+	rm -rf node_modules/.vite/

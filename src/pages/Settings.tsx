@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { AlertTriangle, RotateCcw, Trash2, Eye, RotateCw } from 'lucide-react';
 import { useStore } from '../store';
 import { Toast } from '../components/Toast';
@@ -25,10 +25,11 @@ export default function Settings() {
   const [saving, setSaving] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
+  const toastCounterRef = useRef(0);
   const [loading, setLoading] = useState(true);
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
-    const id = Date.now();
+    const id = Date.now() * 1000 + (++toastCounterRef.current);
     setToasts((prev) => [...prev, { id, type, message }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
   }, []);

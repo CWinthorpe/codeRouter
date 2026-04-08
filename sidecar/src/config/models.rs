@@ -26,6 +26,8 @@ pub struct Provider {
     pub credential_key: String,
     #[serde(default, rename = "dailyTokenQuota")]
     pub daily_token_quota: Option<u64>,
+    #[serde(default, rename = "dailyRequestQuota")]
+    pub daily_request_quota: Option<u64>,
     #[serde(default = "default_quota_reset_hour", rename = "quotaResetUtcHour")]
     pub quota_reset_utc_hour: u32,
     #[serde(default = "default_true")]
@@ -82,6 +84,16 @@ pub struct FailoverConfig {
     pub on_latency_timeout: bool,
     #[serde(default = "default_latency_timeout_ms", rename = "latencyTimeoutMs")]
     pub latency_timeout_ms: u64,
+    #[serde(
+        default = "default_latency_timeout_cooldown_ms",
+        rename = "latencyTimeoutCooldownMs"
+    )]
+    pub latency_timeout_cooldown_ms: u64,
+    #[serde(
+        default = "default_consecutive_error_cooldown_ms",
+        rename = "consecutiveErrorCooldownMs"
+    )]
+    pub consecutive_error_cooldown_ms: u64,
 }
 
 fn default_error_threshold() -> u32 {
@@ -90,6 +102,14 @@ fn default_error_threshold() -> u32 {
 
 fn default_latency_timeout_ms() -> u64 {
     30000
+}
+
+fn default_latency_timeout_cooldown_ms() -> u64 {
+    300000
+}
+
+fn default_consecutive_error_cooldown_ms() -> u64 {
+    600000
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -115,6 +135,8 @@ pub struct AppConfig {
     pub log_verbosity: String,
     #[serde(default)]
     pub opencode_config_path: Option<String>,
+    #[serde(default)]
+    pub onboarding_dismissed: bool,
 }
 
 fn default_proxy_port() -> u16 {
@@ -141,6 +163,7 @@ impl Default for AppConfig {
             refresh_interval_hours: default_refresh_interval(),
             log_verbosity: default_log_verbosity(),
             opencode_config_path: None,
+            onboarding_dismissed: false,
         }
     }
 }
