@@ -17,4 +17,9 @@ export default defineConfig({
       ignored: ['**/src-tauri/**', '**/sidecar/**'],
     },
   },
+  test: {
+    environment: 'jsdom',
+    globals: true,
+    setupFiles: ['./src/test/setup.ts'],
+  },
 });

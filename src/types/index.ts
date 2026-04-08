@@ -22,9 +22,11 @@ export interface Provider {
   baseUrl: string;
   credentialKey: string;
   dailyTokenQuota?: number;
+  dailyRequestQuota?: number;
   quotaResetUtcHour: number;
   enabled: boolean;
   models: ProviderModel[];
+  modelOverrides?: ProviderModel[];
 }
 
 export interface GroupEntry {
@@ -44,6 +46,8 @@ export interface FailoverConfig {
   consecutiveErrorThreshold: number;
   onLatencyTimeout: boolean;
   latencyTimeoutMs: number;
+  latencyTimeoutCooldownMs: number;
+  consecutiveErrorCooldownMs: number;
 }
 
 export interface Group {
@@ -59,6 +63,8 @@ export interface AppConfig {
   proxy_host: string;
   refresh_interval_hours: number;
   log_verbosity: LogVerbosity;
+  opencode_config_path?: string;
+  onboarding_dismissed?: boolean;
 }
 
 export type ProxyStatus = 'running' | 'stopped' | 'unknown';
@@ -74,6 +80,7 @@ export interface EntryStatusResponse {
   cooldown_until?: string;
   consecutive_errors: number;
   daily_tokens_used: number;
+  daily_requests_used: number;
   daily_reset_at: string;
   cooldown_duration_seconds?: number;
 }

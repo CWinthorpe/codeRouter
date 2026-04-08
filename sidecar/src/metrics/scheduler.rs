@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::RwLock;
 
 use chrono::Utc;
 use reqwest::Client;
 use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use tokio::time::{interval, Duration};
 
 use crate::config::models::{Group, Provider};
@@ -54,29 +56,50 @@ impl Drop for ProbeGuard<'_> {
 
 pub fn spawn_scheduler(
     router_state: SharedRouterState,
-    groups: Arc<Vec<Group>>,
+    groups: Arc<RwLock<Arc<Vec<Group>>>>,
     client: Client,
-) -> tokio::task::JoinHandle<()> {
+) -> (tokio::task::JoinHandle<()>, oneshot::Sender<()>) {
     let state_clone = router_state.clone();
     let groups_clone = groups.clone();
-    let client_clone = client.clone();
+    let _client_clone = client.clone();
 
-    tokio::spawn(async move {
+    let probe_client = Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| client.clone());
+
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
+
+    let handle = tokio::spawn(async move {
         let probe_lock = Arc::new(ProbeLock::new());
         let mut quota_interval = interval(Duration::from_secs(60));
         let mut cooldown_interval = interval(Duration::from_secs(30));
 
         loop {
             tokio::select! {
+                _ = &mut shutdown_rx => {
+                    eprintln!("[scheduler] Shutting down gracefully");
+                    break;
+                }
                 _ = quota_interval.tick() => {
-                    run_quota_reset(&state_clone, &groups_clone);
+                    let groups_snapshot = {
+                        let guard = groups_clone.read().unwrap();
+                        guard.clone()
+                    };
+                    run_quota_reset(&state_clone, &groups_snapshot);
                 }
                 _ = cooldown_interval.tick() => {
-                    run_cooldown_check(&state_clone, &groups_clone, &client_clone, &probe_lock).await;
+                    let groups_snapshot = {
+                        let guard = groups_clone.read().unwrap();
+                        guard.clone()
+                    };
+                    run_cooldown_check(&state_clone, &groups_snapshot, &probe_client, &probe_lock).await;
                 }
             }
         }
-    })
+    });
+
+    (handle, shutdown_tx)
 }
 
 fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
@@ -115,6 +138,8 @@ fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
             if now >= entry_state.daily_reset_at {
                 entry_state.status = EntryStatus::Active;
                 entry_state.daily_tokens_used = 0;
+                entry_state.daily_requests_used = 0;
+                entry_state.consecutive_errors = 0;
                 let next_reset = now
                     .date_naive()
                     .and_hms_opt(reset_hour, 0, 0)
@@ -149,28 +174,28 @@ async fn run_cooldown_check(
             Err(_) => return,
         };
 
-    for group in groups {
-        for (idx, entry) in group.entries.iter().enumerate() {
-            let key = router::entry_key(&entry.provider_id, idx as u32);
-            let entry_state = match guard.entries.get(&key) {
-                Some(s) if s.status == EntryStatus::Cooldown => s,
-                _ => continue,
-            };
+        for group in groups {
+            for (idx, entry) in group.entries.iter().enumerate() {
+                let key = router::entry_key(&entry.provider_id, idx as u32);
+                let entry_state = match guard.entries.get(&key) {
+                    Some(s) if s.status == EntryStatus::Cooldown => s,
+                    _ => continue,
+                };
 
-            let _cooldown_until = match entry_state.cooldown_until {
-                Some(t) if now >= t => t,
-                _ => continue,
-            };
+                let _cooldown_until = match entry_state.cooldown_until {
+                    Some(t) if now >= t => t,
+                    _ => continue,
+                };
 
-            let provider = match providers.iter().find(|p| p.id == entry.provider_id) {
-                Some(p) => p.clone(),
-                None => continue,
-            };
+                let provider = match providers.iter().find(|p| p.id == entry.provider_id) {
+                    Some(p) => p.clone(),
+                    None => continue,
+                };
 
-            let cooldown_duration = entry_state.cooldown_duration_seconds.unwrap_or(BASE_COOLDOWN_SECONDS);
-            probes.push((key.clone(), provider, cooldown_duration));
+                let cooldown_duration = entry_state.cooldown_duration_seconds.unwrap_or(BASE_COOLDOWN_SECONDS);
+                probes.push((key.clone(), provider, cooldown_duration));
+            }
         }
-    }
     }
 
     for (key, provider, cooldown_duration) in probes {

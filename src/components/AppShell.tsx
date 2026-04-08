@@ -4,17 +4,34 @@ import { LayoutDashboard, Server, Layers, Terminal, BarChart3, Settings } from '
 import { useStore } from '../store';
 import { useProxyStatusPoll } from '../hooks/useProxyStatusPoll';
 import { Onboarding } from './Onboarding';
+import { dismissOnboarding } from '../lib/ipc';
 
 export function AppShell({ children }: { children: React.ReactNode }) {
   const loadInitialData = useStore((s) => s.loadInitialData);
   const providers = useStore((s) => s.providers);
   const groups = useStore((s) => s.groups);
-  const [showOnboarding, setShowOnboarding] = useState(true);
+  const appConfig = useStore((s) => s.appConfig);
+  const [showOnboarding, setShowOnboarding] = useState(false);
   useProxyStatusPoll();
 
   useEffect(() => {
     loadInitialData();
   }, [loadInitialData]);
+
+  useEffect(() => {
+    if (appConfig) {
+      setShowOnboarding(!appConfig.onboarding_dismissed && (providers.length === 0 || groups.length === 0));
+    }
+  }, [appConfig, providers.length, groups.length]);
+
+  const handleDismissOnboarding = async () => {
+    try {
+      await dismissOnboarding();
+    } catch {
+      // IPC may fail
+    }
+    setShowOnboarding(false);
+  };
 
   return (
     <div className="flex h-screen w-screen bg-zinc-950 text-zinc-100">
@@ -24,7 +41,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
         <Onboarding
           providersCount={providers.length}
           groupsCount={groups.length}
-          onDismiss={() => setShowOnboarding(false)}
+          onDismiss={handleDismissOnboarding}
         />
       )}
     </div>

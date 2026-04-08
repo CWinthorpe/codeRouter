@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::Stream;
+use futures::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -464,6 +464,158 @@ where
 {
     let translated = AnthropicToOpenAIStream::new(stream, group_alias, token_counts.clone());
     let raw_stream = futures::stream::unfold(translated, |mut stream| async move {
+        match futures::StreamExt::next(&mut stream).await {
+            Some(Ok(bytes)) => Some((Ok::<_, std::io::Error>(bytes), stream)),
+            Some(Err(e)) => Some((Err(e), stream)),
+            None => None,
+        }
+    });
+    let body = axum::body::Body::from_stream(raw_stream);
+    (body, token_counts)
+}
+
+pub struct OpenAIStreamTracker<S> {
+    inner: S,
+    buffer: Vec<u8>,
+    token_counts: Arc<Mutex<StreamTokenCounts>>,
+    done: bool,
+}
+
+impl<S> OpenAIStreamTracker<S> {
+    pub fn new(inner: S, token_counts: Arc<Mutex<StreamTokenCounts>>) -> Self {
+        Self {
+            inner,
+            buffer: Vec::new(),
+            token_counts,
+            done: false,
+        }
+    }
+
+    fn parse_sse_chunk(&mut self, data: &str) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+            if let Some(usage) = json.get("usage") {
+                let mut counts = self.token_counts.lock().unwrap();
+                if let Some(pt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
+                    counts.input_tokens = pt;
+                }
+                if let Some(ct) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
+                    counts.output_tokens = ct;
+                }
+                if let Some(tt) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
+                    if counts.input_tokens == 0 && counts.output_tokens == 0 {
+                        counts.output_tokens = tt;
+                    }
+                }
+            }
+            if let Some(choices) = json.get("choices").and_then(|v| v.as_array()) {
+                let mut accumulated_output = 0u64;
+                for choice in choices {
+                    if let Some(delta) = choice.get("delta").and_then(|c| c.get("content")).and_then(|c| c.as_str()) {
+                        accumulated_output += estimate_tokens_from_text(delta);
+                    } else if let Some(message) = choice.get("message").and_then(|c| c.get("content")).and_then(|c| c.as_str()) {
+                        accumulated_output += estimate_tokens_from_text(message);
+                    }
+                }
+                if accumulated_output > 0 {
+                    let mut counts = self.token_counts.lock().unwrap();
+                    counts.output_tokens = accumulated_output;
+                }
+            }
+        }
+    }
+}
+
+impl<S> Stream for OpenAIStreamTracker<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+
+        loop {
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    let chunk_data = chunk.to_vec();
+                    self.buffer.extend_from_slice(&chunk_data);
+
+                    let mut output_chunks: Vec<u8> = Vec::new();
+                    while let Some(newline_pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                        let line_bytes = self.buffer[..newline_pos].to_vec();
+                        self.buffer.drain(..=newline_pos);
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        let line = line.trim();
+
+                        if line.starts_with("data: ") {
+                            let data = &line[6..];
+                            if !data.is_empty() && data != "[DONE]" {
+                                self.parse_sse_chunk(data);
+                            }
+                        } else if line.starts_with("data:") {
+                            let data = &line[5..];
+                            if !data.is_empty() && data != "[DONE]" {
+                                self.parse_sse_chunk(data);
+                            }
+                        }
+
+                        output_chunks.extend_from_slice(&line_bytes);
+                        output_chunks.push(b'\n');
+                    }
+
+                    if !output_chunks.is_empty() {
+                        return Poll::Ready(Some(Ok(Bytes::from(output_chunks))));
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => {
+                    if !self.buffer.is_empty() {
+                        let remaining = String::from_utf8_lossy(&self.buffer);
+                        let remaining = remaining.trim().to_string();
+                        if remaining.starts_with("data: ") {
+                            let data = remaining[6..].to_string();
+                            if !data.is_empty() && data != "[DONE]" {
+                                self.parse_sse_chunk(&data);
+                            }
+                        } else if remaining.starts_with("data:") {
+                            let data = remaining[5..].to_string();
+                            if !data.is_empty() && data != "[DONE]" {
+                                self.parse_sse_chunk(&data);
+                            }
+                        }
+                        self.buffer.clear();
+                    }
+
+                    {
+                        let counts = self.token_counts.lock().unwrap();
+                        let _ = (counts.input_tokens, counts.output_tokens);
+                    }
+
+                    self.done = true;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+fn estimate_tokens_from_text(text: &str) -> u64 {
+    let char_count = text.chars().count() as u64;
+    char_count.saturating_div(4).max(1)
+}
+
+pub fn translate_openai_stream<S>(
+    stream: S,
+    token_counts: Arc<Mutex<StreamTokenCounts>>,
+) -> (axum::body::Body, Arc<Mutex<StreamTokenCounts>>)
+where
+    S: Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send + Unpin + 'static,
+{
+    let tracker = OpenAIStreamTracker::new(stream, token_counts.clone());
+    let raw_stream = futures::stream::unfold(tracker, |mut stream| async move {
         match futures::StreamExt::next(&mut stream).await {
             Some(Ok(bytes)) => Some((Ok::<_, std::io::Error>(bytes), stream)),
             Some(Err(e)) => Some((Err(e), stream)),

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Plus,
   Edit2,
@@ -31,6 +31,8 @@ const DEFAULT_FAILOVER: FailoverConfig = {
   consecutiveErrorThreshold: 5,
   onLatencyTimeout: true,
   latencyTimeoutMs: 30000,
+  latencyTimeoutCooldownMs: 300000,
+  consecutiveErrorCooldownMs: 600000,
 };
 
 function formatNumber(n?: number): string {
@@ -41,7 +43,7 @@ function formatNumber(n?: number): string {
 function formatTimestamp(ts?: string): string {
   if (!ts) return '—';
   try {
-    return new Date(ts).toLocaleTimeString();
+    return new Date(ts).toLocaleString();
   } catch {
     return ts;
   }
@@ -113,9 +115,10 @@ export default function ModelGroups() {
   const [showForm, setShowForm] = useState(false);
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
+  const toastCounterRef = useRef(0);
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
-    const id = Date.now();
+    const id = Date.now() * 1000 + (++toastCounterRef.current);
     setToasts((prev) => [...prev, { id, type, message }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
   }, []);
@@ -421,10 +424,11 @@ function LiveStatusPanel({
           const toggleKey = `${groupId}-${idx}`;
           const quota = entry.dailyTokenQuotaOverride;
           const tokensUsed = st?.daily_tokens_used ?? 0;
+          const entryKey = `${entry.providerId}-${entry.modelId}-${idx}-${entry.priority}`;
 
           return (
             <div
-              key={`${entry.providerId}-${entry.modelId}-${idx}`}
+              key={entryKey}
               className="flex items-center gap-4 rounded-md border border-zinc-800 bg-zinc-900 px-4 py-3"
             >
               <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs font-mono text-zinc-400">
@@ -509,6 +513,7 @@ function GroupForm({
   const [showAddEntry, setShowAddEntry] = useState(false);
   const [showFailover, setShowFailover] = useState(false);
   const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const dragOverThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     setShowFailover(false);
@@ -590,6 +595,10 @@ function GroupForm({
   const handleDragOver = useCallback((e: React.DragEvent, idx: number) => {
     e.preventDefault();
     if (dragIdx === null || dragIdx === idx) return;
+    if (dragOverThrottleRef.current) return;
+    dragOverThrottleRef.current = setTimeout(() => {
+      dragOverThrottleRef.current = null;
+    }, 50);
     setEntries((prev) => {
       const next = [...prev];
       const [moved] = next.splice(dragIdx, 1);
@@ -704,7 +713,7 @@ function GroupForm({
               <div className="flex flex-col gap-2">
                 {entries.map((entry, idx) => (
                   <div
-                    key={`${entry.providerId}-${entry.modelId}-${idx}`}
+                    key={`${entry.providerId}-${entry.modelId}-${idx}-${entry.priority}`}
                     draggable
                     onDragStart={() => handleDragStart(idx)}
                     onDragOver={(e) => handleDragOver(e, idx)}
@@ -899,6 +908,36 @@ function GroupForm({
                         }
                         className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                         min="1000"
+                      />
+                      <label className="mb-1 mt-3 block text-xs font-medium text-zinc-400">Cooldown after timeout (ms)</label>
+                      <input
+                        type="number"
+                        value={failoverConfig.latencyTimeoutCooldownMs}
+                        onChange={(e) =>
+                          setFailoverConfig((c) => ({
+                            ...c,
+                            latencyTimeoutCooldownMs: Math.max(60000, Number(e.target.value)),
+                          }))
+                        }
+                        className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                        min="60000"
+                      />
+                    </div>
+                  )}
+                  {failoverConfig.onConsecutiveErrors && (
+                    <div className="ml-7">
+                      <label className="mb-1 block text-xs font-medium text-zinc-400">Cooldown after errors (ms)</label>
+                      <input
+                        type="number"
+                        value={failoverConfig.consecutiveErrorCooldownMs}
+                        onChange={(e) =>
+                          setFailoverConfig((c) => ({
+                            ...c,
+                            consecutiveErrorCooldownMs: Math.max(60000, Number(e.target.value)),
+                          }))
+                        }
+                        className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                        min="60000"
                       />
                     </div>
                   )}

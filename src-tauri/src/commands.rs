@@ -94,9 +94,19 @@ pub async fn get_providers() -> Result<Vec<ProviderResponse>, String> {
 
 #[tauri::command]
 pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), String> {
+    if provider.protocol != "openai" && provider.protocol != "anthropic" {
+        return Err(format!("Invalid protocol '{}'. Must be 'openai' or 'anthropic'.", provider.protocol));
+    }
+
     ssrf::validate_base_url(&provider.base_url)?;
 
-    let mut providers = store::load_providers().unwrap_or_default();
+    let mut providers = match store::load_providers() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[save_provider] Warning: failed to load existing providers ({e}), starting fresh");
+            Vec::new()
+        }
+    };
 
     if let Some(pos) = providers.iter().position(|p| p.id == provider.id) {
         providers[pos] = provider.clone();
@@ -130,6 +140,15 @@ pub async fn delete_provider(provider_id: String) -> Result<(), String> {
     providers.retain(|p| p.id != provider_id);
     store::save_providers(&providers).map_err(|e| e.to_string())?;
 
+    let mut groups = store::load_groups().map_err(|e| e.to_string())?;
+    for group in &mut groups {
+        group.entries.retain(|e| e.provider_id != provider_id);
+        for (idx, entry) in group.entries.iter_mut().enumerate() {
+            entry.priority = (idx + 1) as u32;
+        }
+    }
+    store::save_groups(&groups).map_err(|e| e.to_string())?;
+
     keychain::delete_credential(&provider_id)
         .await
         .map_err(|e| e.to_string())?;
@@ -144,7 +163,13 @@ pub async fn get_groups() -> Result<Vec<Group>, String> {
 
 #[tauri::command]
 pub async fn save_group(group: Group) -> Result<(), String> {
-    let mut groups = store::load_groups().unwrap_or_default();
+    let mut groups = match store::load_groups() {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("[save_group] Warning: failed to load existing groups ({e}), starting fresh");
+            Vec::new()
+        }
+    };
 
     if let Some(pos) = groups.iter().position(|g| g.id == group.id) {
         groups[pos] = group;
@@ -164,14 +189,18 @@ pub async fn delete_group(group_id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_app_config() -> Result<AppConfig, String> {
-    store::load_app_config().map_or_else(
-        |_| Ok(AppConfig::default()),
-        |c| Ok(c),
-    )
+    store::load_app_config().or_else(|_| Ok(AppConfig::default()))
 }
 
 #[tauri::command]
 pub async fn save_app_config(config: AppConfig) -> Result<(), String> {
+    store::save_app_config(&config).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn dismiss_onboarding() -> Result<(), String> {
+    let mut config = store::load_app_config().unwrap_or_default();
+    config.onboarding_dismissed = true;
     store::save_app_config(&config).map_err(|e| e.to_string())
 }
 
@@ -504,15 +533,12 @@ pub fn spawn_sidecar() -> Result<Child, String> {
         // 2. Release path (next to the main binary in sidecar/)
         // 3. Fallback to PATH
 
-        // Check for AppImage mount point
-        if let Ok(tmp) = std::env::var("APPIMAGE") {
-            if let Some(mount_dir) = std::path::Path::new(&tmp).parent() {
-                let appimage_sidecar = mount_dir.join("usr/bin/sidecar/coderouter-proxy");
-                if appimage_sidecar.exists() {
-                    appimage_sidecar
-                } else {
-                    find_sidecar_fallback()
-                }
+        // Check for AppImage mount point via APPDIR env var
+        if let Ok(appdir) = std::env::var("APPDIR") {
+            let appimage_sidecar = std::path::Path::new(&appdir)
+                .join("usr/bin/sidecar/coderouter-proxy-x86_64-unknown-linux-gnu");
+            if appimage_sidecar.exists() {
+                appimage_sidecar
             } else {
                 find_sidecar_fallback()
             }
@@ -572,6 +598,7 @@ mod tests {
             base_url: "https://api.test.com/v1".to_string(),
             credential_key: id.to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![ProviderModel {
@@ -583,31 +610,6 @@ mod tests {
                 last_refreshed: Some("2026-04-07T00:00:00Z".to_string()),
             }],
             model_overrides: None,
-        }
-    }
-
-    fn test_group() -> Group {
-        Group {
-            id: "test-group".to_string(),
-            alias: "test-group".to_string(),
-            display_name: "Test Group".to_string(),
-            entries: vec![GroupEntry {
-                provider_id: "test-provider".to_string(),
-                model_id: "test-model".to_string(),
-                priority: 1,
-                daily_token_quota_override: None,
-                enabled: true,
-                status: "active".to_string(),
-                cooldown_until: None,
-            }],
-            failover_config: FailoverConfig {
-                on_429: true,
-                on_quota_exhausted: true,
-                on_consecutive_errors: true,
-                consecutive_error_threshold: 3,
-                on_latency_timeout: true,
-                latency_timeout_ms: 30000,
-            },
         }
     }
 

@@ -61,13 +61,12 @@ export default function OpenCodeSetup() {
   const [previewLoading, setPreviewLoading] = useState(false);
 
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
-
+  const toastCounterRef = useRef(0);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [removing, setRemoving] = useState(false);
 
-  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
-    const id = Date.now();
+    const id = Date.now() * 1000 + (++toastCounterRef.current);
     setToasts((prev) => [...prev, { id, type, message }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
   }, []);
@@ -107,7 +106,7 @@ export default function OpenCodeSetup() {
     setPreviewLoading(true);
     try {
       const m = mappingForPreview();
-      const hasAnyMapping = m.build || m.plan || m.general || m.explore || m.small_model;
+      const hasAnyMapping = m.build || m.plan || m.general || m.explore || m.compaction || m.title || m.summary || m.small_model;
       const json = await previewOpencodeConfig(proxyPort, hasAnyMapping ? m : null);
       setPreviewJson(json);
     } catch {

@@ -96,7 +96,7 @@ async fn fetch_openai_compatible_models(
             last_refreshed: Some(now.clone()),
         };
 
-        if let Ok(detail_resp) = client.get(&detail_url).send().await {
+        if let Ok(detail_resp) = client.get(&detail_url).timeout(std::time::Duration::from_secs(30)).send().await {
             if detail_resp.status().is_success() {
                 if let Ok(text) = detail_resp.text().await {
                     if let Ok(detail) = parse_model_detail(&text) {
@@ -279,10 +279,6 @@ fn current_iso_timestamp() -> String {
     Utc::now().to_rfc3339()
 }
 
-fn is_leap_year(year: i64) -> bool {
-    (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
-}
-
 fn needs_refresh(provider: &Provider, refresh_interval_hours: u32) -> bool {
     if provider.models.is_empty() {
         return true;
@@ -420,14 +416,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_is_leap_year() {
-        assert!(is_leap_year(2024));
-        assert!(!is_leap_year(2023));
-        assert!(is_leap_year(2000));
-        assert!(!is_leap_year(1900));
-    }
-
-    #[test]
     fn test_current_iso_timestamp_format() {
         let ts = current_iso_timestamp();
         assert!(ts.ends_with("+00:00") || ts.ends_with('Z'));
@@ -450,6 +438,7 @@ mod tests {
             base_url: "https://api.test.com".to_string(),
             credential_key: "test".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![],
@@ -477,6 +466,7 @@ mod tests {
             base_url: "https://api.test.com".to_string(),
             credential_key: "test".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![model],
@@ -505,6 +495,7 @@ mod tests {
             base_url: "https://api.test.com".to_string(),
             credential_key: "test".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![model],
@@ -556,6 +547,7 @@ mod tests {
             base_url: "https://api.anthropic.com".to_string(),
             credential_key: "test".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![],
@@ -578,6 +570,7 @@ mod tests {
             base_url: "https://api.anthropic.com".to_string(),
             credential_key: "test".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![],
@@ -597,6 +590,7 @@ mod tests {
             base_url: "https://api.anthropic.com".to_string(),
             credential_key: "test".to_string(),
             daily_token_quota: None,
+            daily_request_quota: None,
             quota_reset_utc_hour: 0,
             enabled: true,
             models: vec![],
