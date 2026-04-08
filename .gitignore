@@ -1,0 +1,60 @@
+# ── Workflow / AI files ────────────────────────────────────────────────────────
+ai-prompts/
+implementation-notes/
+docs/rules.md
+docs/memories.md
+docs/build-order.md
+
+# ── Rust / Cargo ───────────────────────────────────────────────────────────────
+target/
+src-tauri/target/
+
+# ── Node / npm ─────────────────────────────────────────────────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.pnpm-store/
+
+# ── Vite / Build output ────────────────────────────────────────────────────────
+dist/
+dist-ssr/
+.vite/
+*.local
+tsconfig.tsbuildinfo
+
+# ── Tauri build artifacts ──────────────────────────────────────────────────────
+src-tauri/gen/
+*.AppImage
+*.deb
+*.rpm
+*.dmg
+*.msi
+*.exe
+
+# ── Environment / secrets ──────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── SQLite ─────────────────────────────────────────────────────────────────────
+*.db
+*.db-shm
+*.db-wal
+
+# ── Logs ───────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS files ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Editor / IDE ───────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

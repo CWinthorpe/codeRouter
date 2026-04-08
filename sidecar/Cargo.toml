@@ -1,0 +1,29 @@
+[package]
+name = "coderouter-proxy"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "coderouter-proxy"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.7"
+bytes = "1"
+fastrand = "2"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
+fs2 = "0.4"
+dirs = "5"
+chrono = { version = "0.4", features = ["serde"] }
+
+[lib]
+name = "coderouter_proxy"
+path = "src/lib.rs"
