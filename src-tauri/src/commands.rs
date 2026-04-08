@@ -3,7 +3,6 @@ use coderouter_proxy::config::store;
 use coderouter_proxy::credentials::keychain;
 use coderouter_proxy::metrics::db;
 use coderouter_proxy::metrics::queries;
-use coderouter_proxy::metrics::scheduler;
 use coderouter_proxy::opencode::config_writer::{self, AgentMapping};
 use coderouter_proxy::proxy::router;
 use coderouter_proxy::proxy::ssrf;
@@ -266,21 +265,43 @@ pub async fn refresh_provider_models(provider_id: String) -> Result<Vec<Provider
 }
 
 #[tauri::command]
-pub fn get_router_status() -> Result<router::RouterStatusResponse, String> {
-    let groups = store::load_groups().map_err(|e| e.to_string())?;
-    let router_state = router::get_global_router_state()
-        .ok_or_else(|| "Router state not initialized".to_string())?;
-    let state = router_state.lock().map_err(|e| e.to_string())?;
-    Ok(router::get_router_status(&groups, &state))
+pub async fn get_router_status() -> Result<router::RouterStatusResponse, String> {
+    let config = store::load_app_config().unwrap_or_default();
+    let client = Client::new();
+    let url = format!("http://{}:{}/internal/router/status", config.proxy_host, config.proxy_port);
+    let resp = client.get(&url).send().await
+        .map_err(|e| format!("Failed to connect to proxy: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("Proxy returned status {}", resp.status()));
+    }
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse proxy response: {}", e))?;
+    if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
+        return Err("Proxy returned error".to_string());
+    }
+    let data = body.get("data").ok_or_else(|| "No data in proxy response".to_string())?;
+    let status: router::RouterStatusResponse = serde_json::from_value(data.clone())
+        .map_err(|e| format!("Failed to parse router status: {}", e))?;
+    Ok(status)
 }
 
 #[tauri::command]
-pub fn set_entry_enabled(group_id: String, entry_index: usize, enabled: bool) -> Result<(), String> {
-    let groups = store::load_groups().map_err(|e| e.to_string())?;
-    let groups_arc = std::sync::Arc::new(groups);
-    let router_state = router::get_global_router_state()
-        .ok_or_else(|| "Router state not initialized".to_string())?;
-    scheduler::set_entry_enabled(&router_state, groups_arc, &group_id, entry_index, enabled)
+pub async fn set_entry_enabled(group_id: String, entry_index: usize, enabled: bool) -> Result<(), String> {
+    let config = store::load_app_config().unwrap_or_default();
+    let client = Client::new();
+    let url = format!("http://{}:{}/internal/router/entry", config.proxy_host, config.proxy_port);
+    let body = serde_json::json!({
+        "group_id": group_id,
+        "entry_index": entry_index,
+        "enabled": enabled,
+    });
+    let resp = client.post(&url).json(&body).send().await
+        .map_err(|e| format!("Failed to connect to proxy: {}", e))?;
+    if !resp.status().is_success() {
+        let err_text = resp.text().await.unwrap_or_default();
+        return Err(format!("Proxy returned error: {}", err_text));
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -536,4 +557,211 @@ pub fn restart_proxy(state: tauri::State<AppState>) -> Result<(), String> {
     crate::update_menu_labels(&state, true);
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coderouter_proxy::config::models::{FailoverConfig, GroupEntry, ProviderModel};
+
+    fn test_provider(id: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com/v1".to_string(),
+            credential_key: id.to_string(),
+            daily_token_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![ProviderModel {
+                id: "test-model".to_string(),
+                context_window: Some(128000),
+                max_output_tokens: Some(8192),
+                input_cost_per_1m: Some(1.0),
+                output_cost_per_1m: Some(2.0),
+                last_refreshed: Some("2026-04-07T00:00:00Z".to_string()),
+            }],
+            model_overrides: None,
+        }
+    }
+
+    fn test_group() -> Group {
+        Group {
+            id: "test-group".to_string(),
+            alias: "test-group".to_string(),
+            display_name: "Test Group".to_string(),
+            entries: vec![GroupEntry {
+                provider_id: "test-provider".to_string(),
+                model_id: "test-model".to_string(),
+                priority: 1,
+                daily_token_quota_override: None,
+                enabled: true,
+                status: "active".to_string(),
+                cooldown_until: None,
+            }],
+            failover_config: FailoverConfig {
+                on_429: true,
+                on_quota_exhausted: true,
+                on_consecutive_errors: true,
+                consecutive_error_threshold: 3,
+                on_latency_timeout: true,
+                latency_timeout_ms: 30000,
+            },
+        }
+    }
+
+    #[test]
+    fn test_provider_response_from_provider() {
+        let provider = test_provider("p1");
+        let response: ProviderResponse = (&provider).into();
+        assert_eq!(response.id, "p1");
+        assert_eq!(response.name, "p1");
+        assert_eq!(response.protocol, "openai");
+        assert_eq!(response.base_url, "https://api.test.com/v1");
+        assert_eq!(response.enabled, true);
+        assert_eq!(response.models.len(), 1);
+        assert_eq!(response.models[0].id, "test-model");
+        assert_eq!(response.models[0].context_window, Some(128000));
+    }
+
+    #[test]
+    fn test_provider_response_with_quota() {
+        let mut provider = test_provider("p1");
+        provider.daily_token_quota = Some(500_000);
+        provider.quota_reset_utc_hour = 6;
+        let response: ProviderResponse = (&provider).into();
+        assert_eq!(response.daily_token_quota, Some(500_000));
+        assert_eq!(response.quota_reset_utc_hour, 6);
+    }
+
+    #[test]
+    fn test_open_code_agent_mapping_from_mapping() {
+        let input = OpenCodeAgentMapping {
+            build: Some("glm-5-router".to_string()),
+            plan: Some("fast-model".to_string()),
+            general: None,
+            explore: None,
+            compaction: None,
+            title: None,
+            summary: None,
+            small_model: Some("small-model".to_string()),
+        };
+        let mapping: AgentMapping = input.into();
+        assert_eq!(mapping.build, Some("glm-5-router".to_string()));
+        assert_eq!(mapping.plan, Some("fast-model".to_string()));
+        assert_eq!(mapping.general, None);
+        assert_eq!(mapping.small_model, Some("small-model".to_string()));
+    }
+
+    #[test]
+    fn test_open_code_agent_mapping_all_none() {
+        let input = OpenCodeAgentMapping {
+            build: None,
+            plan: None,
+            general: None,
+            explore: None,
+            compaction: None,
+            title: None,
+            summary: None,
+            small_model: None,
+        };
+        let mapping: AgentMapping = input.into();
+        assert_eq!(mapping.build, None);
+        assert_eq!(mapping.plan, None);
+        assert_eq!(mapping.small_model, None);
+    }
+
+    #[test]
+    fn test_open_code_agent_mapping_all_fields() {
+        let input = OpenCodeAgentMapping {
+            build: Some("a".to_string()),
+            plan: Some("b".to_string()),
+            general: Some("c".to_string()),
+            explore: Some("d".to_string()),
+            compaction: Some("e".to_string()),
+            title: Some("f".to_string()),
+            summary: Some("g".to_string()),
+            small_model: Some("h".to_string()),
+        };
+        let mapping: AgentMapping = input.into();
+        assert_eq!(mapping.build, Some("a".to_string()));
+        assert_eq!(mapping.plan, Some("b".to_string()));
+        assert_eq!(mapping.general, Some("c".to_string()));
+        assert_eq!(mapping.explore, Some("d".to_string()));
+        assert_eq!(mapping.compaction, Some("e".to_string()));
+        assert_eq!(mapping.title, Some("f".to_string()));
+        assert_eq!(mapping.summary, Some("g".to_string()));
+        assert_eq!(mapping.small_model, Some("h".to_string()));
+    }
+
+    #[test]
+    fn test_test_connection_result_serialization() {
+        let result = TestConnectionResult {
+            success: true,
+            status_code: Some(200),
+            message: "Connection successful (HTTP 200)".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("success"));
+        assert!(json.contains("true"));
+        assert!(json.contains("200"));
+    }
+
+    #[test]
+    fn test_test_connection_result_failure() {
+        let result = TestConnectionResult {
+            success: false,
+            status_code: Some(401),
+            message: "Connection failed (HTTP 401)".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("false"));
+        assert!(json.contains("401"));
+    }
+
+    #[test]
+    fn test_test_connection_result_no_status_code() {
+        let result = TestConnectionResult {
+            success: false,
+            status_code: None,
+            message: "Connection failed: network error".to_string(),
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("null"));
+    }
+
+    #[tokio::test]
+    async fn test_get_providers_returns_empty_when_no_config() {
+        let result = get_providers().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_groups_returns_empty_when_no_config() {
+        let result = get_groups().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_get_app_config_returns_defaults_when_no_config() {
+        let result = get_app_config().await;
+        assert!(result.is_ok());
+        let config = result.unwrap();
+        assert_eq!(config.proxy_port, 4141);
+        assert_eq!(config.proxy_host, "127.0.0.1");
+        assert_eq!(config.refresh_interval_hours, 24);
+    }
+
+    #[test]
+    fn test_daily_summary_date_parsing() {
+        let date = NaiveDate::parse_from_str("2026-04-08", "%Y-%m-%d");
+        assert!(date.is_ok());
+
+        let bad_date = NaiveDate::parse_from_str("04-08-2026", "%Y-%m-%d");
+        assert!(bad_date.is_err());
+
+        let bad_format = NaiveDate::parse_from_str("not-a-date", "%Y-%m-%d");
+        assert!(bad_format.is_err());
+    }
 }

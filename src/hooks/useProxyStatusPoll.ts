@@ -7,8 +7,9 @@ export function useProxyStatusPoll() {
   const setProxyStatus = useStore((s) => s.setProxyStatus);
   const appConfig = useStore((s) => s.appConfig);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const proxyHost = appConfig?.proxy_host ?? 'localhost';
   const proxyPort = appConfig?.proxy_port ?? 4141;
-  const healthUrl = `http://localhost:${proxyPort}/health`;
+  const healthUrl = `http://${proxyHost}:${proxyPort}/health`;
 
   useEffect(() => {
     const poll = async () => {

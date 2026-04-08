@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useState } from 'react';
 import {
   Plus,
   Edit2,
@@ -22,7 +22,7 @@ import {
   refreshProviderModels,
   getGroups,
 } from '../lib/ipc';
-import type { Provider, ProviderModel, Group } from '../types';
+import type { Provider, ProviderModel } from '../types';
 import type { TestConnectionResult } from '../lib/ipc';
 
 function generateId(name: string): string {
@@ -62,11 +62,6 @@ export default function Providers() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
-  const [groups, setGroups] = useState<Group[]>([]);
-
-  useEffect(() => {
-    getGroups().then(setGroups).catch(() => {});
-  }, []);
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
     const id = Date.now();
@@ -120,7 +115,8 @@ export default function Providers() {
 
   const handleDelete = useCallback(
     async (provider: Provider) => {
-      const groupsUsingProvider = groups.filter((g) =>
+      const currentGroups = await getGroups();
+      const groupsUsingProvider = currentGroups.filter((g) =>
         g.entries.some((e) => e.providerId === provider.id),
       );
 
@@ -134,14 +130,14 @@ export default function Providers() {
 
       try {
         await deleteProvider(provider.id);
-        const updated = providers.filter((p) => p.id !== provider.id);
+        const updated = await (await import('../lib/ipc')).getProviders();
         setProviders(updated);
         addToast('success', `Deleted provider "${provider.name}"`);
       } catch (e: unknown) {
         addToast('error', `Delete failed: ${e instanceof Error ? e.message : String(e)}`);
       }
     },
-    [providers, groups, setProviders, addToast],
+    [setProviders, addToast],
   );
 
   const handleSave = useCallback(
@@ -442,9 +438,12 @@ function ProviderModal({
       setError('API key is required for new providers.');
       return;
     }
-    if (dailyTokenQuota && isNaN(Number(dailyTokenQuota))) {
-      setError('Daily token quota must be a number.');
-      return;
+    if (dailyTokenQuota) {
+      const quota = Number(dailyTokenQuota);
+      if (isNaN(quota) || quota < 0) {
+        setError('Daily token quota must be a non-negative number.');
+        return;
+      }
     }
     const hour = Number(quotaResetUtcHour);
     if (isNaN(hour) || hour < 0 || hour > 23) {

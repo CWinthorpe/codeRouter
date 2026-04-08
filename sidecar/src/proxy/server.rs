@@ -13,9 +13,10 @@ use axum::{
 use axum::response::Response;
 use futures::StreamExt;
 use reqwest::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::net::TcpListener;
+use tokio::signal::unix::{signal, SignalKind};
 
 use crate::config::{
     models::{AppConfig, Group},
@@ -24,8 +25,8 @@ use crate::config::{
 use crate::credentials::keychain::get_credential;
 use crate::metrics::db as metrics_db;
 use crate::metrics::recorder::{MetricsRecorder, RequestEvent};
+use crate::metrics::scheduler;
 use crate::metrics::scheduler::spawn_scheduler;
-use crate::metrics::queries::get_latency_percentiles;
 use crate::models::refresher::refresh_all_providers;
 use crate::proxy::router::{
     self, SharedRouterState,
@@ -62,7 +63,7 @@ pub async fn start_server() -> anyhow::Result<()> {
 
     let router_state = router::init_and_set_global_router_state(&groups, &providers);
 
-    router::init_daily_totals_from_db(&router_state);
+    router::init_daily_totals_from_db(&router_state, &providers);
 
     let conn = metrics_db::init_db().expect("Failed to initialize metrics database");
     let (metrics_recorder, _metrics_handle) = MetricsRecorder::new(conn);
@@ -82,8 +83,15 @@ pub async fn start_server() -> anyhow::Result<()> {
     let _scheduler_handle = spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
 
     let refresh_client = state.client.clone();
+    let refresh_interval = state.config.refresh_interval_hours;
     tokio::spawn(async move {
-        refresh_all_providers(&refresh_client).await;
+        loop {
+            refresh_all_providers(&refresh_client).await;
+            tokio::time::sleep(std::time::Duration::from_secs(
+                (refresh_interval as u64).saturating_mul(3600),
+            ))
+            .await;
+        }
     });
 
     let host = state.config.proxy_host.clone();
@@ -95,12 +103,29 @@ pub async fn start_server() -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/v1/completions", post(handle_completions))
         .route("/health", get(handle_health))
+        .route("/internal/router/status", get(handle_internal_router_status))
+        .route("/internal/router/entry", post(handle_internal_router_set_entry))
         .with_state(state.clone());
 
     let listener = TcpListener::bind(&addr).await?;
 
     eprintln!("CodeRouter proxy listening on {addr}");
-    axum::serve(listener, app).await?;
+
+    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                eprintln!("Received SIGTERM, shutting down gracefully");
+            }
+            _ = sigint.recv() => {
+                eprintln!("Received SIGINT, shutting down gracefully");
+            }
+        }
+    });
+
+    server.await?;
 
     Ok(())
 }
@@ -143,40 +168,40 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
             })
         })
         .map(|g| {
-            let highest_active_entry = g
-                .entries
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.enabled)
-                .min_by_key(|(_, e)| e.priority);
+            let (context_window, max_output_tokens) = {
+                let mut found = (None, None);
+                let sorted_entries: Vec<_> = g
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.enabled)
+                    .map(|(idx, e)| (idx, e))
+                    .collect();
+                let mut sorted_by_priority = sorted_entries.clone();
+                sorted_by_priority.sort_by_key(|(_, e)| e.priority);
 
-            let (context_window, max_output_tokens) = if let Some((idx, entry)) = highest_active_entry {
-                let key = format!("{}:{}", entry.provider_id, idx);
-                let is_active = router_state.entries.get(&key)
-                    .map(|es| es.status == router::EntryStatus::Active)
-                    .unwrap_or(true);
+                for (idx, entry) in sorted_by_priority {
+                    let key = format!("{}:{}", entry.provider_id, idx);
+                    let is_active = router_state.entries.get(&key)
+                        .map(|es| es.status == router::EntryStatus::Active)
+                        .unwrap_or(true);
 
-                if is_active {
-                    if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id) {
-                        if let Some(model_meta) = provider.models.iter().find(|m| m.id == entry.model_id) {
-                            (model_meta.context_window, model_meta.max_output_tokens)
-                        } else {
-                            (None, None)
+                    if is_active {
+                        if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id) {
+                            if let Some(model_meta) = provider.models.iter().find(|m| m.id == entry.model_id) {
+                                found = (model_meta.context_window, model_meta.max_output_tokens);
+                            }
                         }
-                    } else {
-                        (None, None)
+                        break;
                     }
-                } else {
-                    (None, None)
                 }
-            } else {
-                (None, None)
+                found
             };
 
             ModelObject {
                 id: g.alias.clone(),
                 object: "model".to_string(),
-                created: 0,
+                created: chrono::Utc::now().timestamp() as u64,
                 owned_by: "coderouter".to_string(),
                 context_window,
                 max_output_tokens,
@@ -409,15 +434,29 @@ async fn process_response(
 
         if content_type.contains("text/event-stream") {
             if is_anthropic {
-                let stream = resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                });
-                return Ok((translator::translate_anthropic_stream(stream, group_alias.to_string()).into_response(), 0, 0));
+                let token_counts = Arc::new(std::sync::Mutex::new(translator::StreamTokenCounts {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                }));
+                let (body, token_counts) = translator::translate_anthropic_stream(
+                    resp.bytes_stream().map(|result| {
+                        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    }),
+                    group_alias.to_string(),
+                    token_counts,
+                );
+                let mut resp = Response::new(body);
+                resp.headers_mut().insert(
+                    CONTENT_TYPE,
+                    axum::http::HeaderValue::from_static("text/event-stream"),
+                );
+                let counts = token_counts.lock().unwrap();
+                return Ok((resp, counts.input_tokens, counts.output_tokens));
             } else {
-                let raw_stream = resp.bytes_stream().map(|result| {
+                let body = resp.bytes_stream().map(|result| {
                     result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                 });
-                let body = axum::body::Body::from_stream(raw_stream);
+                let body = axum::body::Body::from_stream(body);
                 let mut resp = Response::new(body);
                 resp.headers_mut().insert(
                     CONTENT_TYPE,
@@ -565,7 +604,6 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 enum AppError {
     BadRequest(String),
     NotFound(String),
-    UpstreamError(String),
     InternalError(String),
 }
 
@@ -574,10 +612,6 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            AppError::UpstreamError(msg) => {
-                eprintln!("upstream error: {msg}");
-                (StatusCode::BAD_GATEWAY, msg)
-            }
             AppError::InternalError(msg) => {
                 eprintln!("internal error: {msg}");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg)
@@ -593,5 +627,50 @@ impl IntoResponse for AppError {
         }));
 
         (status, body).into_response()
+    }
+}
+
+#[derive(Serialize)]
+struct InternalRouterStatusResponse {
+    pub status: String,
+    pub data: Option<router::RouterStatusResponse>,
+}
+
+async fn handle_internal_router_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<InternalRouterStatusResponse> {
+    let groups = load_groups().unwrap_or_default();
+    let router_state = state.router_state.lock().unwrap();
+    let status = router::get_router_status(&groups, &router_state);
+    Json(InternalRouterStatusResponse {
+        status: "ok".to_string(),
+        data: Some(status),
+    })
+}
+
+#[derive(Deserialize)]
+struct InternalSetEntryRequest {
+    pub group_id: String,
+    pub entry_index: usize,
+    pub enabled: bool,
+}
+
+async fn handle_internal_router_set_entry(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<InternalSetEntryRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let groups = state.groups.clone();
+    match scheduler::set_entry_enabled(
+        &state.router_state,
+        groups,
+        &req.group_id,
+        req.entry_index,
+        req.enabled,
+    ) {
+        Ok(()) => Ok(Json(serde_json::json!({ "status": "ok" }))),
+        Err(e) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e })),
+        )),
     }
 }

@@ -128,10 +128,19 @@ export default function OpenCodeSetup() {
     };
   }, [mapping, groups, proxyPort, fetchPreview]);
 
-  // Initial preview fetch
+  // Check if provider is already enabled on mount
   useEffect(() => {
-    fetchPreview();
-  }, []);
+    const checkProviderStatus = async () => {
+      try {
+        const json = await previewOpencodeConfig(proxyPort, null);
+        const parsed = JSON.parse(json);
+        setProviderEnabled(!!parsed?.provider?.coderouter);
+      } catch {
+        // IPC may fail outside Tauri
+      }
+    };
+    checkProviderStatus();
+  }, [proxyPort]);
 
   const handleToggleProvider = useCallback(async () => {
     setTogglingProvider(true);

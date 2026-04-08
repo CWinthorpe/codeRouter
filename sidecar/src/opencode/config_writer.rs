@@ -179,7 +179,9 @@ pub fn remove_provider(config_path: &Path) -> Result<()> {
         }
     }
 
-    write_config(config_path, &config)
+    write_config(config_path, &config)?;
+    let _ = save_opencode_cache(config_path);
+    Ok(())
 }
 
 pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()> {
@@ -225,7 +227,9 @@ pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()
         );
     }
 
-    write_config(config_path, &config)
+    write_config(config_path, &config)?;
+    let _ = save_opencode_cache(config_path);
+    Ok(())
 }
 
 pub fn remove_agent_models(config_path: &Path) -> Result<()> {

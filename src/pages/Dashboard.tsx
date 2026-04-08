@@ -13,10 +13,10 @@ interface HealthData {
   uptime_seconds: number;
 }
 
-function useHealthPoll(proxyStatus: string, proxyPort: number) {
+function useHealthPoll(proxyStatus: string, proxyPort: number, proxyHost?: string) {
   const [health, setHealth] = useState<HealthData | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const healthUrl = `http://localhost:${proxyPort}/health`;
+  const healthUrl = `http://${proxyHost ?? 'localhost'}:${proxyPort}/health`;
 
   useEffect(() => {
     if (proxyStatus !== 'running') {
@@ -132,7 +132,7 @@ function StatusBadge({ status }: { status: string }) {
 
 function ProxyStatusCard() {
   const { proxyStatus, appConfig } = useStore((s) => ({ proxyStatus: s.proxyStatus, appConfig: s.appConfig }));
-  const health = useHealthPoll(proxyStatus, appConfig?.proxy_port ?? 4141);
+  const health = useHealthPoll(proxyStatus, appConfig?.proxy_port ?? 4141, appConfig?.proxy_host);
   const navigate = useNavigate();
 
   return (
@@ -364,7 +364,7 @@ function RequestFeed() {
             )}
             {requests.map((req) => {
               const isExpanded = expandedId === req.id;
-              const showExpand = req.status === 'error' || req.status === 'timeout' || req.error_type;
+              const showExpand = req.status === 'error' || req.status === 'timeout' || req.status === 'failover' || req.error_type;
               return (
                 <React.Fragment key={req.id}>
                   <tr
