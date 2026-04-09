@@ -32,6 +32,7 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 
 function generateId(name: string): string {
@@ -658,14 +659,15 @@ function ProviderModal({
 
           <div>
             <label className="mb-1 block text-sm font-medium text-zinc-300">Protocol Type</label>
-            <select
-              value={protocol}
-              onChange={(e) => setProtocol(e.target.value as 'openai' | 'anthropic')}
-              className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-            >
-              <option value="openai">OpenAI-compatible</option>
-              <option value="anthropic">Anthropic-compatible</option>
-            </select>
+            <Select value={protocol} onValueChange={(v) => setProtocol(v as 'openai' | 'anthropic')}>
+              <SelectTrigger className="w-full border-zinc-700 bg-zinc-800 text-zinc-100">
+                <SelectValue placeholder="Select protocol" />
+              </SelectTrigger>
+              <SelectContent className="bg-zinc-800 border-zinc-700">
+                <SelectItem value="openai" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">OpenAI-compatible</SelectItem>
+                <SelectItem value="anthropic" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Anthropic-compatible</SelectItem>
+              </SelectContent>
+            </Select>
           </div>
 
           <div>

@@ -4,6 +4,7 @@ import { useStore } from '../store';
 import { Toast } from '../components/Toast';
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '../components/ui/card';
 import { Button } from '../components/ui/button';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import { getAppConfig, saveAppConfig, clearMetricsData, resetAllConfig, restartProxy } from '../lib/ipc';
 import type { AppConfig } from '../types';
 
@@ -223,17 +224,18 @@ export default function Settings() {
           </CardHeader>
           <CardContent>
             <label className="mb-1 block text-sm font-medium text-zinc-300">Auto-refresh interval</label>
-            <select
-              value={form.refresh_interval_hours}
-              onChange={(e) => updateField('refresh_interval_hours', Number(e.target.value))}
-              className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 focus:border-zinc-500 focus:outline-none"
-            >
-              {REFRESH_INTERVAL_OPTIONS.map((opt) => (
-                <option key={opt.value} value={opt.value}>
-                  {opt.label}
-                </option>
-              ))}
-            </select>
+            <Select value={String(form.refresh_interval_hours)} onValueChange={(v) => updateField('refresh_interval_hours', Number(v))}>
+              <SelectTrigger className="w-full border-zinc-700 bg-zinc-800 text-zinc-100">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="bg-zinc-800 border-zinc-700">
+                {REFRESH_INTERVAL_OPTIONS.map((opt) => (
+                  <SelectItem key={opt.value} value={String(opt.value)} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
+                    {opt.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </CardContent>
         </Card>
 
@@ -244,17 +246,18 @@ export default function Settings() {
           <CardContent className="space-y-4">
             <div>
               <label className="mb-1 block text-sm font-medium text-zinc-300">Log verbosity</label>
-              <select
-                value={form.log_verbosity}
-                onChange={(e) => updateField('log_verbosity', e.target.value as 'Error' | 'Info' | 'Debug')}
-                className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-200 focus:border-zinc-500 focus:outline-none"
-              >
-                {LOG_VERBOSITY_OPTIONS.map((v) => (
-                  <option key={v} value={v}>
-                    {v}
-                  </option>
-                ))}
-              </select>
+              <Select value={form.log_verbosity} onValueChange={(v) => updateField('log_verbosity', v as 'Error' | 'Info' | 'Debug')}>
+                <SelectTrigger className="w-full border-zinc-700 bg-zinc-800 text-zinc-100">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-zinc-800 border-zinc-700">
+                  {LOG_VERBOSITY_OPTIONS.map((v) => (
+                    <SelectItem key={v} value={v} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
+                      {v}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
             <Button variant="outline" type="button" onClick={handleViewLogs}>
               <Eye className="h-4 w-4" />

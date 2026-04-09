@@ -12,23 +12,23 @@ export async function getProviders(): Promise<Provider[]> {
 }
 
 export async function saveProvider(provider: Provider, apiKey: string): Promise<void> {
-  return invoke<void>('save_provider', { provider, api_key: apiKey });
+  return invoke<void>('save_provider', { provider, apiKey });
 }
 
 export async function toggleProviderEnabled(providerId: string, enabled: boolean): Promise<void> {
-  return invoke<void>('toggle_provider_enabled', { provider_id: providerId, enabled });
+  return invoke<void>('toggle_provider_enabled', { providerId, enabled });
 }
 
 export async function deleteProvider(providerId: string): Promise<void> {
-  return invoke<void>('delete_provider', { provider_id: providerId });
+  return invoke<void>('delete_provider', { providerId });
 }
 
 export async function refreshProviderModels(providerId: string): Promise<Provider[]> {
-  return invoke<Provider[]>('refresh_provider_models', { provider_id: providerId });
+  return invoke<Provider[]>('refresh_provider_models', { providerId });
 }
 
 export async function testProviderConnection(providerId: string): Promise<TestConnectionResult> {
-  return invoke<TestConnectionResult>('test_provider_connection', { provider_id: providerId });
+  return invoke<TestConnectionResult>('test_provider_connection', { providerId });
 }
 
 export async function getGroups(): Promise<Group[]> {
@@ -40,7 +40,7 @@ export async function saveGroup(group: Group): Promise<void> {
 }
 
 export async function deleteGroup(groupId: string): Promise<void> {
-  return invoke<void>('delete_group', { group_id: groupId });
+  return invoke<void>('delete_group', { groupId });
 }
 
 export async function getAppConfig(): Promise<AppConfig> {
@@ -56,11 +56,11 @@ export async function getRouterStatus(): Promise<RouterStatusResponse> {
 }
 
 export async function setEntryEnabled(groupId: string, entryIndex: number, enabled: boolean): Promise<void> {
-  return invoke<void>('set_entry_enabled', { group_id: groupId, entry_index: entryIndex, enabled });
+  return invoke<void>('set_entry_enabled', { groupId, entryIndex, enabled });
 }
 
 export async function getDailySummary(providerId: string, date: string): Promise<DailySummary> {
-  return invoke<DailySummary>('get_daily_summary', { provider_id: providerId, date });
+  return invoke<DailySummary>('get_daily_summary', { providerId, date });
 }
 
 export async function getRecentRequests(limit: number): Promise<RequestRow[]> {
@@ -87,7 +87,7 @@ export async function setOpencodeConfigPath(path: string): Promise<void> {
 }
 
 export async function injectOpencodeProvider(proxyPort: number): Promise<void> {
-  return invoke<void>('inject_opencode_provider', { proxy_port: proxyPort });
+  return invoke<void>('inject_opencode_provider', { proxyPort });
 }
 
 export async function removeOpencodeProvider(): Promise<void> {
@@ -103,7 +103,7 @@ export async function removeOpencodeAgentModels(): Promise<void> {
 }
 
 export async function previewOpencodeConfig(proxyPort: number, mapping: OpenCodeAgentMapping | null): Promise<string> {
-  return invoke<string>('preview_opencode_config', { proxy_port: proxyPort, mapping });
+  return invoke<string>('preview_opencode_config', { proxyPort, mapping });
 }
 
 export async function clearMetricsData(): Promise<void> {
@@ -119,7 +119,7 @@ export async function restartProxy(): Promise<void> {
 }
 
 export async function isGroupReferencedInOpencode(groupAlias: string): Promise<boolean> {
-  return invoke<boolean>('is_group_referenced_in_opencode', { group_alias: groupAlias });
+  return invoke<boolean>('is_group_referenced_in_opencode', { groupAlias: groupAlias });
 }
 
 export async function removeCoderouterFromOpencode(): Promise<void> {
@@ -131,7 +131,7 @@ export async function dismissOnboarding(): Promise<void> {
 }
 
 export async function getUsageByGroup(days: number, providerId?: string): Promise<GroupUsage[]> {
-  return invoke<GroupUsage[]>('get_usage_by_group', { days, provider_id: providerId ?? null });
+  return invoke<GroupUsage[]>('get_usage_by_group', { days, providerId: providerId ?? null });
 }
 
 
