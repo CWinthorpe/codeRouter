@@ -42,6 +42,10 @@ pub struct ProviderResponse {
     pub daily_token_quota: Option<u64>,
     #[serde(default, rename = "quotaResetUtcHour")]
     pub quota_reset_utc_hour: u32,
+    #[serde(default, rename = "dailyRequestQuota")]
+    pub daily_request_quota: Option<u64>,
+    #[serde(default, rename = "modelOverrides")]
+    pub model_overrides: Vec<ProviderModelResponse>,
     #[serde(default)]
     pub enabled: bool,
     #[serde(default)]
@@ -72,7 +76,16 @@ impl From<&Provider> for ProviderResponse {
             base_url: p.base_url.clone(),
             credential_key: p.credential_key.clone(),
             daily_token_quota: p.daily_token_quota,
+            daily_request_quota: p.daily_request_quota,
             quota_reset_utc_hour: p.quota_reset_utc_hour,
+            model_overrides: p.model_overrides.as_ref().map(|v| v.iter().map(|m| ProviderModelResponse {
+                id: m.id.clone(),
+                context_window: m.context_window,
+                max_output_tokens: m.max_output_tokens,
+                input_cost_per_1m: m.input_cost_per_1m,
+                output_cost_per_1m: m.output_cost_per_1m,
+                last_refreshed: m.last_refreshed.clone(),
+            }).collect()).unwrap_or_default(),
             enabled: p.enabled,
             models: p.models.iter().map(|m| ProviderModelResponse {
                 id: m.id.clone(),
@@ -96,9 +109,19 @@ async fn notify_sidecar_config_reload() {
     let config = store::load_app_config().unwrap_or_default();
     let url = format!("http://{}:{}/internal/config/reload", config.proxy_host, config.proxy_port);
     let client = Client::new();
-    if let Err(e) = client.post(&url).send().await {
-        eprintln!("[notify-sidecar] failed to notify config reload: {e}");
+
+    for attempt in 0..3 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        match client.post(&url).timeout(std::time::Duration::from_secs(2)).send().await {
+            Ok(_) => return,
+            Err(e) => {
+                eprintln!("[notify-sidecar] attempt {} failed: {e}", attempt + 1);
+            }
+        }
     }
+    eprintln!("[notify-sidecar] all retry attempts failed");
 }
 
 #[tauri::command]
@@ -304,7 +327,7 @@ pub async fn refresh_provider_models(provider_id: String) -> Result<Vec<Provider
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut all_providers = store::load_providers().map_err(|e| e.to_string())?;
+    let mut all_providers = providers;
     if let Some(existing) = all_providers.iter_mut().find(|p| p.id == provider_id) {
         existing.models = models;
     }
@@ -357,8 +380,13 @@ pub async fn set_entry_enabled(group_id: String, entry_index: usize, enabled: bo
 pub fn get_daily_summary(provider_id: String, date: String) -> Result<queries::DailySummary, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map_err(|e| format!("Invalid date format (expected YYYY-MM-DD): {}", e))?;
+    let providers = store::load_providers().unwrap_or_default();
+    let reset_hour = providers.iter()
+        .find(|p| p.id == provider_id)
+        .map(|p| p.quota_reset_utc_hour)
+        .unwrap_or(0);
     with_metrics_db(|conn| {
-        queries::get_daily_summary(conn, &provider_id, date)
+        queries::get_daily_summary(conn, &provider_id, date, reset_hour)
             .map_err(|e| e.to_string())
     })
 }
@@ -373,8 +401,13 @@ pub fn get_recent_requests(limit: usize) -> Result<Vec<queries::RequestRow>, Str
 
 #[tauri::command]
 pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::DailyUsage>, String> {
+    let providers = store::load_providers().unwrap_or_default();
+    let reset_hour = providers.iter()
+        .find(|p| p.id == provider_id)
+        .map(|p| p.quota_reset_utc_hour)
+        .unwrap_or(0);
     with_metrics_db(|conn| {
-        queries::get_usage_by_day(conn, &provider_id, days)
+        queries::get_usage_by_day(conn, &provider_id, days, reset_hour)
             .map_err(|e| e.to_string())
     })
 }
@@ -382,7 +415,7 @@ pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::D
 #[tauri::command]
 pub fn get_usage_by_group(days: u32) -> Result<Vec<queries::GroupUsage>, String> {
     with_metrics_db(|conn| {
-        queries::get_usage_by_group(conn, days)
+        queries::get_usage_by_group(conn, days, 0)
             .map_err(|e| e.to_string())
     })
 }
@@ -422,6 +455,37 @@ impl From<OpenCodeAgentMapping> for AgentMapping {
     }
 }
 
+fn build_entry_statuses() -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    let config = store::load_app_config().unwrap_or_default();
+    let url = format!("http://{}:{}/internal/router/status", config.proxy_host, config.proxy_port);
+    let client = reqwest::blocking::Client::new();
+    let resp = match client.get(&url).timeout(std::time::Duration::from_secs(2)).send() {
+        Ok(r) => r,
+        Err(_) => return map,
+    };
+    if !resp.status().is_success() {
+        return map;
+    }
+    let body: serde_json::Value = match resp.json() {
+        Ok(b) => b,
+        Err(_) => return map,
+    };
+    let data = match body.get("data") {
+        Some(d) => d,
+        None => return map,
+    };
+    let status: router::RouterStatusResponse = match serde_json::from_value(data.clone()) {
+        Ok(s) => s,
+        Err(_) => return map,
+    };
+    for entry in status.entries {
+        let key = format!("{}:{}", entry.provider_id, entry.entry_index);
+        map.insert(key, entry.status);
+    }
+    map
+}
+
 #[tauri::command]
 pub fn get_opencode_config_path() -> Option<String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -443,8 +507,9 @@ pub fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
 
     let groups = store::load_groups().unwrap_or_default();
     let providers = store::load_providers().unwrap_or_default();
+    let entry_statuses = build_entry_statuses();
 
-    config_writer::inject_provider(&config_path, &groups, &providers, proxy_port)
+    config_writer::inject_provider(&config_path, &groups, &providers, proxy_port, &entry_statuses)
         .map_err(|e| e.to_string())
 }
 
@@ -482,10 +547,11 @@ pub fn remove_opencode_agent_models() -> Result<(), String> {
 pub fn preview_opencode_config(proxy_port: u16, mapping: Option<OpenCodeAgentMapping>) -> Result<String, String> {
     let groups = store::load_groups().unwrap_or_default();
     let providers = store::load_providers().unwrap_or_default();
+    let entry_statuses = build_entry_statuses();
 
     let agent_mapping = mapping.map(|m| m.into());
 
-    config_writer::preview_opencode_config(&groups, &providers, proxy_port, agent_mapping.as_ref())
+    config_writer::preview_opencode_config(&groups, &providers, proxy_port, agent_mapping.as_ref(), &entry_statuses)
         .map_err(|e| e.to_string())
 }
 
@@ -498,8 +564,13 @@ pub fn is_group_referenced_in_opencode(group_alias: String) -> bool {
 pub fn get_latency_percentiles(provider_id: String, date: String) -> Result<Option<queries::LatencyPercentiles>, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map_err(|e| format!("Invalid date format (expected YYYY-MM-DD): {}", e))?;
+    let providers = store::load_providers().unwrap_or_default();
+    let reset_hour = providers.iter()
+        .find(|p| p.id == provider_id)
+        .map(|p| p.quota_reset_utc_hour)
+        .unwrap_or(0);
     with_metrics_db(|conn| {
-        queries::get_latency_percentiles(conn, &provider_id, date)
+        queries::get_latency_percentiles(conn, &provider_id, date, reset_hour)
             .map_err(|e| e.to_string())
     })
 }
@@ -552,26 +623,40 @@ pub fn kill_sidecar(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn sidecar_target_suffix() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    let vendor = "unknown";
+    let env = match os {
+        "linux" => "gnu",
+        "macos" => "darwin",
+        "windows" => "msvc",
+        _ => "unknown",
+    };
+    format!("coderouter-proxy-{}-{}-{}-{}", arch, vendor, os, env)
+}
+
 pub fn spawn_sidecar() -> Result<Child, String> {
+    let target_suffix = sidecar_target_suffix();
     let sidecar_path = if cfg!(debug_assertions) {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let dev_path = std::path::Path::new(manifest_dir)
-            .join("sidecar/coderouter-proxy-x86_64-unknown-linux-gnu");
+            .join(format!("sidecar/{target_suffix}"));
         if dev_path.exists() {
             dev_path
         } else {
-            std::path::PathBuf::from("coderouter-proxy")
+            let fallback = std::path::Path::new(manifest_dir)
+                .join("sidecar/coderouter-proxy");
+            if fallback.exists() {
+                fallback
+            } else {
+                std::path::PathBuf::from("coderouter-proxy")
+            }
         }
     } else {
-        // Check multiple possible paths for the sidecar binary:
-        // 1. AppImage-extracted path (/tmp/.mount_*/usr/bin/sidecar/)
-        // 2. Release path (next to the main binary in sidecar/)
-        // 3. Fallback to PATH
-
-        // Check for AppImage mount point via APPDIR env var
         if let Ok(appdir) = std::env::var("APPDIR") {
             let appimage_sidecar = std::path::Path::new(&appdir)
-                .join("usr/bin/sidecar/coderouter-proxy-x86_64-unknown-linux-gnu");
+                .join(format!("usr/bin/sidecar/{target_suffix}"));
             if appimage_sidecar.exists() {
                 appimage_sidecar
             } else {
@@ -800,5 +885,11 @@ mod tests {
 
         let bad_format = NaiveDate::parse_from_str("not-a-date", "%Y-%m-%d");
         assert!(bad_format.is_err());
+    }
+
+    #[test]
+    fn test_build_entry_statuses_returns_empty_when_sidecar_unavailable() {
+        let statuses = build_entry_statuses();
+        assert!(statuses.is_empty());
     }
 }

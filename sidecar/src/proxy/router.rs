@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use chrono::{DateTime, Utc};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use crate::config::models::{Group, GroupEntry, Provider};
@@ -98,14 +99,12 @@ pub fn init_and_set_global_router_state(
     state
 }
 
-pub fn init_daily_totals_from_db(state: &SharedRouterState, providers: &[Provider]) {
-    use crate::metrics::db::init_db;
+pub fn init_daily_totals_from_db(
+    state: &SharedRouterState,
+    providers: &[Provider],
+    conn: &Connection,
+) {
     use crate::metrics::queries::{get_today_request_counts, get_today_token_totals};
-
-    let conn = match init_db() {
-        Ok(c) => c,
-        Err(_) => return,
-    };
 
     let mut guard = match state.lock() {
         Ok(g) => g,
@@ -147,7 +146,7 @@ pub fn init_daily_totals_from_db(state: &SharedRouterState, providers: &[Provide
 
 pub fn select_entry<'a>(
     group: &'a Group,
-    state: &RouterState,
+    state: &mut RouterState,
     providers: &[Provider],
     skip_indices: &std::collections::HashSet<u32>,
 ) -> Option<(&'a GroupEntry, u32)> {
@@ -163,15 +162,22 @@ pub fn select_entry<'a>(
                 return false;
             }
             let key = entry_key(&entry.provider_id, *idx as u32);
-            if let Some(entry_state) = state.entries.get(&key) {
-                if entry_state.status != EntryStatus::Active {
-                    if entry_state.status == EntryStatus::Cooldown {
-                        if let Some(cooldown_until) = entry_state.cooldown_until {
-                            if Utc::now() >= cooldown_until {
-                                return true;
-                            }
-                        }
+            if let Some(entry_state) = state.entries.get_mut(&key) {
+                if entry_state.status == EntryStatus::Cooldown {
+                    let cooldown_expired = entry_state
+                        .cooldown_until
+                        .as_ref()
+                        .map(|until| Utc::now() >= *until)
+                        .unwrap_or(false);
+                    if cooldown_expired {
+                        entry_state.status = EntryStatus::Active;
+                        entry_state.cooldown_until = None;
+                        entry_state.consecutive_errors = 0;
+                        return true;
                     }
+                    return false;
+                }
+                if entry_state.status != EntryStatus::Active {
                     return false;
                 }
                 let effective_quota = entry.daily_token_quota_override.or_else(|| {
@@ -273,19 +279,31 @@ pub fn record_success(
     entry_index: u32,
     tokens_used: u64,
     effective_quota: Option<u64>,
+    effective_request_quota: Option<u64>,
     on_quota_exhausted: bool,
 ) {
+    let prefix = format!("{provider_id}:");
+    for (key, entry_state) in state.entries.iter_mut() {
+        if key.starts_with(&prefix) {
+            entry_state.daily_tokens_used += tokens_used;
+            entry_state.daily_requests_used += 1;
+        }
+    }
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.consecutive_errors = 0;
-        entry_state.daily_tokens_used += tokens_used;
-        entry_state.daily_requests_used += 1;
         if entry_state.status == EntryStatus::Cooldown {
             entry_state.status = EntryStatus::Active;
             entry_state.cooldown_until = None;
         }
         if let Some(quota) = effective_quota {
             if entry_state.daily_tokens_used >= quota && on_quota_exhausted {
+                entry_state.status = EntryStatus::QuotaExhausted;
+                entry_state.cooldown_until = None;
+            }
+        }
+        if let Some(request_quota) = effective_request_quota {
+            if entry_state.daily_requests_used >= request_quota && on_quota_exhausted {
                 entry_state.status = EntryStatus::QuotaExhausted;
                 entry_state.cooldown_until = None;
             }
@@ -429,10 +447,10 @@ mod tests {
         let entries = vec![make_entry("p1", 2, true), make_entry("p2", 1, true)];
         let group = test_group_with_entries(entries);
         let state = init_router_state(&[group.clone()], &providers);
-        let state = state.lock().unwrap();
+        let mut state = state.lock().unwrap();
         let skip = std::collections::HashSet::new();
 
-        let (entry, idx) = select_entry(&group, &state, &providers, &skip).unwrap();
+        let (entry, idx) = select_entry(&group, &mut state, &providers, &skip).unwrap();
         assert_eq!(idx, 1);
         assert_eq!(entry.provider_id, "p2");
     }
@@ -443,10 +461,10 @@ mod tests {
         let entries = vec![make_entry("p1", 1, false)];
         let group = test_group_with_entries(entries);
         let state = init_router_state(&[group.clone()], &providers);
-        let state = state.lock().unwrap();
+        let mut state = state.lock().unwrap();
         let skip = std::collections::HashSet::new();
 
-        assert!(select_entry(&group, &state, &providers, &skip).is_none());
+        assert!(select_entry(&group, &mut state, &providers, &skip).is_none());
     }
 
     #[test]
@@ -459,10 +477,10 @@ mod tests {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
         }
-        let state = state.lock().unwrap();
+        let mut state = state.lock().unwrap();
         let skip = std::collections::HashSet::new();
 
-        assert!(select_entry(&group, &state, &providers, &skip).is_none());
+        assert!(select_entry(&group, &mut state, &providers, &skip).is_none());
     }
 
     #[test]
@@ -473,12 +491,12 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_success(&mut s, "p1", 0, 100, Some(100), true);
+            record_success(&mut s, "p1", 0, 100, Some(100), None, true);
         }
-        let state = state.lock().unwrap();
+        let mut state = state.lock().unwrap();
         let skip = std::collections::HashSet::new();
 
-        assert!(select_entry(&group, &state, &providers, &skip).is_none());
+        assert!(select_entry(&group, &mut state, &providers, &skip).is_none());
     }
 
     #[test]
@@ -491,7 +509,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
             record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
-            record_success(&mut s, "p1", 0, 50, None, false);
+            record_success(&mut s, "p1", 0, 50, None, None, false);
         }
         let state = state.lock().unwrap();
         let entry = state.entries.get("p1:0").unwrap();
@@ -581,11 +599,11 @@ mod tests {
         let entries = vec![make_entry("p1", 1, true), make_entry("p2", 2, true)];
         let group = test_group_with_entries(entries);
         let state = init_router_state(&[group.clone()], &providers);
-        let state = state.lock().unwrap();
+        let mut state = state.lock().unwrap();
         let mut skip = std::collections::HashSet::new();
         skip.insert(0);
 
-        let (entry, idx) = select_entry(&group, &state, &providers, &skip).unwrap();
+        let (entry, idx) = select_entry(&group, &mut state, &providers, &skip).unwrap();
         assert_eq!(idx, 1);
         assert_eq!(entry.provider_id, "p2");
     }
@@ -617,7 +635,7 @@ mod tests {
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::Cooldown);
             assert!(entry.cooldown_until.is_some());
-            record_success(&mut s, "p1", 0, 50, None, false);
+            record_success(&mut s, "p1", 0, 50, None, None, false);
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert!(entry.cooldown_until.is_none());
@@ -679,11 +697,11 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_success(&mut s, "p1", 0, 60, Some(100), true);
+            record_success(&mut s, "p1", 0, 60, Some(100), None, true);
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert_eq!(entry.daily_tokens_used, 60);
-            record_success(&mut s, "p1", 0, 50, Some(100), true);
+            record_success(&mut s, "p1", 0, 50, Some(100), None, true);
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::QuotaExhausted);
             assert_eq!(entry.daily_tokens_used, 110);
@@ -698,10 +716,111 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_success(&mut s, "p1", 0, 150, Some(100), false);
+            record_success(&mut s, "p1", 0, 150, Some(100), None, false);
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert_eq!(entry.daily_tokens_used, 150);
         }
+    }
+
+    #[test]
+    fn test_record_success_sets_quota_exhausted_on_request_quota() {
+        let mut prov = test_provider("p1", None);
+        prov.daily_request_quota = Some(2);
+        let providers = vec![prov];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_success(&mut s, "p1", 0, 10, None, Some(2), true);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::Active);
+            assert_eq!(entry.daily_requests_used, 1);
+            record_success(&mut s, "p1", 0, 10, None, Some(2), true);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::QuotaExhausted);
+            assert_eq!(entry.daily_requests_used, 2);
+        }
+    }
+
+    #[test]
+    fn test_select_entry_skips_request_quota_exhausted() {
+        let mut prov = test_provider("p1", None);
+        prov.daily_request_quota = Some(1);
+        let providers = vec![prov];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_success(&mut s, "p1", 0, 10, None, Some(1), true);
+        }
+        let mut state = state.lock().unwrap();
+        let skip = std::collections::HashSet::new();
+        assert!(select_entry(&group, &mut state, &providers, &skip).is_none());
+    }
+
+    #[test]
+    fn test_record_success_syncs_counters_across_provider_entries() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true), make_entry("p1", 2, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            record_consecutive_error(&mut s, "p1", 1, 3, true, 600000);
+            record_success(&mut s, "p1", 0, 50, None, None, false);
+        }
+        let state = state.lock().unwrap();
+        let entry0 = state.entries.get("p1:0").unwrap();
+        let entry1 = state.entries.get("p1:1").unwrap();
+        assert_eq!(entry0.daily_tokens_used, 50);
+        assert_eq!(entry0.daily_requests_used, 1);
+        assert_eq!(entry0.consecutive_errors, 0);
+        assert_eq!(entry1.daily_tokens_used, 50);
+        assert_eq!(entry1.daily_requests_used, 1);
+        assert_eq!(entry1.consecutive_errors, 1);
+    }
+
+    #[test]
+    fn test_record_success_syncs_request_counters_across_provider_entries() {
+        let mut prov = test_provider("p1", None);
+        prov.daily_request_quota = Some(5);
+        let providers = vec![prov];
+        let entries = vec![make_entry("p1", 1, true), make_entry("p1", 2, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_success(&mut s, "p1", 0, 10, None, Some(5), false);
+        }
+        let state = state.lock().unwrap();
+        let entry0 = state.entries.get("p1:0").unwrap();
+        let entry1 = state.entries.get("p1:1").unwrap();
+        assert_eq!(entry0.daily_requests_used, 1);
+        assert_eq!(entry1.daily_requests_used, 1);
+    }
+
+    #[test]
+    fn test_record_success_quota_check_only_on_specific_entry() {
+        let providers = vec![test_provider("p1", Some(100))];
+        let entries = vec![make_entry("p1", 1, true), {
+            let mut e = make_entry("p1", 2, true);
+            e.daily_token_quota_override = Some(200);
+            e
+        }];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_success(&mut s, "p1", 0, 100, Some(100), None, true);
+        }
+        let state = state.lock().unwrap();
+        let entry0 = state.entries.get("p1:0").unwrap();
+        let entry1 = state.entries.get("p1:1").unwrap();
+        assert_eq!(entry0.status, EntryStatus::QuotaExhausted);
+        assert_eq!(entry1.status, EntryStatus::Active);
     }
 }

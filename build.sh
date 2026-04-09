@@ -45,7 +45,9 @@ elif [ -d "/usr/lib64/pkgconfig" ]; then
 elif [ -d "/usr/lib/pkgconfig" ]; then
   export PKG_CONFIG_PATH=/usr/lib/pkgconfig
 fi
-npm install
+if [ ! -d "node_modules" ] || [ "package.json" -nt "node_modules" ]; then
+    npm install
+fi
 npm run tauri build
 
 echo ""

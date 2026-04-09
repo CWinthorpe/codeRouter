@@ -29,9 +29,7 @@ export function GroupStatusProvider({ children }: { children: ReactNode }) {
         setStatusData(data);
         setError(null);
       } catch (e: unknown) {
-        if (loading) {
-          setError(e instanceof Error ? e.message : 'Failed to fetch router status');
-        }
+        setError(e instanceof Error ? e.message : 'Failed to fetch router status');
       } finally {
         setLoading(false);
       }
@@ -43,7 +41,8 @@ export function GroupStatusProvider({ children }: { children: ReactNode }) {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [loading]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <GroupStatusContext.Provider value={{ statusData, loading, error }}>

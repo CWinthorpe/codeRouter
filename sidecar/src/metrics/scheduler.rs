@@ -117,7 +117,7 @@ fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
         for (idx, entry) in group.entries.iter().enumerate() {
             let key = router::entry_key(&entry.provider_id, idx as u32);
             let entry_state = match guard.entries.get_mut(&key) {
-                Some(s) if s.status == EntryStatus::QuotaExhausted => s,
+                Some(s) if s.status != EntryStatus::ManuallyDisabled => s,
                 _ => continue,
             };
 

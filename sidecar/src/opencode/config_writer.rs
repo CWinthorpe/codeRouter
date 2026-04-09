@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -98,6 +99,7 @@ pub fn inject_provider(
     groups: &[Group],
     providers: &[Provider],
     proxy_port: u16,
+    entry_statuses: &HashMap<String, String>,
 ) -> Result<()> {
     let mut config = read_config(config_path)?;
 
@@ -109,8 +111,19 @@ pub fn inject_provider(
         let highest_active = group
             .entries
             .iter()
-            .filter(|e| e.enabled && e.status == "active")
-            .min_by_key(|e| e.priority);
+            .enumerate()
+            .filter(|(idx, e)| {
+                if !e.enabled {
+                    return false;
+                }
+                let key = format!("{}:{}", e.provider_id, idx);
+                entry_statuses
+                    .get(&key)
+                    .map(|s| s == "active")
+                    .unwrap_or(true)
+            })
+            .min_by_key(|(_, e)| e.priority)
+            .map(|(_, e)| e);
 
         if let Some(entry) = highest_active {
             let provider = providers.iter().find(|p| p.id == entry.provider_id);
@@ -281,6 +294,7 @@ pub fn preview_opencode_config(
     providers: &[Provider],
     proxy_port: u16,
     mapping: Option<&AgentMapping>,
+    entry_statuses: &HashMap<String, String>,
 ) -> Result<String> {
     let mut config = read_config_or_empty()?;
 
@@ -292,8 +306,19 @@ pub fn preview_opencode_config(
         let highest_active = group
             .entries
             .iter()
-            .filter(|e| e.enabled && e.status == "active")
-            .min_by_key(|e| e.priority);
+            .enumerate()
+            .filter(|(idx, e)| {
+                if !e.enabled {
+                    return false;
+                }
+                let key = format!("{}:{}", e.provider_id, idx);
+                entry_statuses
+                    .get(&key)
+                    .map(|s| s == "active")
+                    .unwrap_or(true)
+            })
+            .min_by_key(|(_, e)| e.priority)
+            .map(|(_, e)| e);
 
         if let Some(entry) = highest_active {
             let provider = providers.iter().find(|p| p.id == entry.provider_id);
@@ -402,7 +427,11 @@ fn read_config(config_path: &Path) -> Result<serde_json::Value> {
 fn read_config_or_empty() -> Result<serde_json::Value> {
     let path = detect_opencode_config();
     match path {
-        Some(p) => read_config(&p),
+        Some(p) if p.exists() => read_config(&p),
+        Some(_) => match load_opencode_cache() {
+            Some(cache) => Ok(cache),
+            None => Ok(serde_json::Value::Object(serde_json::Map::new())),
+        },
         None => Ok(serde_json::Value::Object(serde_json::Map::new())),
     }
 }
@@ -585,7 +614,7 @@ mod tests {
         let groups = vec![test_group()];
         let providers = vec![test_provider()];
 
-        inject_provider(&config_path, &groups, &providers, 4141).unwrap();
+        inject_provider(&config_path, &groups, &providers, 4141, &HashMap::new()).unwrap();
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -636,7 +665,7 @@ mod tests {
         let groups = vec![test_group()];
         let providers = vec![test_provider()];
 
-        inject_provider(&config_path, &groups, &providers, 4141).unwrap();
+        inject_provider(&config_path, &groups, &providers, 4141, &HashMap::new()).unwrap();
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -678,7 +707,7 @@ mod tests {
         let groups = vec![test_group()];
         let providers = vec![test_provider()];
 
-        inject_provider(&config_path, &groups, &providers, 4141).unwrap();
+        inject_provider(&config_path, &groups, &providers, 4141, &HashMap::new()).unwrap();
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -1000,7 +1029,7 @@ mod tests {
         let groups = vec![test_group()];
         let providers = vec![provider];
 
-        inject_provider(&config_path, &groups, &providers, 4141).unwrap();
+        inject_provider(&config_path, &groups, &providers, 4141, &HashMap::new()).unwrap();
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
@@ -1027,7 +1056,8 @@ mod tests {
         let groups = vec![test_group()];
         let providers = vec![test_provider()];
 
-        let result = preview_opencode_config(&groups, &providers, 4141, None).unwrap();
+        let result =
+            preview_opencode_config(&groups, &providers, 4141, None, &HashMap::new()).unwrap();
 
         let config: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(config.get("provider").unwrap().get("coderouter").is_some());
@@ -1049,7 +1079,9 @@ mod tests {
             small_model: Some("fast-model-router".to_string()),
         };
 
-        let result = preview_opencode_config(&groups, &providers, 4141, Some(&mapping)).unwrap();
+        let result =
+            preview_opencode_config(&groups, &providers, 4141, Some(&mapping), &HashMap::new())
+                .unwrap();
 
         let config: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(
@@ -1076,7 +1108,7 @@ mod tests {
         let groups = vec![test_group()];
         let providers = vec![test_provider()];
 
-        inject_provider(&config_path, &groups, &providers, 4141).unwrap();
+        inject_provider(&config_path, &groups, &providers, 4141, &HashMap::new()).unwrap();
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
@@ -1129,7 +1161,7 @@ mod tests {
         let groups = vec![group];
         let providers = vec![provider1, provider2];
 
-        inject_provider(&config_path, &groups, &providers, 4141).unwrap();
+        inject_provider(&config_path, &groups, &providers, 4141, &HashMap::new()).unwrap();
 
         let contents = fs::read_to_string(&config_path).unwrap();
         let config: serde_json::Value = serde_json::from_str(&contents).unwrap();

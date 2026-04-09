@@ -225,6 +225,7 @@ fn main() {
                 Ok(child) => {
                     let mut sidecar_guard = state.sidecar.lock().unwrap();
                     *sidecar_guard = Some(child);
+                    *state.proxy_running.lock().unwrap() = true;
                 }
                 Err(e) => eprintln!("Warning: Failed to spawn sidecar: {}", e),
             }

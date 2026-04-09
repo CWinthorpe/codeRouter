@@ -14,6 +14,8 @@ import {
 import { Calendar, Download, ChevronLeft, ChevronRight, Filter } from 'lucide-react';
 import { getRecentRequests } from '../lib/ipc';
 import type { RequestRow } from '../types';
+import { StatusBadge } from '@/components/StatusBadge';
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 
 type Preset = 'today' | 'last7' | 'last30' | 'custom';
 
@@ -26,23 +28,17 @@ const PAGE_SIZE = 50;
 const FETCH_LIMIT = 1000;
 
 function startOfDay(d: Date): Date {
-  const copy = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-  return copy;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
 }
 
 function endOfDay(d: Date): Date {
-  const copy = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
-  return copy;
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
 }
 
 function formatDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
-}
-
-function formatUTCDate(d: Date): string {
-  const year = d.getUTCFullYear();
-  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
@@ -67,11 +63,11 @@ function formatTokens(n: number): string {
 
 function getDaysInRange(start: Date, end: Date): string[] {
   const days: string[] = [];
-  const current = startOfDay(start);
-  const last = startOfDay(end);
+  const current = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+  const last = new Date(end.getFullYear(), end.getMonth(), end.getDate());
   while (current <= last) {
-    days.push(formatUTCDate(current));
-    current.setUTCDate(current.getUTCDate() + 1);
+    days.push(formatDate(current));
+    current.setDate(current.getDate() + 1);
   }
   return days;
 }
@@ -87,8 +83,8 @@ function generateColors(n: number): string[] {
 
 function SortHeader({ column, children, sortColumn, sortDirection, onSort }: { column: keyof RequestRow; children: React.ReactNode; sortColumn: keyof RequestRow; sortDirection: 'asc' | 'desc'; onSort: (column: keyof RequestRow) => void }) {
   return (
-    <th
-      className="cursor-pointer select-none px-4 py-3 text-xs uppercase text-zinc-500 hover:text-zinc-300"
+    <TableHead
+      className="cursor-pointer select-none border-zinc-800 text-xs uppercase text-zinc-500 hover:text-zinc-300"
       onClick={() => onSort(column)}
     >
       <span className="inline-flex items-center gap-1">
@@ -97,7 +93,7 @@ function SortHeader({ column, children, sortColumn, sortDirection, onSort }: { c
           <span className="text-zinc-300">{sortDirection === 'asc' ? '↑' : '↓'}</span>
         )}
       </span>
-    </th>
+    </TableHead>
   );
 }
 
@@ -207,10 +203,10 @@ export default function UsageMetrics() {
     const loadData = async () => {
       setLoading(true);
       try {
-        const requests = await getRecentRequests(FETCH_LIMIT);
+        const limit = preset === 'last30' ? 5000 : preset === 'last7' ? 2000 : FETCH_LIMIT;
+        const requests = await getRecentRequests(limit);
         setAllRequests(requests);
       } catch {
-        // IPC may fail outside Tauri
       } finally {
         setLoading(false);
       }
@@ -218,7 +214,7 @@ export default function UsageMetrics() {
     loadData();
     const interval = setInterval(loadData, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [preset, customStart, customEnd]);
 
   const filteredRequests = useMemo(() => {
     const startTs = dateRange.start.getTime() / 1000;
@@ -311,7 +307,7 @@ export default function UsageMetrics() {
     }
 
     for (const r of filteredRequests) {
-      const day = new Date(r.ts * 1000).toISOString().slice(0, 10);
+      const day = formatDate(new Date(r.ts * 1000));
       if (!costByProvider[day]) continue;
       if (costByProvider[day][r.provider_id] !== undefined) {
         costByProvider[day][r.provider_id] += r.cost_usd;
@@ -544,51 +540,49 @@ export default function UsageMetrics() {
           <div className="px-6 py-12 text-center text-zinc-500">Loading request data...</div>
         ) : (
           <>
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm">
-                <thead>
-                  <tr className="border-b border-zinc-800">
-                    <SortHeader column="ts" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Timestamp</SortHeader>
-                    <SortHeader column="group_alias" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Group</SortHeader>
-                    <SortHeader column="provider_id" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Provider</SortHeader>
-                    <SortHeader column="model_id" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Model</SortHeader>
-                    <SortHeader column="prompt_tokens" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Prompt Tokens</SortHeader>
-                    <SortHeader column="output_tokens" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Output Tokens</SortHeader>
-                    <SortHeader column="cost_usd" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Cost</SortHeader>
-                    <SortHeader column="latency_ms" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Latency (ms)</SortHeader>
-                    <SortHeader column="status" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Status</SortHeader>
-                    <SortHeader column="error_type" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Error</SortHeader>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pagedRequests.length === 0 && (
-                    <tr>
-                      <td colSpan={10} className="px-4 py-8 text-center text-zinc-500">
-                        No requests match the selected filters and date range
-                      </td>
-                    </tr>
-                  )}
-                  {pagedRequests.map((req) => (
-                    <tr key={req.id} className="border-b border-zinc-800/50 transition-colors hover:bg-zinc-800/30">
-                      <td className="px-4 py-2.5 text-zinc-400">{formatTs(req.ts)}</td>
-                      <td className="px-4 py-2.5">{req.group_alias}</td>
-                      <td className="px-4 py-2.5 text-zinc-400">{req.provider_id}</td>
-                      <td className="px-4 py-2.5 text-zinc-400">{req.model_id}</td>
-                      <td className="px-4 py-2.5">{formatTokens(req.prompt_tokens)}</td>
-                      <td className="px-4 py-2.5">{formatTokens(req.output_tokens)}</td>
-                      <td className="px-4 py-2.5 text-zinc-300">${req.cost_usd.toFixed(4)}</td>
-                      <td className="px-4 py-2.5 text-zinc-400">{req.latency_ms}</td>
-                      <td className="px-4 py-2.5">
-                        <StatusBadge status={req.status} />
-                      </td>
-                      <td className="max-w-[200px] truncate px-4 py-2.5 text-xs text-zinc-500">
-                        {req.error_type ?? '—'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+            <Table className="text-left text-sm">
+              <TableHeader>
+                <TableRow className="border-b border-zinc-800 hover:bg-transparent">
+                  <SortHeader column="ts" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Timestamp</SortHeader>
+                  <SortHeader column="group_alias" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Group</SortHeader>
+                  <SortHeader column="provider_id" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Provider</SortHeader>
+                  <SortHeader column="model_id" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Model</SortHeader>
+                  <SortHeader column="prompt_tokens" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Prompt Tokens</SortHeader>
+                  <SortHeader column="output_tokens" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Output Tokens</SortHeader>
+                  <SortHeader column="cost_usd" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Cost</SortHeader>
+                  <SortHeader column="latency_ms" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Latency (ms)</SortHeader>
+                  <SortHeader column="status" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Status</SortHeader>
+                  <SortHeader column="error_type" sortColumn={sortColumn} sortDirection={sortDirection} onSort={handleSort}>Error</SortHeader>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {pagedRequests.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={10} className="px-4 py-8 text-center text-zinc-500">
+                      No requests match the selected filters and date range
+                    </TableCell>
+                  </TableRow>
+                )}
+                {pagedRequests.map((req) => (
+                  <TableRow key={req.id} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+                    <TableCell className="px-4 py-2.5 text-zinc-400">{formatTs(req.ts)}</TableCell>
+                    <TableCell className="px-4 py-2.5">{req.group_alias}</TableCell>
+                    <TableCell className="px-4 py-2.5 text-zinc-400">{req.provider_id}</TableCell>
+                    <TableCell className="px-4 py-2.5 text-zinc-400">{req.model_id}</TableCell>
+                    <TableCell className="px-4 py-2.5">{formatTokens(req.prompt_tokens)}</TableCell>
+                    <TableCell className="px-4 py-2.5">{formatTokens(req.output_tokens)}</TableCell>
+                    <TableCell className="px-4 py-2.5 text-zinc-300">${req.cost_usd.toFixed(4)}</TableCell>
+                    <TableCell className="px-4 py-2.5 text-zinc-400">{req.latency_ms}</TableCell>
+                    <TableCell className="px-4 py-2.5">
+                      <StatusBadge status={req.status} />
+                    </TableCell>
+                    <TableCell className="max-w-[200px] truncate px-4 py-2.5 text-xs text-zinc-500">
+                      {req.error_type ?? '—'}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
 
             {/* Pagination */}
             <div className="flex items-center justify-between border-t border-zinc-800 px-6 py-3">
@@ -644,5 +638,3 @@ function EmptyChart() {
     </div>
   );
 }
-
-import { StatusBadge } from '@/components/StatusBadge';

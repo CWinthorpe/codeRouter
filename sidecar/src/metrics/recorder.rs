@@ -20,13 +20,15 @@ pub struct RequestEvent {
 
 impl RequestEvent {
     pub fn calculate_cost(&self) -> f64 {
-        match (self.input_cost_per_1m, self.output_cost_per_1m) {
-            (Some(input_cost), Some(output_cost)) => {
-                (self.prompt_tokens as f64 / 1_000_000.0) * input_cost
-                    + (self.output_tokens as f64 / 1_000_000.0) * output_cost
-            }
-            _ => 0.0,
-        }
+        let input_cost = match self.input_cost_per_1m {
+            Some(cost) => (self.prompt_tokens as f64 / 1_000_000.0) * cost,
+            None => 0.0,
+        };
+        let output_cost = match self.output_cost_per_1m {
+            Some(cost) => (self.output_tokens as f64 / 1_000_000.0) * cost,
+            None => 0.0,
+        };
+        input_cost + output_cost
     }
 }
 
@@ -37,7 +39,7 @@ pub struct MetricsRecorder {
 
 impl MetricsRecorder {
     pub fn new(conn: Connection) -> (Self, tokio::task::JoinHandle<()>) {
-        let (tx, mut rx) = mpsc::channel::<RequestEvent>(256);
+        let (tx, mut rx) = mpsc::channel::<RequestEvent>(1024);
 
         let handle = tokio::spawn(async move {
             let mut conn = conn;
@@ -60,7 +62,10 @@ impl MetricsRecorder {
     pub fn record_request_sync(&self, event: RequestEvent) -> Result<()> {
         self.sender
             .try_send(event)
-            .map_err(|e| anyhow::anyhow!("Failed to send event to metrics recorder: {}", e))?;
+            .map_err(|e| {
+                eprintln!("[metrics] dropped event: channel full");
+                anyhow::anyhow!("Failed to send event to metrics recorder: {}", e)
+            })?;
         Ok(())
     }
 }
@@ -150,7 +155,7 @@ mod tests {
             output_cost_per_1m: None,
         };
         let cost = event.calculate_cost();
-        assert_eq!(cost, 0.0);
+        assert!((cost - 3.0).abs() < 0.001);
     }
 
     #[test]

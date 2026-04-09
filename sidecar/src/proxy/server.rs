@@ -8,6 +8,7 @@ use axum::{
     extract::State,
     http::{header::CONTENT_TYPE, StatusCode},
     response::IntoResponse,
+    response::sse::{Event, KeepAlive, Sse},
     routing::{get, post},
     Json, Router,
 };
@@ -18,11 +19,12 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 
 use crate::config::{
     models::{AppConfig, Group, Provider},
@@ -49,6 +51,7 @@ pub struct AppState {
     pub client: Client,
     pub router_state: SharedRouterState,
     pub metrics_recorder: Arc<MetricsRecorder>,
+    pub metrics_broadcast: broadcast::Sender<String>,
 }
 
 static START_TIME: AtomicI64 = AtomicI64::new(0);
@@ -70,11 +73,13 @@ pub async fn start_server() -> anyhow::Result<()> {
 
     let router_state = router::init_and_set_global_router_state(&groups, &providers);
 
-    router::init_daily_totals_from_db(&router_state, &providers);
-
     let conn = metrics_db::init_db().expect("Failed to initialize metrics database");
-    let (metrics_recorder, _metrics_handle) = MetricsRecorder::new(conn);
+    router::init_daily_totals_from_db(&router_state, &providers, &conn);
+    let (metrics_recorder, metrics_handle) = MetricsRecorder::new(conn);
     let metrics_recorder = Arc::new(metrics_recorder);
+    let metrics_handle = Arc::new(tokio::sync::Mutex::new(Some(metrics_handle)));
+
+    let (metrics_broadcast_tx, _) = broadcast::channel::<String>(256);
 
     let state = AppState {
         config: Arc::new(RwLock::new(Arc::new(config))),
@@ -83,18 +88,16 @@ pub async fn start_server() -> anyhow::Result<()> {
         client,
         router_state,
         metrics_recorder: metrics_recorder.clone(),
+        metrics_broadcast: metrics_broadcast_tx,
     };
 
     let scheduler_groups = state.groups.clone();
     let scheduler_client = state.client.clone();
     let scheduler_state = state.router_state.clone();
-    let (_scheduler_handle, scheduler_shutdown) = spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
+    let (scheduler_handle, scheduler_shutdown) = spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
+    let scheduler_handle = Arc::new(tokio::sync::Mutex::new(Some(scheduler_handle)));
 
     let refresh_client = state.client.clone();
-    let refresh_interval = {
-        let config = state.config.read().unwrap();
-        config.refresh_interval_hours.max(1)
-    };
     let (refresh_shutdown, mut refresh_shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
         loop {
@@ -105,8 +108,14 @@ pub async fn start_server() -> anyhow::Result<()> {
                 }
                 _ = refresh_all_providers(&refresh_client) => {}
             }
+            let interval_hours = {
+                match load_app_config() {
+                    Ok(c) => c.refresh_interval_hours.max(1),
+                    Err(_) => 24,
+                }
+            };
             tokio::time::sleep(std::time::Duration::from_secs(
-                (refresh_interval as u64).saturating_mul(3600),
+                (interval_hours as u64).saturating_mul(3600),
             ))
             .await;
         }
@@ -130,6 +139,7 @@ pub async fn start_server() -> anyhow::Result<()> {
         .route("/internal/router/status", get(handle_internal_router_status))
         .route("/internal/router/entry", post(handle_internal_router_set_entry))
         .route("/internal/config/reload", post(handle_internal_config_reload))
+        .route("/internal/metrics/stream", get(handle_metrics_stream))
         .with_state(state.clone());
 
     let listener = TcpListener::bind(&addr).await?;
@@ -139,6 +149,9 @@ pub async fn start_server() -> anyhow::Result<()> {
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
 
+    let shutdown_recorder = metrics_recorder.clone();
+    let shutdown_metrics_handle = metrics_handle.clone();
+    let shutdown_scheduler_handle = scheduler_handle.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -150,11 +163,19 @@ pub async fn start_server() -> anyhow::Result<()> {
         }
         let _ = scheduler_shutdown.send(());
         let _ = refresh_shutdown.send(());
-        drop(state.metrics_recorder.clone());
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        drop(shutdown_recorder);
     });
 
     server.await?;
+
+    drop(state);
+    drop(metrics_recorder);
+    if let Some(h) = shutdown_scheduler_handle.lock().await.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+    }
+    if let Some(h) = shutdown_metrics_handle.lock().await.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), h).await;
+    }
 
     Ok(())
 }
@@ -321,8 +342,8 @@ async fn route_request(
 
     for _attempt in 0..max_retries {
         let (entry, entry_index) = {
-            let router_state = state.router_state.lock().unwrap();
-            match router::select_entry(&group, &router_state, &providers, &skip_indices) {
+            let mut router_state = state.router_state.lock().unwrap();
+            match router::select_entry(&group, &mut router_state, &providers, &skip_indices) {
                 Some(result) => result,
                 None => break,
             }
@@ -336,7 +357,7 @@ async fn route_request(
 
         let api_key = get_credential(&provider.credential_key).await.map_err(|e| {
             eprintln!("failed to get credential for '{}': {e}", provider.credential_key);
-            AppError::InternalError(e.to_string())
+            AppError::InternalError("upstream provider configuration error".to_string())
         })?;
 
         let is_anthropic = provider.protocol == "anthropic";
@@ -354,6 +375,11 @@ async fn route_request(
         } else {
             format!("{}/v1/chat/completions", provider.base_url.trim_end_matches('/'))
         };
+
+        if endpoint == "completions" && is_anthropic {
+            skip_indices.insert(entry_index);
+            continue;
+        }
 
         let timeout_ms = group.failover_config.latency_timeout_ms;
         let req = if endpoint == "completions" {
@@ -386,6 +412,7 @@ async fn route_request(
                 let group_alias_str = group.alias.clone();
                 let router_state = state.router_state.clone();
                 let metrics_recorder = state.metrics_recorder.clone();
+                let metrics_broadcast = state.metrics_broadcast.clone();
                 let entry_index_clone = entry_index;
                 let effective_quota = entry.daily_token_quota_override.or_else(|| {
                     providers
@@ -393,34 +420,76 @@ async fn route_request(
                         .find(|p| p.id == entry.provider_id)
                         .and_then(|p| p.daily_token_quota)
                 });
+                let effective_request_quota = providers
+                    .iter()
+                    .find(|p| p.id == entry.provider_id)
+                    .and_then(|p| p.daily_request_quota);
                 let on_quota_exhausted = group.failover_config.on_quota_exhausted;
-                let latency_ms = start.elapsed().as_millis() as i64;
+                let latency_start = start;
 
-                let body_with_metrics = MetricsRecordingStream::new(raw_stream, move |_, _| {
+                let consecutive_error_threshold = group.failover_config.consecutive_error_threshold;
+                let on_consecutive_errors = group.failover_config.on_consecutive_errors;
+                let consecutive_error_cooldown_ms = group.failover_config.consecutive_error_cooldown_ms;
+
+                let body_with_metrics = MetricsRecordingStream::new(raw_stream, move |success: bool| {
+                    let latency_ms = latency_start.elapsed().as_millis() as i64;
                     let counts = token_counts.lock().unwrap();
                     let prompt_tokens = counts.input_tokens;
                     let output_tokens = counts.output_tokens;
                     let tokens_used = prompt_tokens + output_tokens;
                     drop(counts);
 
-                    let event = RequestEvent {
-                        ts: chrono::Utc::now().timestamp(),
-                        group_alias: group_alias_str.clone(),
-                        provider_id: provider_id.clone(),
-                        model_id: model_id.clone(),
-                        prompt_tokens: prompt_tokens as i64,
-                        output_tokens: output_tokens as i64,
-                        latency_ms,
-                        status: "success".to_string(),
-                        error_type: None,
-                        input_cost_per_1m: None,
-                        output_cost_per_1m: None,
-                    };
-                    let _ = metrics_recorder.record_request_sync(event);
+                    if success {
+                        let event = RequestEvent {
+                            ts: chrono::Utc::now().timestamp(),
+                            group_alias: group_alias_str.clone(),
+                            provider_id: provider_id.clone(),
+                            model_id: model_id.clone(),
+                            prompt_tokens: prompt_tokens as i64,
+                            output_tokens: output_tokens as i64,
+                            latency_ms,
+                            status: "success".to_string(),
+                            error_type: None,
+                            input_cost_per_1m: None,
+                            output_cost_per_1m: None,
+                        };
+                        let _ = metrics_recorder.record_request_sync(event.clone());
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            let _ = metrics_broadcast.send(json);
+                        }
 
-                    if tokens_used > 0 {
+                        if tokens_used > 0 {
+                            let mut rs = router_state.lock().unwrap();
+                            router::record_success(&mut rs, &provider_id, entry_index_clone, tokens_used, effective_quota, effective_request_quota, on_quota_exhausted);
+                        }
+                    } else {
+                        let event = RequestEvent {
+                            ts: chrono::Utc::now().timestamp(),
+                            group_alias: group_alias_str.clone(),
+                            provider_id: provider_id.clone(),
+                            model_id: model_id.clone(),
+                            prompt_tokens: prompt_tokens as i64,
+                            output_tokens: output_tokens as i64,
+                            latency_ms,
+                            status: "error".to_string(),
+                            error_type: Some("stream_error".to_string()),
+                            input_cost_per_1m: None,
+                            output_cost_per_1m: None,
+                        };
+                        let _ = metrics_recorder.record_request_sync(event.clone());
+                        if let Ok(json) = serde_json::to_string(&event) {
+                            let _ = metrics_broadcast.send(json);
+                        }
+
                         let mut rs = router_state.lock().unwrap();
-                        router::record_success(&mut rs, &provider_id, entry_index_clone, tokens_used, effective_quota, on_quota_exhausted);
+                        router::record_consecutive_error(
+                            &mut rs,
+                            &provider_id,
+                            entry_index_clone,
+                            consecutive_error_threshold,
+                            on_consecutive_errors,
+                            consecutive_error_cooldown_ms,
+                        );
                     }
                 });
 
@@ -443,12 +512,17 @@ async fn route_request(
                             .find(|p| p.id == entry.provider_id)
                             .and_then(|p| p.daily_token_quota)
                     });
-                    router::record_success(&mut rs, &provider.id, entry_index, tokens_used, effective_quota, group.failover_config.on_quota_exhausted);
+                    let effective_request_quota = providers
+                        .iter()
+                        .find(|p| p.id == entry.provider_id)
+                        .and_then(|p| p.daily_request_quota);
+                    router::record_success(&mut rs, &provider.id, entry_index, tokens_used, effective_quota, effective_request_quota, group.failover_config.on_quota_exhausted);
                 }
                 let model_id = entry.model_id.clone();
                 let provider_id = provider.id.clone();
                 let group_alias = group.alias.clone();
                 let metrics_recorder = state.metrics_recorder.clone();
+                let metrics_broadcast = state.metrics_broadcast.clone();
                 tokio::spawn(async move {
                     let event = RequestEvent {
                         ts: chrono::Utc::now().timestamp(),
@@ -463,7 +537,10 @@ async fn route_request(
                         input_cost_per_1m: None,
                         output_cost_per_1m: None,
                     };
-                    let _ = metrics_recorder.record_request(event).await;
+                    let _ = metrics_recorder.record_request(event.clone()).await;
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        let _ = metrics_broadcast.send(json);
+                    }
                 });
                 return Ok(resp);
             }
@@ -591,7 +668,13 @@ async fn process_response(
                 return Ok(StreamProcessResult::Streaming(stream, token_counts));
             }
         } else {
-            let bytes = resp.bytes().await.map_err(|e| {
+            let bytes = tokio::time::timeout(
+                std::time::Duration::from_secs(120),
+                resp.bytes()
+            )
+            .await
+            .map_err(|_| RequestError::Network("response body read timed out".into()))?
+            .map_err(|e| {
                 eprintln!("failed to read response body: {e}");
                 RequestError::Network(e.to_string())
             })?;
@@ -600,7 +683,7 @@ async fn process_response(
                 let anthropic_resp: translator::MessagesResponse =
                     serde_json::from_slice(&bytes).map_err(|e| {
                         eprintln!("failed to parse anthropic response: {e}");
-                        RequestError::Network(e.to_string())
+                        RequestError::ServerError(format!("invalid upstream JSON: {e}"))
                     })?;
                 let (prompt_tokens, output_tokens) = extract_anthropic_tokens(&anthropic_resp);
                 let openai_resp = translator::anthropic_to_openai(&anthropic_resp, group_alias);
@@ -620,7 +703,13 @@ async fn process_response(
             }
         }
     } else {
-        let bytes = resp.bytes().await.map_err(|e| {
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            resp.bytes()
+        )
+        .await
+        .map_err(|_| RequestError::Network("response body read timed out".into()))?
+        .map_err(|e| {
             eprintln!("failed to read response body: {e}");
             RequestError::Network(e.to_string())
         })?;
@@ -629,7 +718,7 @@ async fn process_response(
             let anthropic_resp: translator::MessagesResponse =
                 serde_json::from_slice(&bytes).map_err(|e| {
                     eprintln!("failed to parse anthropic response: {e}");
-                    RequestError::Network(e.to_string())
+                    RequestError::ServerError(format!("invalid upstream JSON: {e}"))
                 })?;
             let (prompt_tokens, output_tokens) = extract_anthropic_tokens(&anthropic_resp);
             let openai_resp = translator::anthropic_to_openai(&anthropic_resp, group_alias);
@@ -674,7 +763,7 @@ fn extract_anthropic_tokens(resp: &translator::MessagesResponse) -> (u64, u64) {
 struct TimeoutStream<S> {
     inner: S,
     timeout: std::time::Duration,
-    last_chunk: Instant,
+    last_activity: Instant,
 }
 
 impl<S> TimeoutStream<S> {
@@ -682,7 +771,7 @@ impl<S> TimeoutStream<S> {
         Self {
             inner,
             timeout: std::time::Duration::from_millis(timeout_ms),
-            last_chunk: Instant::now(),
+            last_activity: Instant::now(),
         }
     }
 }
@@ -694,31 +783,36 @@ where
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if self.last_chunk.elapsed() > self.timeout {
-            return Poll::Ready(Some(Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "streaming response timed out",
-            ))));
-        }
         match Pin::new(&mut self.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                self.last_chunk = Instant::now();
-                Poll::Ready(Some(Ok(bytes)))
+            Poll::Ready(Some(Ok(item))) => {
+                self.last_activity = Instant::now();
+                Poll::Ready(Some(Ok(item)))
             }
-            other => other,
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if self.last_activity.elapsed() > self.timeout {
+                    Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "streaming response timed out (inter-chunk gap exceeded)",
+                    ))))
+                } else {
+                    Poll::Pending
+                }
+            }
         }
     }
 }
 
 struct MetricsRecordingStream<S> {
     inner: S,
-    on_complete: Option<Box<dyn FnOnce(u64, u64) + Send + 'static>>,
+    on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
 }
 
 impl<S> MetricsRecordingStream<S> {
     fn new<F>(inner: S, on_complete: F) -> Self
     where
-        F: FnOnce(u64, u64) + Send + 'static,
+        F: FnOnce(bool) + Send + 'static,
     {
         Self {
             inner,
@@ -738,19 +832,45 @@ where
             Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
             Poll::Ready(Some(Err(e))) => {
                 if let Some(cb) = self.on_complete.take() {
-                    cb(0, 0);
+                    cb(false);
                 }
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {
                 if let Some(cb) = self.on_complete.take() {
-                    cb(0, 0);
+                    cb(true);
                 }
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
         }
     }
+}
+
+async fn handle_metrics_stream(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let mut rx = state.metrics_broadcast.subscribe();
+    let stream = async_stream::stream! {
+        loop {
+            match rx.recv().await {
+                Ok(json) => {
+                    yield Ok(Event::default().data(json));
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    break;
+                }
+            }
+        }
+    };
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(std::time::Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }
 
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
@@ -927,11 +1047,11 @@ async fn handle_internal_config_reload(
         }
     };
 
-    let old_counters = {
+    let old_state = {
         let guard = state.router_state.lock().unwrap();
-        let mut map: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut map: HashMap<String, router::EntryState> = HashMap::new();
         for (key, entry) in guard.entries.iter() {
-            map.insert(key.clone(), (entry.daily_tokens_used, entry.daily_requests_used));
+            map.insert(key.clone(), entry.clone());
         }
         map
     };
@@ -948,25 +1068,137 @@ async fn handle_internal_config_reload(
             new_guard.entries.clone()
         };
         let mut guard = state.router_state.lock().unwrap();
-        for (key, new_entry) in new_entries {
-            if let Some(existing) = guard.entries.get_mut(&key) {
-                if let Some((tokens, requests)) = old_counters.get(&key) {
-                    existing.daily_tokens_used = *tokens;
-                    existing.daily_requests_used = *requests;
-                }
+        for (key, new_entry) in &new_entries {
+            if let Some(existing) = old_state.get(key) {
+                let entry = guard.entries.entry(key.clone()).or_insert_with(|| new_entry.clone());
+                entry.status = existing.status.clone();
+                entry.consecutive_errors = existing.consecutive_errors;
+                entry.cooldown_until = existing.cooldown_until;
+                entry.cooldown_duration_seconds = existing.cooldown_duration_seconds;
+                entry.daily_tokens_used = existing.daily_tokens_used;
+                entry.daily_requests_used = existing.daily_requests_used;
+                entry.daily_reset_at = existing.daily_reset_at;
             } else {
-                let mut entry = new_entry;
-                if let Some((tokens, requests)) = old_counters.get(&key) {
-                    entry.daily_tokens_used = *tokens;
-                    entry.daily_requests_used = *requests;
-                }
-                guard.entries.insert(key, entry);
+                guard.entries.insert(key.clone(), new_entry.clone());
             }
         }
+        let new_keys: HashSet<String> = new_entries.keys().cloned().collect();
+        guard.entries.retain(|key, _| new_keys.contains(key));
     }
 
-    router::init_daily_totals_from_db(&state.router_state, &new_providers);
+    // Daily totals will be re-synced by the scheduler on the next quota check cycle.
 
     eprintln!("[config-reload] config reloaded successfully");
     Ok(Json(serde_json::json!({ "status": "ok" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use futures::stream::StreamExt;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn test_timeout_stream_passes_chunks_without_delay() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("chunk1")),
+            Ok(Bytes::from("chunk2")),
+            Ok(Bytes::from("chunk3")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let mut timeout_stream = TimeoutStream::new(stream, 5000);
+
+        let mut results = Vec::new();
+        while let Some(item) = timeout_stream.next().await {
+            results.push(item);
+        }
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn test_timeout_stream_propagates_end() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![];
+        let stream = futures::stream::iter(chunks);
+        let mut timeout_stream = TimeoutStream::new(stream, 5000);
+
+        let result = timeout_stream.next().await;
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_timeout_stream_propagates_error() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("chunk1")),
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "test error")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let mut timeout_stream = TimeoutStream::new(stream, 5000);
+
+        let r1 = timeout_stream.next().await.unwrap().unwrap();
+        assert_eq!(r1, Bytes::from("chunk1"));
+
+        let r2 = timeout_stream.next().await.unwrap();
+        assert!(r2.is_err());
+        assert_eq!(r2.unwrap_err().kind(), std::io::ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn test_metrics_recording_stream_success_callback() {
+        let called = Arc::new(Mutex::new(None));
+        let called_clone = called.clone();
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("chunk1")),
+            Ok(Bytes::from("chunk2")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let mut metrics_stream = MetricsRecordingStream::new(stream, move |success: bool| {
+            *called_clone.lock().unwrap() = Some(success);
+        });
+
+        while let Some(_) = metrics_stream.next().await {}
+
+        assert_eq!(*called.lock().unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_recording_stream_error_callback() {
+        let called = Arc::new(Mutex::new(None));
+        let called_clone = called.clone();
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("chunk1")),
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "stream error")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let mut metrics_stream = MetricsRecordingStream::new(stream, move |success: bool| {
+            *called_clone.lock().unwrap() = Some(success);
+        });
+
+        while let Some(item) = metrics_stream.next().await {
+            if item.is_err() {
+                break;
+            }
+        }
+
+        assert_eq!(*called.lock().unwrap(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_metrics_recording_stream_empty_success() {
+        let called = Arc::new(Mutex::new(None));
+        let called_clone = called.clone();
+
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![];
+        let stream = futures::stream::iter(chunks);
+        let mut metrics_stream = MetricsRecordingStream::new(stream, move |success: bool| {
+            *called_clone.lock().unwrap() = Some(success);
+        });
+
+        while let Some(_) = metrics_stream.next().await {}
+
+        assert_eq!(*called.lock().unwrap(), Some(true));
+    }
 }

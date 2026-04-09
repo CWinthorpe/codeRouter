@@ -19,9 +19,6 @@ fn ensure_first_run() -> anyhow::Result<()> {
         fs::create_dir_all(&data_dir)?;
     }
 
-    // Initialize SQLite DB (runs migrations)
-    coderouter_proxy::metrics::db::init_db()?;
-
     // Create default config.json if not present
     let config_path = config_dir.join("config.json");
     if !config_path.exists() {

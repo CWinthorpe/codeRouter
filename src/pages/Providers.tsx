@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   Plus,
   Edit2,
@@ -6,16 +6,19 @@ import {
   Zap,
   RefreshCw,
   ChevronDown,
+  ChevronUp,
   ChevronRight,
   Loader2,
   AlertTriangle,
   CheckCircle2,
+  XCircle,
 } from 'lucide-react';
 import { useStore } from '../store';
 import { ActionButton } from '../components/ActionButton';
 import { Toast } from '../components/Toast';
 import {
   saveProvider,
+  saveGroup,
   toggleProviderEnabled,
   deleteProvider,
   testProviderConnection,
@@ -23,11 +26,13 @@ import {
   getGroups,
   getProviders,
 } from '../lib/ipc';
-import type { Provider, ProviderModel } from '../types';
+import type { Provider, ProviderModel, Group, GroupEntry } from '../types';
 import type { TestConnectionResult } from '../lib/ipc';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 
 function generateId(name: string): string {
   return name
@@ -221,6 +226,7 @@ export default function Providers() {
 
       {showAddModal && (
         <ProviderModal
+          key={editingProvider ? editingProvider.id : 'new'}
           provider={editingProvider}
           onSave={handleSave}
           onClose={() => {
@@ -304,6 +310,11 @@ function ProviderCard({
                 <RefreshCw className="h-4 w-4 text-zinc-500" />
                 {lastRefresh ? formatTimestamp(lastRefresh) : 'Never refreshed'}
               </span>
+              {provider.modelOverrides && provider.modelOverrides.length > 0 && (
+                <Badge variant="outline" className="text-xs">
+                  Custom models ({provider.modelOverrides.length})
+                </Badge>
+              )}
             </div>
           </div>
 
@@ -311,6 +322,7 @@ function ProviderCard({
             <label className="relative inline-flex cursor-pointer items-center">
               <input
                 type="checkbox"
+                aria-label={`Toggle ${provider.name}`}
                 checked={provider.enabled}
                 onChange={onToggleEnabled}
                 className="peer sr-only"
@@ -346,13 +358,69 @@ function ProviderCard({
           </Button>
         </div>
 
-        {isExpanded && <ModelBrowser models={provider.models} providerName={provider.name} />}
+        {isExpanded && <ModelBrowser models={provider.models} providerName={provider.name} providerId={provider.id} />}
       </CardContent>
     </Card>
   );
 }
 
-function ModelBrowser({ models, providerName }: { models: ProviderModel[]; providerName: string }) {
+function ModelBrowser({ models, providerName, providerId }: { models: ProviderModel[]; providerName: string; providerId: string }) {
+  const [addingModelId, setAddingModelId] = useState<string | null>(null);
+  const [groups, setGroups] = useState<Group[]>([]);
+  const [loadingGroups, setLoadingGroups] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const dropdownRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!addingModelId) return;
+    const handler = (e: MouseEvent) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
+        setAddingModelId(null);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [addingModelId]);
+
+  const handleAddToGroup = async (modelId: string) => {
+    if (addingModelId === modelId) {
+      setAddingModelId(null);
+      return;
+    }
+    setLoadingGroups(true);
+    try {
+      const g = await getGroups();
+      setGroups(g);
+      setAddingModelId(modelId);
+    } catch {
+      setAddingModelId(null);
+    } finally {
+      setLoadingGroups(false);
+    }
+  };
+
+  const handleSelectGroup = async (group: Group, modelId: string) => {
+    setSaving(true);
+    try {
+      const newEntry: GroupEntry = {
+        providerId,
+        modelId,
+        priority: group.entries.length + 1,
+        enabled: true,
+        status: 'active',
+      };
+      const updatedGroup: Group = {
+        ...group,
+        entries: [...group.entries, newEntry],
+      };
+      await saveGroup(updatedGroup);
+      setAddingModelId(null);
+    } catch {
+    } finally {
+      setSaving(false);
+    }
+  };
+
   if (models.length === 0) {
     return (
       <div className="border-t border-zinc-800 px-5 py-6 text-center text-sm text-zinc-500">
@@ -363,42 +431,62 @@ function ModelBrowser({ models, providerName }: { models: ProviderModel[]; provi
 
   return (
     <div className="border-t border-zinc-800">
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-zinc-800 text-left text-xs uppercase tracking-wider text-zinc-500">
-              <th className="px-5 py-3 font-medium">Model ID</th>
-              <th className="px-5 py-3 font-medium">Context Window</th>
-              <th className="px-5 py-3 font-medium">Max Output Tokens</th>
-              <th className="px-5 py-3 font-medium">Input Cost/1M</th>
-              <th className="px-5 py-3 font-medium">Output Cost/1M</th>
-              <th className="px-5 py-3 font-medium">Last Refreshed</th>
-              <th className="px-5 py-3 font-medium" />
-            </tr>
-          </thead>
-          <tbody>
-            {models.map((model) => (
-              <tr key={model.id} className="border-b border-zinc-800/50 transition-colors hover:bg-zinc-800/30">
-                <td className="px-5 py-3 font-mono text-xs">{model.id}</td>
-                <td className="px-5 py-3 text-zinc-300">{formatNumber(model.context_window)}</td>
-                <td className="px-5 py-3 text-zinc-300">{formatNumber(model.max_output_tokens)}</td>
-                <td className="px-5 py-3 text-zinc-300">{formatCost(model.input_cost_per_1m)}</td>
-                <td className="px-5 py-3 text-zinc-300">{formatCost(model.output_cost_per_1m)}</td>
-                <td className="px-5 py-3 text-zinc-400">{formatTimestamp(model.last_refreshed)}</td>
-                <td className="px-5 py-3">
+      <Table className="text-sm">
+        <TableHeader>
+          <TableRow className="border-b border-zinc-800 hover:bg-transparent">
+            <TableHead className="px-5 py-3 font-medium text-xs uppercase tracking-wider text-zinc-500">Model ID</TableHead>
+            <TableHead className="px-5 py-3 font-medium text-xs uppercase tracking-wider text-zinc-500">Context Window</TableHead>
+            <TableHead className="px-5 py-3 font-medium text-xs uppercase tracking-wider text-zinc-500">Max Output Tokens</TableHead>
+            <TableHead className="px-5 py-3 font-medium text-xs uppercase tracking-wider text-zinc-500">Input Cost/1M</TableHead>
+            <TableHead className="px-5 py-3 font-medium text-xs uppercase tracking-wider text-zinc-500">Output Cost/1M</TableHead>
+            <TableHead className="px-5 py-3 font-medium text-xs uppercase tracking-wider text-zinc-500">Last Refreshed</TableHead>
+            <TableHead className="px-5 py-3 font-medium text-xs uppercase tracking-wider text-zinc-500" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {models.map((model) => (
+            <TableRow key={model.id} className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
+              <TableCell className="px-5 py-3 font-mono text-xs text-zinc-100">{model.id}</TableCell>
+              <TableCell className="px-5 py-3 text-zinc-300">{formatNumber(model.context_window)}</TableCell>
+              <TableCell className="px-5 py-3 text-zinc-300">{formatNumber(model.max_output_tokens)}</TableCell>
+              <TableCell className="px-5 py-3 text-zinc-300">{formatCost(model.input_cost_per_1m)}</TableCell>
+              <TableCell className="px-5 py-3 text-zinc-300">{formatCost(model.output_cost_per_1m)}</TableCell>
+              <TableCell className="px-5 py-3 text-zinc-400">{formatTimestamp(model.last_refreshed)}</TableCell>
+              <TableCell className="px-5 py-3">
+                <div className="relative" ref={addingModelId === model.id ? dropdownRef : undefined}>
                   <button
-                    disabled
-                    title="Coming soon: add this model to a group"
-                    className="rounded-md bg-zinc-800 px-3 py-1.5 text-xs font-medium text-zinc-500 transition-colors cursor-not-allowed"
+                    onClick={() => handleAddToGroup(model.id)}
+                    disabled={saving || loadingGroups}
+                    className="rounded-md bg-zinc-800 px-3 py-1.5 text-xs font-medium text-zinc-300 transition-colors hover:bg-zinc-700 disabled:opacity-50"
                   >
-                    Add to group
+                    {loadingGroups && addingModelId === model.id ? 'Loading…' : saving && addingModelId === model.id ? 'Saving…' : 'Add to group'}
                   </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+                  {addingModelId === model.id && groups.length > 0 && (
+                    <div className="absolute right-0 top-full z-50 mt-1 w-48 rounded-md border border-zinc-700 bg-zinc-800 shadow-xl">
+                      {groups.map((g) => (
+                        <button
+                          key={g.id}
+                          type="button"
+                          className="w-full px-3 py-2 text-left text-sm text-zinc-200 hover:bg-zinc-700"
+                          onClick={() => handleSelectGroup(g, model.id)}
+                          disabled={saving}
+                        >
+                          {g.displayName || g.alias}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                  {addingModelId === model.id && groups.length === 0 && (
+                    <div className="absolute right-0 top-full z-50 mt-1 w-48 rounded-md border border-zinc-700 bg-zinc-800 p-3 text-xs text-zinc-500 shadow-xl">
+                      No groups available
+                    </div>
+                  )}
+                </div>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     </div>
   );
 }
@@ -421,12 +509,37 @@ function ProviderModal({
   const [dailyTokenQuota, setDailyTokenQuota] = useState(
     provider?.dailyTokenQuota != null ? String(provider.dailyTokenQuota) : '',
   );
+  const [dailyRequestQuota, setDailyRequestQuota] = useState(
+    provider?.dailyRequestQuota != null ? String(provider.dailyRequestQuota) : '',
+  );
   const [quotaResetUtcHour, setQuotaResetUtcHour] = useState(
     provider?.quotaResetUtcHour != null ? String(provider.quotaResetUtcHour) : '0',
   );
   const [enabled, setEnabled] = useState(provider?.enabled ?? true);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [modelOverrides, setModelOverrides] = useState<ProviderModel[]>(provider?.modelOverrides ?? []);
+  const [showOverrides, setShowOverrides] = useState(false);
+  const [overrideModelId, setOverrideModelId] = useState('');
+  const [overrideContextWindow, setOverrideContextWindow] = useState('');
+  const [overrideMaxOutputTokens, setOverrideMaxOutputTokens] = useState('');
+  const [overrideInputCost, setOverrideInputCost] = useState('');
+  const [overrideOutputCost, setOverrideOutputCost] = useState('');
+
+  const handleAddOverride = () => {
+    if (!overrideModelId.trim()) return;
+    const entry: ProviderModel = { id: overrideModelId.trim() };
+    if (overrideContextWindow) entry.context_window = Number(overrideContextWindow);
+    if (overrideMaxOutputTokens) entry.max_output_tokens = Number(overrideMaxOutputTokens);
+    if (overrideInputCost) entry.input_cost_per_1m = Number(overrideInputCost);
+    if (overrideOutputCost) entry.output_cost_per_1m = Number(overrideOutputCost);
+    setModelOverrides((prev) => [...prev, entry]);
+    setOverrideModelId('');
+    setOverrideContextWindow('');
+    setOverrideMaxOutputTokens('');
+    setOverrideInputCost('');
+    setOverrideOutputCost('');
+  };
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -457,6 +570,13 @@ function ProviderModal({
         return;
       }
     }
+    if (dailyRequestQuota) {
+      const quota = Number(dailyRequestQuota);
+      if (isNaN(quota) || quota < 0) {
+        setError('Daily request quota must be a non-negative number.');
+        return;
+      }
+    }
     const hour = Number(quotaResetUtcHour);
     if (isNaN(hour) || hour < 0 || hour > 23) {
       setError('Quota reset UTC hour must be between 0 and 23.');
@@ -472,9 +592,11 @@ function ProviderModal({
         baseUrl: baseUrl.trim(),
         credentialKey: provider?.credentialKey ?? generateId(name),
         dailyTokenQuota: dailyTokenQuota ? Number(dailyTokenQuota) : undefined,
+        dailyRequestQuota: dailyRequestQuota ? Number(dailyRequestQuota) : undefined,
         quotaResetUtcHour: hour,
         enabled,
         models: provider?.models ?? [],
+        modelOverrides: modelOverrides.length > 0 ? modelOverrides : undefined,
       };
       await onSave(providerObj, apiKey);
     } catch (e: unknown) {
@@ -485,12 +607,11 @@ function ProviderModal({
   };
 
   return (
-    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/60" onClick={onClose}>
-      <div
-        className="w-full max-w-lg rounded-lg border border-zinc-800 bg-zinc-900 p-6 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 className="mb-5 text-lg font-semibold">{isEditing ? 'Edit Provider' : 'Add Provider'}</h2>
+    <Dialog open onOpenChange={() => onClose()}>
+      <DialogContent className="max-w-lg bg-zinc-900 border-zinc-800 text-zinc-100">
+        <DialogHeader>
+          <DialogTitle>{isEditing ? 'Edit Provider' : 'Add Provider'}</DialogTitle>
+        </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
           <div>
@@ -539,7 +660,7 @@ function ProviderModal({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 pr-16 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                placeholder={isEditing ? '••••••••' : 'sk-...'}
+                placeholder={isEditing ? 'Leave empty to keep existing key' : 'Enter API key'}
               />
               <button
                 type="button"
@@ -560,7 +681,7 @@ function ProviderModal({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-3 gap-4">
             <div>
               <label className="mb-1 block text-sm font-medium text-zinc-300">
                 Daily Token Quota <span className="text-zinc-500">(optional)</span>
@@ -569,6 +690,19 @@ function ProviderModal({
                 type="number"
                 value={dailyTokenQuota}
                 onChange={(e) => setDailyTokenQuota(e.target.value)}
+                className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                placeholder="Unlimited"
+                min="0"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-sm font-medium text-zinc-300">
+                Daily Request Quota <span className="text-zinc-500">(optional)</span>
+              </label>
+              <input
+                type="number"
+                value={dailyRequestQuota}
+                onChange={(e) => setDailyRequestQuota(e.target.value)}
                 className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                 placeholder="Unlimited"
                 min="0"
@@ -602,6 +736,87 @@ function ProviderModal({
             <span className="text-sm text-zinc-300">Enabled</span>
           </div>
 
+          <div className="rounded-md border border-zinc-800">
+            <button
+              type="button"
+              onClick={() => setShowOverrides(!showOverrides)}
+              className="flex w-full items-center justify-between px-4 py-3 text-sm font-medium text-zinc-300"
+            >
+              <span>Model Overrides ({modelOverrides.length})</span>
+              {showOverrides ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+            </button>
+            {showOverrides && (
+              <div className="border-t border-zinc-800 px-4 py-4">
+                <p className="mb-3 text-xs text-zinc-500">
+                  Override auto-discovered models with a custom list. Leave empty to use auto-discovered models.
+                </p>
+                {modelOverrides.map((m, i) => (
+                  <div key={m.id} className="mb-2 flex items-center gap-2">
+                    <code className="text-xs text-zinc-400">{m.id}</code>
+                    <span className="text-xs text-zinc-600">ctx: {m.context_window ?? 'auto'}</span>
+                    <span className="text-xs text-zinc-600">out: {m.max_output_tokens ?? 'auto'}</span>
+                    {m.input_cost_per_1m != null && (
+                      <span className="text-xs text-zinc-600">in: ${m.input_cost_per_1m}/1M</span>
+                    )}
+                    {m.output_cost_per_1m != null && (
+                      <span className="text-xs text-zinc-600">out: ${m.output_cost_per_1m}/1M</span>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setModelOverrides((prev) => prev.filter((_, j) => j !== i))}
+                      className="ml-auto"
+                    >
+                      <XCircle className="h-3.5 w-3.5 text-zinc-500 hover:text-red-400" />
+                    </button>
+                  </div>
+                ))}
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <input
+                    placeholder="Model ID (required)"
+                    value={overrideModelId}
+                    onChange={(e) => setOverrideModelId(e.target.value)}
+                    className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                  <input
+                    placeholder="Context window"
+                    type="number"
+                    value={overrideContextWindow}
+                    onChange={(e) => setOverrideContextWindow(e.target.value)}
+                    className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                  <input
+                    placeholder="Max output tokens"
+                    type="number"
+                    value={overrideMaxOutputTokens}
+                    onChange={(e) => setOverrideMaxOutputTokens(e.target.value)}
+                    className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                  <input
+                    placeholder="Input cost / 1M tokens"
+                    type="number"
+                    value={overrideInputCost}
+                    onChange={(e) => setOverrideInputCost(e.target.value)}
+                    className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                  <input
+                    placeholder="Output cost / 1M tokens"
+                    type="number"
+                    value={overrideOutputCost}
+                    onChange={(e) => setOverrideOutputCost(e.target.value)}
+                    className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleAddOverride}
+                    className="rounded-md bg-zinc-800 px-3 py-2 text-sm font-medium text-zinc-300 transition-colors hover:bg-zinc-700"
+                  >
+                    Add Model
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           {error && (
             <div className="flex items-center gap-2 rounded-md bg-red-600/10 px-3 py-2 text-sm text-red-400">
               <AlertTriangle className="h-4 w-4 shrink-0" />
@@ -627,7 +842,7 @@ function ProviderModal({
             </button>
           </div>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }

@@ -96,7 +96,7 @@ async fn fetch_openai_compatible_models(
             last_refreshed: Some(now.clone()),
         };
 
-        if let Ok(detail_resp) = client.get(&detail_url).timeout(std::time::Duration::from_secs(30)).send().await {
+        if let Ok(detail_resp) = client.get(&detail_url).header("Authorization", format!("Bearer {api_key}")).timeout(std::time::Duration::from_secs(30)).send().await {
             if detail_resp.status().is_success() {
                 if let Ok(text) = detail_resp.text().await {
                     if let Ok(detail) = parse_model_detail(&text) {
@@ -402,7 +402,7 @@ pub async fn refresh_provider_models(provider_id: String, client: &Client) -> Re
 
     let models = fetch_models_for_provider(provider, &api_key, client).await?;
 
-    let mut all_providers = load_providers()?;
+    let mut all_providers = providers;
     if let Some(existing) = all_providers.iter_mut().find(|p| p.id == provider_id) {
         existing.models = models.clone();
     }
