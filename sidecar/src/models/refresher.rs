@@ -16,6 +16,22 @@ struct OpenAiModelsResponse {
 #[derive(Debug, Deserialize)]
 struct OpenAiModelEntry {
     id: String,
+    #[serde(default)]
+    context_window: Option<u64>,
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<u64>,
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    input_cost_per_token: Option<f64>,
+    #[serde(default)]
+    output_cost_per_token: Option<f64>,
+    #[serde(default)]
+    pricing: Option<PricingInfo>,
+    #[serde(default)]
+    model_spec: Option<ModelSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -42,6 +58,30 @@ struct PricingInfo {
     prompt: Option<f64>,
     #[serde(default)]
     completion: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelSpec {
+    #[serde(default, rename = "availableContextTokens")]
+    available_context_tokens: Option<u64>,
+    #[serde(default, rename = "maxCompletionTokens")]
+    max_completion_tokens: Option<u64>,
+    #[serde(default)]
+    pricing: Option<ModelSpecPricing>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelSpecPricing {
+    #[serde(default)]
+    input: Option<ModelSpecPrice>,
+    #[serde(default)]
+    output: Option<ModelSpecPrice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelSpecPrice {
+    #[serde(default)]
+    usd: Option<f64>,
 }
 
 pub async fn fetch_models_for_provider(
@@ -92,12 +132,34 @@ async fn fetch_openai_compatible_models(
     for entry in models_list.data {
         let detail_url = format!("{base_url}/models/{}", entry.id);
 
+        let entry_ctx = entry.context_window
+            .or(entry.context_length)
+            .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.available_context_tokens));
+
+        let entry_max_out = entry.max_output_tokens
+            .or(entry.max_completion_tokens)
+            .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.max_completion_tokens));
+
+        let entry_input_cost = entry.input_cost_per_token.map(|c| c * 1_000_000.0)
+            .or_else(|| entry.pricing.as_ref().and_then(|p| p.prompt).map(|c| c * 1_000_000.0))
+            .or_else(|| entry.model_spec.as_ref()
+                .and_then(|ms| ms.pricing.as_ref())
+                .and_then(|p| p.input.as_ref())
+                .and_then(|i| i.usd));
+
+        let entry_output_cost = entry.output_cost_per_token.map(|c| c * 1_000_000.0)
+            .or_else(|| entry.pricing.as_ref().and_then(|p| p.completion).map(|c| c * 1_000_000.0))
+            .or_else(|| entry.model_spec.as_ref()
+                .and_then(|ms| ms.pricing.as_ref())
+                .and_then(|p| p.output.as_ref())
+                .and_then(|o| o.usd));
+
         let mut model = ProviderModel {
             id: entry.id.clone(),
-            context_window: None,
-            max_output_tokens: None,
-            input_cost_per_1m: None,
-            output_cost_per_1m: None,
+            context_window: entry_ctx,
+            max_output_tokens: entry_max_out,
+            input_cost_per_1m: entry_input_cost,
+            output_cost_per_1m: entry_output_cost,
             last_refreshed: Some(now.clone()),
             protocol: None,
         };
@@ -106,13 +168,15 @@ async fn fetch_openai_compatible_models(
             if detail_resp.status().is_success() {
                 if let Ok(text) = detail_resp.text().await {
                     if let Ok(detail) = parse_model_detail(&text) {
-                        model.context_window = detail
-                            .context_window
-                            .or(detail.context_length);
+                        let detail_ctx = detail.context_window.or(detail.context_length);
+                        if detail_ctx.is_some() {
+                            model.context_window = detail_ctx;
+                        }
 
-                        model.max_output_tokens = detail
-                            .max_output_tokens
-                            .or(detail.max_completion_tokens);
+                        let detail_max = detail.max_output_tokens.or(detail.max_completion_tokens);
+                        if detail_max.is_some() {
+                            model.max_output_tokens = detail_max;
+                        }
 
                         if let Some(pricing) = detail.pricing {
                             if let Some(prompt) = pricing.prompt {
@@ -185,6 +249,23 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
         }
         if let Some(v) = obj.get("output_cost_per_token").and_then(|v| v.as_f64()) {
             model.output_cost_per_1m = Some(v * 1_000_000.0);
+        }
+
+        if let Some(spec) = obj.get("model_spec").and_then(|v| v.as_object()) {
+            if let Some(v) = spec.get("availableContextTokens").and_then(|v| v.as_u64()) {
+                model.context_window = model.context_window.or(Some(v));
+            }
+            if let Some(v) = spec.get("maxCompletionTokens").and_then(|v| v.as_u64()) {
+                model.max_output_tokens = model.max_output_tokens.or(Some(v));
+            }
+            if let Some(spec_pricing) = spec.get("pricing").and_then(|v| v.as_object()) {
+                if let Some(usd) = spec_pricing.get("input").and_then(|v| v.as_object()).and_then(|o| o.get("usd")).and_then(|v| v.as_f64()) {
+                    model.input_cost_per_1m = model.input_cost_per_1m.or(Some(usd));
+                }
+                if let Some(usd) = spec_pricing.get("output").and_then(|v| v.as_object()).and_then(|o| o.get("usd")).and_then(|v| v.as_f64()) {
+                    model.output_cost_per_1m = model.output_cost_per_1m.or(Some(usd));
+                }
+            }
         }
     }
 
@@ -546,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_get_anthropic_models_with_overrides() {
-        let now = current_iso_timestamp();
+        let _now = current_iso_timestamp();
         let override_model = ProviderModel {
             id: "custom-claude-model".to_string(),
             context_window: Some(100_000),
@@ -676,5 +757,140 @@ mod tests {
         assert_eq!(result.max_output_tokens, Some(64000));
         assert_eq!(result.input_cost_per_1m, Some(3.0));
         assert_eq!(result.output_cost_per_1m, Some(15.0));
+    }
+
+    #[test]
+    fn test_openai_model_entry_with_model_spec() {
+        let json = serde_json::json!({
+            "id": "qwen3-235b-a22b",
+            "object": "model",
+            "model_spec": {
+                "availableContextTokens": 131072,
+                "maxCompletionTokens": 24000,
+                "pricing": {
+                    "input": { "usd": 0.15 },
+                    "output": { "usd": 0.60 }
+                }
+            }
+        });
+
+        let entry: OpenAiModelEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.id, "qwen3-235b-a22b");
+        let spec = entry.model_spec.unwrap();
+        assert_eq!(spec.available_context_tokens, Some(131072));
+        assert_eq!(spec.max_completion_tokens, Some(24000));
+        let spec_pricing = spec.pricing.unwrap();
+        assert_eq!(spec_pricing.input.unwrap().usd, Some(0.15));
+        assert_eq!(spec_pricing.output.unwrap().usd, Some(0.60));
+    }
+
+    #[test]
+    fn test_openai_model_entry_top_level_fields() {
+        let json = serde_json::json!({
+            "id": "test-model",
+            "context_window": 128000,
+            "max_output_tokens": 8192,
+            "input_cost_per_token": 0.000003,
+            "output_cost_per_token": 0.000015
+        });
+
+        let entry: OpenAiModelEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.id, "test-model");
+        assert_eq!(entry.context_window, Some(128000));
+        assert_eq!(entry.max_output_tokens, Some(8192));
+        assert_eq!(entry.input_cost_per_token, Some(0.000003));
+        assert_eq!(entry.output_cost_per_token, Some(0.000015));
+    }
+
+    #[test]
+    fn test_extract_from_raw_json_with_model_spec() {
+        let json = serde_json::json!({
+            "id": "qwen3-235b-a22b",
+            "model_spec": {
+                "availableContextTokens": 131072,
+                "maxCompletionTokens": 24000,
+                "pricing": {
+                    "input": { "usd": 0.15 },
+                    "output": { "usd": 0.60 }
+                }
+            }
+        });
+
+        let model = ProviderModel {
+            id: "qwen3-235b-a22b".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            input_cost_per_1m: None,
+            output_cost_per_1m: None,
+            last_refreshed: None,
+            protocol: None,
+        };
+
+        let now = current_iso_timestamp();
+        let result = extract_from_raw_json(&json, model, &now);
+
+        assert_eq!(result.context_window, Some(131072));
+        assert_eq!(result.max_output_tokens, Some(24000));
+        assert_eq!(result.input_cost_per_1m, Some(0.15));
+        assert_eq!(result.output_cost_per_1m, Some(0.60));
+    }
+
+    #[test]
+    fn test_extract_from_raw_json_model_spec_preserves_existing() {
+        let json = serde_json::json!({
+            "id": "test",
+            "context_window": 64000,
+            "model_spec": {
+                "availableContextTokens": 131072
+            }
+        });
+
+        let model = ProviderModel {
+            id: "test".to_string(),
+            context_window: Some(64000),
+            max_output_tokens: None,
+            input_cost_per_1m: None,
+            output_cost_per_1m: None,
+            last_refreshed: None,
+            protocol: None,
+        };
+
+        let now = current_iso_timestamp();
+        let result = extract_from_raw_json(&json, model, &now);
+
+        assert_eq!(result.context_window, Some(64000));
+    }
+
+    #[test]
+    fn test_extract_from_raw_json_model_spec_fills_missing() {
+        let json = serde_json::json!({
+            "id": "test",
+            "model_spec": {
+                "availableContextTokens": 131072,
+                "maxCompletionTokens": 24000,
+                "pricing": {
+                    "input": { "usd": 0.15 },
+                    "output": { "usd": 0.60 }
+                }
+            }
+        });
+
+        let model = ProviderModel {
+            id: "test".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            input_cost_per_1m: None,
+            output_cost_per_1m: None,
+            last_refreshed: None,
+            protocol: None,
+        };
+
+        let now = current_iso_timestamp();
+        let result = extract_from_raw_json(&json, model, &now);
+
+        assert_eq!(result.context_window, Some(131072));
+        assert_eq!(result.max_output_tokens, Some(24000));
+        assert_eq!(result.input_cost_per_1m, Some(0.15));
+        assert_eq!(result.output_cost_per_1m, Some(0.60));
     }
 }
