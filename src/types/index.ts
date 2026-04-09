@@ -13,6 +13,7 @@ export interface ProviderModel {
   input_cost_per_1m?: number;
   output_cost_per_1m?: number;
   last_refreshed?: string;
+  protocol?: Protocol;
 }
 
 export interface Provider {

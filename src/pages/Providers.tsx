@@ -545,6 +545,7 @@ function ProviderModal({
   const [overrideMaxOutputTokens, setOverrideMaxOutputTokens] = useState('');
   const [overrideInputCost, setOverrideInputCost] = useState('');
   const [overrideOutputCost, setOverrideOutputCost] = useState('');
+  const [overrideProtocol, setOverrideProtocol] = useState<string>('');
 
   const handleAddOverride = () => {
     if (!overrideModelId.trim()) return;
@@ -553,12 +554,14 @@ function ProviderModal({
     if (overrideMaxOutputTokens) entry.max_output_tokens = Number(overrideMaxOutputTokens);
     if (overrideInputCost) entry.input_cost_per_1m = Number(overrideInputCost);
     if (overrideOutputCost) entry.output_cost_per_1m = Number(overrideOutputCost);
+    if (overrideProtocol && overrideProtocol !== '__none__') entry.protocol = overrideProtocol as 'openai' | 'anthropic';
     setModelOverrides((prev) => [...prev, entry]);
     setOverrideModelId('');
     setOverrideContextWindow('');
     setOverrideMaxOutputTokens('');
     setOverrideInputCost('');
     setOverrideOutputCost('');
+    setOverrideProtocol('');
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -774,6 +777,11 @@ function ProviderModal({
                 {modelOverrides.map((m, i) => (
                   <div key={m.id} className="mb-2 flex items-center gap-2">
                     <code className="text-xs text-zinc-400">{m.id}</code>
+                    {m.protocol && (
+                      <Badge className={`rounded-full text-xs font-medium ${m.protocol === 'anthropic' ? 'bg-violet-600/20 text-violet-300' : 'bg-emerald-600/20 text-emerald-300'}`}>
+                        {m.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}
+                      </Badge>
+                    )}
                     <span className="text-xs text-zinc-600">ctx: {m.context_window ?? 'auto'}</span>
                     <span className="text-xs text-zinc-600">out: {m.max_output_tokens ?? 'auto'}</span>
                     {m.input_cost_per_1m != null && (
@@ -826,6 +834,16 @@ function ProviderModal({
                     onChange={(e) => setOverrideOutputCost(e.target.value)}
                     className="rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                   />
+                  <Select value={overrideProtocol || '__none__'} onValueChange={(v) => setOverrideProtocol(v === '__none__' ? '' : v)}>
+                    <SelectTrigger className="border-zinc-700 bg-zinc-800 text-zinc-100">
+                      <SelectValue placeholder="Provider default" />
+                    </SelectTrigger>
+                    <SelectContent className="bg-zinc-800 border-zinc-700">
+                      <SelectItem value="__none__" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Provider default</SelectItem>
+                      <SelectItem value="openai" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">OpenAI-compatible</SelectItem>
+                      <SelectItem value="anthropic" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Anthropic-compatible</SelectItem>
+                    </SelectContent>
+                  </Select>
                   <button
                     type="button"
                     onClick={handleAddOverride}
