@@ -268,11 +268,7 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
 
     let client = Client::new();
     let base_url = provider.base_url.trim_end_matches('/');
-    let models_url = if base_url.ends_with("/v1") {
-        format!("{base_url}/models")
-    } else {
-        format!("{base_url}/v1/models")
-    };
+    let models_url = format!("{base_url}/models");
 
     let request = match provider.protocol.as_str() {
         "anthropic" => client
