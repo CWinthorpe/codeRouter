@@ -369,7 +369,16 @@ function ModelBrowser({ models, providerName, providerId }: { models: ProviderMo
   const [groups, setGroups] = useState<Group[]>([]);
   const [loadingGroups, setLoadingGroups] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
+  const toastCounterRef = useRef(0);
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const setStoreGroups = useStore((s) => s.setGroups);
+
+  const addToast = useCallback((type: 'success' | 'error', message: string) => {
+    const id = Date.now() * 1000 + (++toastCounterRef.current);
+    setToasts((prev) => [...prev, { id, type, message }]);
+    setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
+  }, []);
 
   useEffect(() => {
     if (!addingModelId) return;
@@ -414,8 +423,11 @@ function ModelBrowser({ models, providerName, providerId }: { models: ProviderMo
         entries: [...group.entries, newEntry],
       };
       await saveGroup(updatedGroup);
+      const updatedGroups = await getGroups();
+      setStoreGroups(updatedGroups);
       setAddingModelId(null);
-    } catch {
+    } catch (e: unknown) {
+      addToast('error', `Failed to add model to group: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSaving(false);
     }
@@ -487,6 +499,13 @@ function ModelBrowser({ models, providerName, providerId }: { models: ProviderMo
           ))}
         </TableBody>
       </Table>
+      {toasts.length > 0 && (
+        <div className="flex flex-col gap-2 px-5 pt-3">
+          {toasts.map((toast) => (
+            <Toast key={toast.id} type={toast.type} message={toast.message} />
+          ))}
+        </div>
+      )}
     </div>
   );
 }

@@ -16,7 +16,7 @@ export function useMetricsStream() {
       return;
     }
 
-    const host = appConfig?.proxy_host ?? 'localhost';
+    const host = appConfig?.proxy_host ?? '127.0.0.1';
     const port = appConfig?.proxy_port ?? 4141;
     const url = `http://${host}:${port}/internal/metrics/stream`;
 
@@ -25,8 +25,27 @@ export function useMetricsStream() {
 
     es.onmessage = (e) => {
       try {
-        const event = JSON.parse(e.data);
-        addRecentRequest(event);
+        const raw = JSON.parse(e.data);
+        const inputCost = typeof raw.input_cost_per_1m === 'number' && typeof raw.prompt_tokens === 'number'
+          ? (raw.prompt_tokens * raw.input_cost_per_1m) / 1_000_000
+          : 0;
+        const outputCost = typeof raw.output_cost_per_1m === 'number' && typeof raw.output_tokens === 'number'
+          ? (raw.output_tokens * raw.output_cost_per_1m) / 1_000_000
+          : 0;
+        const row = {
+          id: Date.now() * 1000 + Math.floor(Math.random() * 1000),
+          ts: raw.ts ?? Math.floor(Date.now() / 1000),
+          group_alias: raw.group_alias ?? '',
+          provider_id: raw.provider_id ?? '',
+          model_id: raw.model_id ?? '',
+          prompt_tokens: raw.prompt_tokens ?? 0,
+          output_tokens: raw.output_tokens ?? 0,
+          cost_usd: inputCost + outputCost,
+          latency_ms: raw.latency_ms ?? 0,
+          status: raw.status ?? 'success',
+          error_type: raw.error_type ?? null,
+        };
+        addRecentRequest(row);
       } catch {
         // ignore parse errors
       }
