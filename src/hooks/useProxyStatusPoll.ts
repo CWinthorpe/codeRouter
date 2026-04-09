@@ -14,8 +14,11 @@ export function useProxyStatusPoll() {
 
   useEffect(() => {
     const poll = async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000);
       try {
-        const res = await fetch(healthUrl, { signal: AbortSignal.timeout(3000) });
+        const res = await fetch(healthUrl, { signal: controller.signal });
+        clearTimeout(timeoutId);
         if (res.ok) {
           setProxyStatus('running');
           try {
@@ -29,6 +32,7 @@ export function useProxyStatusPoll() {
           setHealthData(null);
         }
       } catch {
+        clearTimeout(timeoutId);
         setProxyStatus('stopped');
         setHealthData(null);
       }

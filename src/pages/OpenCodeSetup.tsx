@@ -23,6 +23,7 @@ import {
   previewOpencodeConfig,
   type OpenCodeAgentMapping,
 } from '../lib/ipc';
+import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 
 const AGENT_LABELS: Record<string, string> = {
   build: 'Build agent',
@@ -316,18 +317,19 @@ export default function OpenCodeSetup() {
             {AGENT_KEYS.map((key) => (
               <div key={key} className="flex items-center gap-3">
                 <label className="w-40 shrink-0 text-sm text-zinc-300">{AGENT_LABELS[key]}</label>
-                <select
-                  value={mapping[key] ?? ''}
-                  onChange={(e) => handleMappingChange(key, e.target.value)}
-                  className="flex-1 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                >
-                  <option value="">— use default —</option>
-                  {groupAliases.map((alias) => (
-                    <option key={alias} value={alias}>
-                      {alias}
-                    </option>
-                  ))}
-                </select>
+                <Select value={mapping[key] ?? ''} onValueChange={(v) => handleMappingChange(key, v)}>
+                  <SelectTrigger className="flex-1 border-zinc-700 bg-zinc-800 text-zinc-100">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-zinc-800 border-zinc-700">
+                    <SelectItem value="" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">— use default —</SelectItem>
+                    {groupAliases.map((alias) => (
+                      <SelectItem key={alias} value={alias} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
+                        {alias}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
             ))}
 
@@ -336,18 +338,19 @@ export default function OpenCodeSetup() {
                 Small/Fast model
                 <span className="ml-1 text-zinc-500">(titles, summaries)</span>
               </label>
-              <select
-                value={mapping.small_model ?? ''}
-                onChange={(e) => handleMappingChange('small_model', e.target.value)}
-                className="flex-1 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-              >
-                <option value="">— use default —</option>
-                {groupAliases.map((alias) => (
-                  <option key={alias} value={alias}>
-                    {alias}
-                  </option>
-                ))}
-              </select>
+              <Select value={mapping.small_model ?? ''} onValueChange={(v) => handleMappingChange('small_model', v)}>
+                <SelectTrigger className="flex-1 border-zinc-700 bg-zinc-800 text-zinc-100">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-zinc-800 border-zinc-700">
+                  <SelectItem value="" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">— use default —</SelectItem>
+                  {groupAliases.map((alias) => (
+                    <SelectItem key={alias} value={alias} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
+                      {alias}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
             </div>
           </div>
 
