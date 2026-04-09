@@ -413,12 +413,15 @@ pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::D
 }
 
 #[tauri::command]
-pub fn get_usage_by_group(days: u32) -> Result<Vec<queries::GroupUsage>, String> {
+pub fn get_usage_by_group(days: u32, provider_id: Option<String>) -> Result<Vec<queries::GroupUsage>, String> {
+    let reset_hour = provider_id.and_then(|pid| {
+        let providers = store::load_providers().ok()?;
+        providers.iter()
+            .find(|p| p.id == pid)
+            .map(|p| p.quota_reset_utc_hour)
+    }).unwrap_or(0);
     with_metrics_db(|conn| {
-        // reset_hour=0 (UTC midnight) is used because this function aggregates
-        // across ALL providers — no single provider's reset_hour applies.
-        // This is a cross-provider design limitation, not a bug.
-        queries::get_usage_by_group(conn, days, 0)
+        queries::get_usage_by_group(conn, days, reset_hour)
             .map_err(|e| e.to_string())
     })
 }
