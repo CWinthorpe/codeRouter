@@ -644,7 +644,9 @@ function GroupForm({
     );
   }, []);
 
-  const handleDragStart = useCallback((idx: number) => {
+  const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
+    e.dataTransfer.effectAllowed = 'move';
+    e.dataTransfer.setData('text/plain', String(idx));
     setDragIdx(idx);
   }, []);
 
@@ -671,6 +673,11 @@ function GroupForm({
   }, [dragIdx]);
 
   const handleDragEnd = useCallback(() => {
+    setDragIdx(null);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
     setDragIdx(null);
   }, []);
 
@@ -773,14 +780,15 @@ function GroupForm({
                   <div
                     key={entryKeys[idx]}
                     draggable
-                    onDragStart={() => handleDragStart(idx)}
+                    onDragStart={(e) => handleDragStart(e, idx)}
                     onDragOver={(e) => handleDragOver(e, idx)}
+                    onDrop={handleDrop}
                     onDragEnd={handleDragEnd}
                     className={`flex items-center gap-3 rounded-md border border-zinc-800 bg-zinc-900 px-3 py-2.5 transition-opacity ${
                       dragIdx === idx ? 'opacity-50' : ''
                     }`}
                   >
-                    <div className="cursor-grab text-zinc-600 hover:text-zinc-400">
+                    <div className="cursor-grab text-zinc-600 hover:text-zinc-400 active:cursor-grabbing">
                       <GripVertical className="h-4 w-4" />
                     </div>
                     <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-zinc-800 text-xs font-mono text-zinc-400">
