@@ -77,16 +77,11 @@ pub async fn send_with_timeout(
     on_latency_timeout: bool,
 ) -> Result<reqwest::Response, UpstreamError> {
     if on_latency_timeout {
-        let req = req.timeout(std::time::Duration::from_millis(timeout_ms));
-        match req.send().await {
-            Ok(resp) => Ok(resp),
-            Err(e) => {
-                if e.is_timeout() {
-                    Err(UpstreamError::Timeout)
-                } else {
-                    Err(UpstreamError::Network(e.to_string()))
-                }
-            }
+        let duration = std::time::Duration::from_millis(timeout_ms);
+        match tokio::time::timeout(duration, req.send()).await {
+            Ok(Ok(resp)) => Ok(resp),
+            Ok(Err(e)) => Err(UpstreamError::Network(e.to_string())),
+            Err(_) => Err(UpstreamError::Timeout),
         }
     } else {
         match req.send().await {
