@@ -370,12 +370,13 @@ async fn route_request(
             AppError::InternalError(format!("invalid provider base_url: {}", e))
         })?;
 
+        let base = provider.base_url.trim_end_matches('/');
         let url = if is_anthropic {
-            format!("{}/v1/messages", provider.base_url.trim_end_matches('/'))
+            format!("{base}/messages")
         } else if endpoint == "completions" {
-            format!("{}/v1/completions", provider.base_url.trim_end_matches('/'))
+            format!("{base}/completions")
         } else {
-            format!("{}/v1/chat/completions", provider.base_url.trim_end_matches('/'))
+            format!("{base}/chat/completions")
         };
 
         if endpoint == "completions" && is_anthropic {

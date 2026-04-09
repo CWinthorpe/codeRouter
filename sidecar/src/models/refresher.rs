@@ -61,11 +61,7 @@ async fn fetch_openai_compatible_models(
     client: &Client,
 ) -> Result<Vec<ProviderModel>> {
     let base_url = provider.base_url.trim_end_matches('/');
-    let models_url = if base_url.ends_with("/v1") {
-        format!("{base_url}/models")
-    } else {
-        format!("{base_url}/v1/models")
-    };
+    let models_url = format!("{base_url}/models");
 
     let resp = client
         .get(&models_url)
@@ -89,11 +85,7 @@ async fn fetch_openai_compatible_models(
     let mut result = Vec::new();
 
     for entry in models_list.data {
-        let detail_url = if base_url.ends_with("/v1") {
-            format!("{base_url}/models/{}", entry.id)
-        } else {
-            format!("{base_url}/v1/models/{}", entry.id)
-        };
+        let detail_url = format!("{base_url}/models/{}", entry.id);
 
         let mut model = ProviderModel {
             id: entry.id.clone(),

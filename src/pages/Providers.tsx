@@ -653,7 +653,7 @@ function ProviderModal({
               value={baseUrl}
               onChange={(e) => setBaseUrl(e.target.value)}
               className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-              placeholder="https://api.example.com"
+              placeholder="https://api.example.com/v1"
             />
           </div>
 
