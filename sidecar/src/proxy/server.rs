@@ -362,7 +362,14 @@ async fn route_request(
             AppError::InternalError("upstream provider configuration error".to_string())
         })?;
 
-        let is_anthropic = provider.protocol == "anthropic";
+        let model_protocol = provider.models.iter()
+            .find(|m| m.id == entry.model_id)
+            .and_then(|m| m.protocol.clone())
+            .or_else(|| provider.model_overrides.as_ref()
+                .and_then(|overrides| overrides.iter()
+                    .find(|m| m.id == entry.model_id)
+                    .and_then(|m| m.protocol.clone())));
+        let is_anthropic = model_protocol.as_deref().unwrap_or(&provider.protocol) == "anthropic";
         let upstream_model = entry.model_id.clone();
 
         ssrf::validate_base_url(&provider.base_url).map_err(|e| {

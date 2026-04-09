@@ -65,8 +65,9 @@ pub struct ProviderModelResponse {
     pub output_cost_per_1m: Option<f64>,
     #[serde(default)]
     pub last_refreshed: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
-
 impl From<&Provider> for ProviderResponse {
     fn from(p: &Provider) -> Self {
         ProviderResponse {
@@ -85,6 +86,7 @@ impl From<&Provider> for ProviderResponse {
                 input_cost_per_1m: m.input_cost_per_1m,
                 output_cost_per_1m: m.output_cost_per_1m,
                 last_refreshed: m.last_refreshed.clone(),
+                protocol: m.protocol.clone(),
             }).collect()).unwrap_or_default(),
             enabled: p.enabled,
             models: p.models.iter().map(|m| ProviderModelResponse {
@@ -94,6 +96,7 @@ impl From<&Provider> for ProviderResponse {
                 input_cost_per_1m: m.input_cost_per_1m,
                 output_cost_per_1m: m.output_cost_per_1m,
                 last_refreshed: m.last_refreshed.clone(),
+                protocol: m.protocol.clone(),
             }).collect(),
         }
     }
@@ -766,6 +769,7 @@ mod tests {
                 input_cost_per_1m: Some(1.0),
                 output_cost_per_1m: Some(2.0),
                 last_refreshed: Some("2026-04-07T00:00:00Z".to_string()),
+                protocol: None,
             }],
             model_overrides: None,
         }

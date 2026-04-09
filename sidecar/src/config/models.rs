@@ -13,6 +13,8 @@ pub struct ProviderModel {
     pub output_cost_per_1m: Option<f64>,
     #[serde(default)]
     pub last_refreshed: Option<String>,
+    #[serde(default)]
+    pub protocol: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
