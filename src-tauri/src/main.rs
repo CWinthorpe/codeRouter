@@ -275,6 +275,7 @@ fn main() {
             commands::get_latency_percentiles,
             commands::remove_coderouter_from_opencode,
             commands::dismiss_onboarding,
+            commands::check_proxy_health,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

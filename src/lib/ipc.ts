@@ -134,4 +134,14 @@ export async function getUsageByGroup(days: number, providerId?: string): Promis
   return invoke<GroupUsage[]>('get_usage_by_group', { days, providerId: providerId ?? null });
 }
 
+export interface HealthCheckResult {
+  running: boolean;
+  status: string | null;
+  uptime_seconds: number | null;
+}
+
+export async function checkProxyHealth(): Promise<HealthCheckResult> {
+  return invoke<HealthCheckResult>('check_proxy_health');
+}
+
 
