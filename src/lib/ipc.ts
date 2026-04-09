@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow } from '../types';
+import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow, GroupUsage } from '../types';
 
 export interface TestConnectionResult {
   success: boolean;
@@ -128,6 +128,10 @@ export async function removeCoderouterFromOpencode(): Promise<void> {
 
 export async function dismissOnboarding(): Promise<void> {
   return invoke<void>('dismiss_onboarding');
+}
+
+export async function getUsageByGroup(days: number, providerId?: string): Promise<GroupUsage[]> {
+  return invoke<GroupUsage[]>('get_usage_by_group', { days, provider_id: providerId ?? null });
 }
 
 

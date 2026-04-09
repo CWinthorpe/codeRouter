@@ -110,3 +110,11 @@ export interface RequestRow {
   status: RequestStatus;
   error_type: string | null;
 }
+
+export interface GroupUsage {
+  group_alias: string;
+  total_requests: number;
+  total_prompt_tokens: number;
+  total_output_tokens: number;
+  total_cost: number;
+}

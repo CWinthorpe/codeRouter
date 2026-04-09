@@ -30,6 +30,8 @@ use crate::config::{
     models::{AppConfig, Group, Provider},
     store::{load_app_config, load_groups, load_providers},
 };
+
+const STREAM_INTER_CHUNK_TIMEOUT_MS: u64 = 120_000;
 use crate::credentials::keychain::get_credential;
 use crate::metrics::db as metrics_db;
 use crate::metrics::recorder::{MetricsRecorder, RequestEvent};
@@ -618,7 +620,7 @@ async fn process_response(
     stream: bool,
     group_alias: &str,
     is_anthropic: bool,
-    latency_timeout_ms: u64,
+    _latency_timeout_ms: u64,
 ) -> Result<StreamProcessResult, RequestError> {
     let status = resp.status();
 
@@ -653,7 +655,7 @@ async fn process_response(
                 resp.bytes_stream().map(|result| {
                     result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                 }),
-                latency_timeout_ms,
+                STREAM_INTER_CHUNK_TIMEOUT_MS,
             );
 
             if is_anthropic {
