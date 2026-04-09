@@ -17,7 +17,7 @@ const REFRESH_INTERVAL_OPTIONS: { label: string; value: number }[] = [
 const LOG_VERBOSITY_OPTIONS = ['Error', 'Info', 'Debug'];
 
 export default function Settings() {
-  const { setAppConfig } = useStore((s) => ({ setAppConfig: s.setAppConfig }));
+  const setAppConfig = useStore((s) => s.setAppConfig);
   const [form, setForm] = useState<AppConfig | null>(null);
   const [showRestartBanner, setShowRestartBanner] = useState(false);
   const [originalPort, setOriginalPort] = useState<number | null>(null);

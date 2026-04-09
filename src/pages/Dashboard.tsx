@@ -82,7 +82,9 @@ function getProviderCardSortSubKey(
 }
 
 function ProxyStatusCard() {
-  const { proxyStatus, appConfig, healthData } = useStore((s) => ({ proxyStatus: s.proxyStatus, appConfig: s.appConfig, healthData: s.healthData }));
+  const proxyStatus = useStore((s) => s.proxyStatus);
+  const appConfig = useStore((s) => s.appConfig);
+  const healthData = useStore((s) => s.healthData);
   const navigate = useNavigate();
 
   return (

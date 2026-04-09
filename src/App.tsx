@@ -1,5 +1,6 @@
 import { createBrowserRouter, RouterProvider, Outlet, Link } from 'react-router-dom';
 import { AppShell } from './components/AppShell';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { GroupStatusProvider } from './hooks/useGroupStatusPoll';
 import Dashboard from './pages/Dashboard';
 import Providers from './pages/Providers';
@@ -44,5 +45,9 @@ const router = createBrowserRouter([
 ]);
 
 export default function App() {
-  return <RouterProvider router={router} />;
+  return (
+    <ErrorBoundary>
+      <RouterProvider router={router} />
+    </ErrorBoundary>
+  );
 }
