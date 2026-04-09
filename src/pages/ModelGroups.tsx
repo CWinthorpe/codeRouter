@@ -22,6 +22,8 @@ import { ActionButton } from '../components/ActionButton';
 import { Toast } from '../components/Toast';
 import { saveGroup, deleteGroup, getGroups, setEntryEnabled, isGroupReferencedInOpencode } from '../lib/ipc';
 import { useGroupStatusPoll } from '../hooks/useGroupStatusPoll';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Progress } from '@/components/ui/progress';
 import type { Group, GroupEntry, FailoverConfig, Provider, EntryStatusResponse } from '../types';
 
 const DEFAULT_FAILOVER: FailoverConfig = {
@@ -94,7 +96,7 @@ function statusLabel(status: string): string {
   }
 }
 
-function cooldownCountdown(cooldownUntil?: string, _tick?: number): string {
+function cooldownCountdown(cooldownUntil?: string, _forceUpdateTick?: number): string {
   if (!cooldownUntil) return '';
   try {
     const diff = new Date(cooldownUntil).getTime() - Date.now();
@@ -458,12 +460,10 @@ function LiveStatusPanel({
 
                 {quota != null && quota > 0 && (
                   <div className="mt-2 flex items-center gap-2">
-                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-zinc-800">
-                      <div
-                        className="h-full rounded-full bg-emerald-500 transition-all"
-                        style={{ width: `${Math.min((tokensUsed / quota) * 100, 100)}%` }}
-                      />
-                    </div>
+                    <Progress
+                      value={Math.min((tokensUsed / quota) * 100, 100)}
+                      className="h-1.5 flex-1 bg-zinc-800 [&>div]:bg-emerald-500"
+                    />
                     <span className="text-xs text-zinc-500">
                       {formatNumber(tokensUsed)} / {formatNumber(quota)}
                     </span>
@@ -474,6 +474,7 @@ function LiveStatusPanel({
               <label className="relative inline-flex shrink-0 cursor-pointer items-center">
                 <input
                   type="checkbox"
+                  aria-label={`Toggle ${providerNameForId(entry.providerId)} ${entry.modelId}`}
                   checked={entry.enabled}
                   onChange={() => handleToggle(idx, entry.enabled)}
                   className="peer sr-only"
@@ -485,6 +486,55 @@ function LiveStatusPanel({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+function SearchableSelect({ options, value, onChange, placeholder, disabled }: {
+  options: { value: string; label: string }[];
+  value: string;
+  onChange: (v: string) => void;
+  placeholder: string;
+  disabled?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const handler = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [open]);
+
+  const filtered = options.filter(o => o.label.toLowerCase().includes(search.toLowerCase()));
+  const selectedLabel = options.find(o => o.value === value)?.label ?? '';
+
+  return (
+    <div ref={ref} className="relative">
+      <input
+        type="text"
+        disabled={disabled}
+        value={open ? search : selectedLabel}
+        onChange={(e) => { setSearch(e.target.value); if (!open) setOpen(true); }}
+        onFocus={() => { setOpen(true); setSearch(selectedLabel); }}
+        placeholder={placeholder}
+        className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:opacity-50"
+      />
+      {open && !disabled && (
+        <div className="absolute z-50 mt-1 max-h-48 w-full overflow-auto rounded-md border border-zinc-700 bg-zinc-800 shadow-xl">
+          {filtered.length === 0 && <p className="px-3 py-2 text-xs text-zinc-500">No matches</p>}
+          {filtered.map(o => (
+            <button key={o.value} type="button"
+              className={`w-full px-3 py-2 text-left text-sm hover:bg-zinc-700 ${o.value === value ? 'bg-zinc-700 text-emerald-400' : 'text-zinc-200'}`}
+              onClick={() => { onChange(o.value); setOpen(false); setSearch(''); }}
+            >{o.label}</button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -514,6 +564,10 @@ function GroupForm({
   const [showFailover, setShowFailover] = useState(false);
   const [dragIdx, setDragIdx] = useState<number | null>(null);
   const dragOverThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const entryIdCounter = useRef(0);
+  const [entryKeys, setEntryKeys] = useState<string[]>(
+    group?.entries.map(() => `e-${++entryIdCounter.current}`) ?? []
+  );
 
   useEffect(() => {
     setShowFailover(false);
@@ -562,6 +616,7 @@ function GroupForm({
       status: 'active',
     };
     setEntries((prev) => [...prev, newEntry]);
+    setEntryKeys((prev) => [...prev, `e-${++entryIdCounter.current}`]);
     setAddProviderId('');
     setAddModelId('');
     setAddQuotaOverride('');
@@ -570,6 +625,7 @@ function GroupForm({
 
   const handleRemoveEntry = useCallback((idx: number) => {
     setEntries((prev) => prev.filter((_, i) => i !== idx).map((e, i) => ({ ...e, priority: i + 1 })));
+    setEntryKeys((prev) => prev.filter((_, i) => i !== idx));
   }, []);
 
   const handleEntryToggle = useCallback((idx: number) => {
@@ -604,6 +660,12 @@ function GroupForm({
       const [moved] = next.splice(dragIdx, 1);
       next.splice(idx, 0, moved);
       return next.map((e, i) => ({ ...e, priority: i + 1 }));
+    });
+    setEntryKeys((prev) => {
+      const next = [...prev];
+      const [moved] = next.splice(dragIdx, 1);
+      next.splice(idx, 0, moved);
+      return next;
     });
     setDragIdx(idx);
   }, [dragIdx]);
@@ -649,17 +711,13 @@ function GroupForm({
   );
 
   return (
-    <div className="fixed inset-0 z-40 flex items-start justify-center overflow-auto bg-black/60 p-8" onClick={onClose}>
-      <div
-        className="w-full max-w-2xl rounded-lg border border-zinc-800 bg-zinc-900 shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="border-b border-zinc-800 px-6 py-4">
-          <h2 className="text-lg font-semibold">{isEditing ? 'Edit Group' : 'Create Group'}</h2>
-        </div>
+    <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
+      <DialogContent className="max-w-2xl bg-zinc-900 border-zinc-800 text-zinc-100">
+        <DialogHeader>
+          <DialogTitle>{isEditing ? 'Edit Group' : 'Create Group'}</DialogTitle>
+        </DialogHeader>
 
-        <form onSubmit={handleSubmit} className="flex flex-col gap-6 p-6">
-          {/* Basic info */}
+        <form onSubmit={handleSubmit} className="flex flex-col gap-6">
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="mb-1 block text-sm font-medium text-zinc-300">
@@ -713,7 +771,7 @@ function GroupForm({
               <div className="flex flex-col gap-2">
                 {entries.map((entry, idx) => (
                   <div
-                    key={`${entry.providerId}-${entry.modelId}-${idx}-${entry.priority}`}
+                    key={entryKeys[idx]}
                     draggable
                     onDragStart={() => handleDragStart(idx)}
                     onDragOver={(e) => handleDragOver(e, idx)}
@@ -774,37 +832,25 @@ function GroupForm({
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="mb-1 block text-xs font-medium text-zinc-400">Provider</label>
-                  <select
+                  <SearchableSelect
                     value={addProviderId}
-                    onChange={(e) => {
-                      setAddProviderId(e.target.value);
+                    onChange={(v) => {
+                      setAddProviderId(v);
                       setAddModelId('');
                     }}
-                    className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                  >
-                    <option value="">Select provider…</option>
-                    {providers.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
-                      </option>
-                    ))}
-                  </select>
+                    placeholder="Select provider…"
+                    options={providers.map(p => ({ value: p.id, label: p.name }))}
+                  />
                 </div>
                 <div>
                   <label className="mb-1 block text-xs font-medium text-zinc-400">Model</label>
-                  <select
+                  <SearchableSelect
                     value={addModelId}
-                    onChange={(e) => setAddModelId(e.target.value)}
+                    onChange={setAddModelId}
                     disabled={!selectedProvider}
-                    className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500 disabled:opacity-50"
-                  >
-                    <option value="">Select model…</option>
-                    {selectedProvider?.models.map((m) => (
-                      <option key={m.id} value={m.id}>
-                        {m.id}
-                      </option>
-                    ))}
-                  </select>
+                    placeholder="Select model…"
+                    options={selectedProvider?.models.map(m => ({ value: m.id, label: m.id })) ?? []}
+                  />
                 </div>
               </div>
               <div className="mt-3">
@@ -971,8 +1017,8 @@ function GroupForm({
             </button>
           </div>
         </form>
-      </div>
-    </div>
+      </DialogContent>
+    </Dialog>
   );
 }
 

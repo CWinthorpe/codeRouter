@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowRight, Server, Layers, CheckCircle2 } from 'lucide-react';
 
@@ -11,6 +11,14 @@ interface OnboardingProps {
 export function Onboarding({ providersCount, groupsCount, onDismiss }: OnboardingProps) {
   const navigate = useNavigate();
   const [step, setStep] = useState(0);
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onDismiss();
+    };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onDismiss]);
 
   const shouldShow = providersCount === 0 || groupsCount === 0;
 
@@ -43,6 +51,8 @@ export function Onboarding({ providersCount, groupsCount, onDismiss }: Onboardin
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70" onClick={onDismiss}>
       <div
+        role="dialog"
+        aria-modal="true"
         className="w-full max-w-lg rounded-xl border border-zinc-700 bg-zinc-900 p-8 shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >

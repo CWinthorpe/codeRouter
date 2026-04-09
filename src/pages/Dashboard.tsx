@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useRef } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '../store';
 import { getDailySummary, getRecentRequests } from '../lib/ipc';
@@ -8,49 +8,11 @@ import { Server, Power, Terminal, ChevronDown, ChevronRight, AlertTriangle, Chec
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
+import { StatusBadge } from '@/components/StatusBadge';
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
+import { Progress } from '@/components/ui/progress';
 
 const POLL_INTERVAL_MS = 5000;
-
-interface HealthData {
-  status: string;
-  uptime_seconds: number;
-}
-
-function useHealthPoll(proxyStatus: string, proxyPort: number, proxyHost?: string) {
-  const [health, setHealth] = useState<HealthData | null>(null);
-  const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const healthUrl = `http://${proxyHost ?? 'localhost'}:${proxyPort}/health`;
-
-  useEffect(() => {
-    if (proxyStatus !== 'running') {
-      setHealth(null);
-      return;
-    }
-
-    const poll = async () => {
-      try {
-        const res = await fetch(healthUrl, { signal: AbortSignal.timeout(3000) });
-        if (res.ok) {
-          const data = await res.json();
-          setHealth(data);
-        } else {
-          setHealth(null);
-        }
-      } catch {
-        setHealth(null);
-      }
-    };
-
-    poll();
-    intervalRef.current = setInterval(poll, POLL_INTERVAL_MS);
-
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [proxyStatus, healthUrl]);
-
-  return health;
-}
 
 function formatUptime(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
@@ -80,49 +42,47 @@ function formatTokens(n: number): string {
   return `${n}`;
 }
 
-function getEntryStatusCounts(entries: EntryStatusResponse[], providerId: string): { active: number; cooldown: number; disabled: number } {
+function getEntryStatusCounts(entries: EntryStatusResponse[], providerId: string): { active: number; cooldown: number; quotaExhausted: number; disabled: number } {
   const filtered = entries.filter((e) => e.provider_id === providerId);
   return {
     active: filtered.filter((e) => e.status === 'active').length,
     cooldown: filtered.filter((e) => e.status === 'cooldown').length,
+    quotaExhausted: filtered.filter((e) => e.status === 'quota_exhausted').length,
     disabled: filtered.filter((e) => e.status === 'manually_disabled').length,
   };
 }
 
 function getProviderOverallStatus(
   provider: Provider,
-  entryCounts: { active: number; cooldown: number; disabled: number },
+  entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number },
 ): string {
   if (!provider.enabled) return 'Disabled';
-  if (entryCounts.active === 0 && entryCounts.cooldown === 0) return 'All Entries Exhausted';
-  if (entryCounts.cooldown > 0) return 'Partially Degraded';
+  if (entryCounts.active === 0 && entryCounts.cooldown === 0 && entryCounts.quotaExhausted === 0) return 'All Entries Exhausted';
+  if (entryCounts.cooldown > 0 || entryCounts.quotaExhausted > 0) return 'Partially Degraded';
   return 'Active';
 }
 
 function getProviderCardSortKey(
   provider: Provider,
-  entryCounts: { active: number; cooldown: number; disabled: number },
+  entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number },
 ): number {
   if (!provider.enabled) return 2;
-  if (entryCounts.cooldown > 0 || (entryCounts.active === 0 && entryCounts.cooldown === 0)) return 0;
+  if (entryCounts.cooldown > 0 || entryCounts.quotaExhausted > 0 || (entryCounts.active === 0 && entryCounts.cooldown === 0 && entryCounts.quotaExhausted === 0)) return 0;
   return 1;
 }
 
 function getProviderCardSortSubKey(
   provider: Provider,
-  entryCounts: { active: number; cooldown: number; disabled: number },
+  entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number },
 ): number {
   if (!provider.enabled) return 2;
-  if (entryCounts.active === 0 && entryCounts.cooldown === 0) return 0;
-  if (entryCounts.cooldown > 0) return 1;
+  if (entryCounts.active === 0 && entryCounts.cooldown === 0 && entryCounts.quotaExhausted === 0) return 0;
+  if (entryCounts.cooldown > 0 || entryCounts.quotaExhausted > 0) return 1;
   return 2;
 }
 
-import { StatusBadge } from '@/components/StatusBadge';
-
 function ProxyStatusCard() {
-  const { proxyStatus, appConfig } = useStore((s) => ({ proxyStatus: s.proxyStatus, appConfig: s.appConfig }));
-  const health = useHealthPoll(proxyStatus, appConfig?.proxy_port ?? 4141, appConfig?.proxy_host);
+  const { proxyStatus, appConfig, healthData } = useStore((s) => ({ proxyStatus: s.proxyStatus, appConfig: s.appConfig, healthData: s.healthData }));
   const navigate = useNavigate();
 
   return (
@@ -153,9 +113,9 @@ function ProxyStatusCard() {
                   <p>
                     Listening on <span className="text-zinc-200">{appConfig.proxy_host}:{appConfig.proxy_port}</span>
                   </p>
-                  {health && health.uptime_seconds > 0 && (
+                  {healthData && healthData.uptime_seconds > 0 && (
                     <p>
-                      Uptime: <span className="text-zinc-200">{formatUptime(health.uptime_seconds)}</span>
+                      Uptime: <span className="text-zinc-200">{formatUptime(healthData.uptime_seconds)}</span>
                     </p>
                   )}
                 </>
@@ -182,7 +142,7 @@ function ProviderHealthCard({
   summary,
 }: {
   provider: Provider;
-  entryCounts: { active: number; cooldown: number; disabled: number };
+  entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number };
   summary: DailySummary | null;
 }) {
   const overallStatus = getProviderOverallStatus(provider, entryCounts);
@@ -219,6 +179,12 @@ function ProviderHealthCard({
             <AlertTriangle className="mr-1 inline h-3 w-3 text-yellow-500" />
             {entryCounts.cooldown} Cooldown
           </span>
+          {entryCounts.quotaExhausted > 0 && (
+            <span>
+              <AlertTriangle className="mr-1 inline h-3 w-3 text-orange-500" />
+              {entryCounts.quotaExhausted} Quota Exhausted
+            </span>
+          )}
           <span>
             <MinusCircle className="mr-1 inline h-3 w-3 text-zinc-500" />
             {entryCounts.disabled} Disabled
@@ -233,14 +199,16 @@ function ProviderHealthCard({
                 {formatTokens(totalTokensToday)} / {formatTokens(quota)}
               </span>
             </div>
-            <div className="h-2 overflow-hidden rounded-full bg-zinc-800">
-              <div
-                className={`h-full rounded-full transition-all ${
-                  progressPct > 90 ? 'bg-red-500' : progressPct > 70 ? 'bg-yellow-500' : 'bg-green-500'
-                }`}
-                style={{ width: `${progressPct}%` }}
-              />
-            </div>
+            <Progress
+              value={progressPct}
+              className={`h-2 bg-zinc-800 ${
+                progressPct > 90
+                  ? '[&>div]:bg-red-500'
+                  : progressPct > 70
+                    ? '[&>div]:bg-yellow-500'
+                    : '[&>div]:bg-green-500'
+              }`}
+            />
           </div>
         )}
 
@@ -262,7 +230,7 @@ function ProviderHealthCards() {
   const entryStatusData = useGroupStatusPoll();
   const [summaries, setSummaries] = useState<Record<string, DailySummary | null>>({});
 
-  const fetchSummaries = async () => {
+  const fetchSummaries = useCallback(async () => {
     const today = new Date().toISOString().slice(0, 10);
     const results: Record<string, DailySummary | null> = {};
     await Promise.all(
@@ -275,16 +243,13 @@ function ProviderHealthCards() {
       }),
     );
     setSummaries(results);
-  };
+  }, [providers]);
 
   useEffect(() => {
     fetchSummaries();
-  }, [providers]);
-
-  useEffect(() => {
     const interval = setInterval(fetchSummaries, 60000);
     return () => clearInterval(interval);
-  }, [providers]);
+  }, [fetchSummaries]);
 
   const sortedProviders = [...providers].sort((a, b) => {
     const countsA = getEntryStatusCounts(entryStatusData.entries, a.id);
@@ -317,6 +282,23 @@ function ProviderHealthCards() {
 function RequestFeed() {
   const [requests, setRequests] = useState<RequestRow[]>([]);
   const [expandedId, setExpandedId] = useState<number | null>(null);
+  const recentStreamRequests = useStore((s) => s.recentStreamRequests);
+  const [sseApplied, setSseApplied] = useState(0);
+  const lastSseTimeRef = useRef(0);
+  const [isLive, setIsLive] = useState(false);
+
+  useEffect(() => {
+    if (recentStreamRequests.length > sseApplied) {
+      lastSseTimeRef.current = Date.now();
+    }
+  }, [recentStreamRequests, sseApplied]);
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setIsLive(Date.now() - lastSseTimeRef.current < 5000);
+    }, 500);
+    return () => clearInterval(interval);
+  }, []);
 
   useEffect(() => {
     const poll = async () => {
@@ -333,6 +315,18 @@ function RequestFeed() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    if (recentStreamRequests.length === sseApplied) return;
+    const pending = recentStreamRequests.slice(0, recentStreamRequests.length - sseApplied);
+    setSseApplied(recentStreamRequests.length);
+    setRequests((prev) => {
+      const existingIds = new Set(prev.map((r) => r.id));
+      const newItems = pending.filter((r) => !existingIds.has(r.id));
+      if (newItems.length === 0) return prev;
+      return [...newItems, ...prev].slice(0, 50);
+    });
+  }, [recentStreamRequests, sseApplied]);
+
   const toggleExpand = (id: number) => {
     setExpandedId((prev) => (prev === id ? null : id));
   };
@@ -340,80 +334,86 @@ function RequestFeed() {
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900">
       <div className="border-b border-zinc-800 px-6 py-4">
-        <h2 className="text-lg font-semibold">Recent Requests</h2>
+        <h2 className="text-lg font-semibold flex items-center gap-2">
+          Recent Requests
+          {isLive && (
+            <span className="flex items-center gap-1.5 rounded-full bg-green-500/15 px-2.5 py-0.5 text-xs font-medium text-green-400">
+              <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-green-400" />
+              Live
+            </span>
+          )}
+        </h2>
       </div>
-      <div className="overflow-x-auto">
-        <table className="w-full text-left text-sm">
-          <thead>
-            <tr className="border-b border-zinc-800 text-xs uppercase text-zinc-500">
-              <th className="px-4 py-3"></th>
-              <th className="px-4 py-3">Time</th>
-              <th className="px-4 py-3">Group</th>
-              <th className="px-4 py-3">Provider</th>
-              <th className="px-4 py-3">Tokens In</th>
-              <th className="px-4 py-3">Tokens Out</th>
-              <th className="px-4 py-3">Latency</th>
-              <th className="px-4 py-3">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {requests.length === 0 && (
-              <tr>
-                <td colSpan={8} className="px-4 py-8 text-center text-zinc-500">
-                  No requests recorded yet
-                </td>
-              </tr>
-            )}
-            {requests.map((req) => {
-              const isExpanded = expandedId === req.id;
-              const showExpand = req.status === 'error' || req.status === 'timeout' || req.status === 'failover' || req.error_type;
-              return (
-                <React.Fragment key={req.id}>
-                  <tr
-                    className={`cursor-pointer border-b border-zinc-800/50 transition-colors hover:bg-zinc-800/30 ${
-                      isExpanded ? 'bg-zinc-800/20' : ''
-                    }`}
-                    onClick={() => showExpand && toggleExpand(req.id)}
-                  >
-                    <td className="px-4 py-3">
-                      {showExpand && (
-                        isExpanded ? (
-                          <ChevronDown className="h-4 w-4 text-zinc-400" />
-                        ) : (
-                          <ChevronRight className="h-4 w-4 text-zinc-500" />
-                        )
-                      )}
-                    </td>
-                    <td className="px-4 py-3 text-zinc-400">{formatRelativeTime(req.ts)}</td>
-                    <td className="px-4 py-3">{req.group_alias}</td>
-                    <td className="px-4 py-3 text-zinc-400">{req.provider_id}</td>
-                    <td className="px-4 py-3">{formatTokens(req.prompt_tokens)}</td>
-                    <td className="px-4 py-3">{formatTokens(req.output_tokens)}</td>
-                    <td className="px-4 py-3 text-zinc-400">{formatLatency(req.latency_ms)}</td>
-                    <td className="px-4 py-3">
-                      <StatusBadge status={req.status} />
-                    </td>
-                  </tr>
-                  {isExpanded && (
-                    <tr className="bg-zinc-900/50">
-                      <td colSpan={8} className="px-4 py-3">
-                        <div className="rounded bg-zinc-950 p-3 font-mono text-xs text-red-400">
-                          {req.error_type ? `Error type: ${req.error_type}` : 'No error details available'}
-                          {req.status === 'error' && req.error_type && (
-                            <div className="mt-1 text-zinc-500">
-                              Request failed with status: {req.error_type}
-                            </div>
-                          )}
-                        </div>
-                      </td>
-                    </tr>
-                  )}
-                </React.Fragment>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+      <Table className="text-left text-sm">
+        <TableHeader>
+          <TableRow className="border-b border-zinc-800 text-xs uppercase text-zinc-500 hover:bg-transparent">
+            <TableHead className="px-4 py-3"></TableHead>
+            <TableHead className="px-4 py-3">Time</TableHead>
+            <TableHead className="px-4 py-3">Group</TableHead>
+            <TableHead className="px-4 py-3">Provider</TableHead>
+            <TableHead className="px-4 py-3">Tokens In</TableHead>
+            <TableHead className="px-4 py-3">Tokens Out</TableHead>
+            <TableHead className="px-4 py-3">Latency</TableHead>
+            <TableHead className="px-4 py-3">Status</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {requests.length === 0 && (
+            <TableRow>
+              <TableCell colSpan={8} className="px-4 py-8 text-center text-zinc-500">
+                No requests recorded yet
+              </TableCell>
+            </TableRow>
+          )}
+          {requests.map((req) => {
+            const isExpanded = expandedId === req.id;
+            const showExpand = req.status === 'error' || req.status === 'timeout' || req.status === 'failover' || req.error_type;
+            return (
+              <React.Fragment key={req.id}>
+                <TableRow
+                  className={`cursor-pointer border-b border-zinc-800/50 hover:bg-zinc-800/30 ${
+                    isExpanded ? 'bg-zinc-800/20' : ''
+                  }`}
+                  onClick={() => showExpand && toggleExpand(req.id)}
+                >
+                  <TableCell className="px-4 py-3">
+                    {showExpand && (
+                      isExpanded ? (
+                        <ChevronDown className="h-4 w-4 text-zinc-400" />
+                      ) : (
+                        <ChevronRight className="h-4 w-4 text-zinc-500" />
+                      )
+                    )}
+                  </TableCell>
+                  <TableCell className="px-4 py-3 text-zinc-400">{formatRelativeTime(req.ts)}</TableCell>
+                  <TableCell className="px-4 py-3">{req.group_alias}</TableCell>
+                  <TableCell className="px-4 py-3 text-zinc-400">{req.provider_id}</TableCell>
+                  <TableCell className="px-4 py-3">{formatTokens(req.prompt_tokens)}</TableCell>
+                  <TableCell className="px-4 py-3">{formatTokens(req.output_tokens)}</TableCell>
+                  <TableCell className="px-4 py-3 text-zinc-400">{formatLatency(req.latency_ms)}</TableCell>
+                  <TableCell className="px-4 py-3">
+                    <StatusBadge status={req.status} />
+                  </TableCell>
+                </TableRow>
+                {isExpanded && (
+                  <TableRow className="bg-zinc-900/50 hover:bg-zinc-900/50">
+                    <TableCell colSpan={8} className="px-4 py-3">
+                      <div className="rounded bg-zinc-950 p-3 font-mono text-xs text-red-400">
+                        {req.error_type ? `Error type: ${req.error_type}` : 'No error details available'}
+                        {req.status === 'error' && req.error_type && (
+                          <div className="mt-1 text-zinc-500">
+                            Request failed with status: {req.error_type}
+                          </div>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </React.Fragment>
+            );
+          })}
+        </TableBody>
+      </Table>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import { createBrowserRouter, RouterProvider, Outlet } from 'react-router-dom';
+import { createBrowserRouter, RouterProvider, Outlet, Link } from 'react-router-dom';
 import { AppShell } from './components/AppShell';
 import { GroupStatusProvider } from './hooks/useGroupStatusPoll';
 import Dashboard from './pages/Dashboard';
@@ -7,6 +7,16 @@ import ModelGroups from './pages/ModelGroups';
 import OpenCodeSetup from './pages/OpenCodeSetup';
 import UsageMetrics from './pages/UsageMetrics';
 import Settings from './pages/Settings';
+
+function NotFound() {
+  return (
+    <div className="flex flex-col items-center justify-center py-16">
+      <h2 className="text-xl font-semibold">Page Not Found</h2>
+      <p className="mt-2 text-zinc-400">The page you're looking for doesn't exist.</p>
+      <Link to="/" className="mt-4 text-emerald-400 hover:underline">Go to Dashboard</Link>
+    </div>
+  );
+}
 
 function Layout() {
   return (
@@ -28,6 +38,7 @@ const router = createBrowserRouter([
       { path: '/opencode', element: <OpenCodeSetup /> },
       { path: '/metrics', element: <UsageMetrics /> },
       { path: '/settings', element: <Settings /> },
+      { path: '*', element: <NotFound /> },
     ],
   },
 ]);

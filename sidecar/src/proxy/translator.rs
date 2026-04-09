@@ -10,7 +10,7 @@ use std::task::{Context, Poll};
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AnthropicMessage {
     pub role: String,
-    pub content: String,
+    pub content: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -153,14 +153,14 @@ pub fn openai_to_anthropic(
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
         let content = msg
             .get("content")
-            .map(|v| match v {
-                serde_json::Value::String(s) => s.clone(),
-                _ => serde_json::to_string(v).unwrap_or_default(),
-            })
-            .unwrap_or_default();
+            .cloned()
+            .unwrap_or(serde_json::Value::String(String::new()));
 
         match role {
-            "system" => system_parts.push(content),
+            "system" => system_parts.push(match &content {
+                serde_json::Value::String(s) => s.clone(),
+                v => serde_json::to_string(v).unwrap_or_default(),
+            }),
             "user" => anthropic_messages.push(AnthropicMessage {
                 role: "user".to_string(),
                 content,
@@ -561,7 +561,8 @@ where
                             }
                         }
 
-                        output_chunks.extend_from_slice(&line_bytes);
+                        let clean_bytes: Vec<u8> = line_bytes.iter().filter(|&&b| b != b'\r').copied().collect();
+                        output_chunks.extend_from_slice(&clean_bytes);
                         output_chunks.push(b'\n');
                     }
 
@@ -671,7 +672,7 @@ mod tests {
         assert_eq!(result.system, Some("You are helpful.".to_string()));
         assert_eq!(result.messages.len(), 1);
         assert_eq!(result.messages[0].role, "user");
-        assert_eq!(result.messages[0].content, "Hello");
+        assert_eq!(result.messages[0].content, serde_json::Value::String("Hello".to_string()));
         assert_eq!(result.max_tokens, 100);
         assert_eq!(result.temperature, Some(0.7));
         assert_eq!(result.stream, Some(true));

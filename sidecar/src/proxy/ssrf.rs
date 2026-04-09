@@ -1,13 +1,9 @@
+use std::net::ToSocketAddrs;
 use url::Host;
 
 /// Validate that a base_url is safe for upstream requests.
 /// Rejects private/reserved IP ranges to prevent SSRF attacks.
-///
-/// NOTE: This validation checks the URL string at parse time only.
-/// It does NOT protect against DNS rebinding attacks, where a domain
-/// initially resolves to a public IP but later resolves to a private IP.
-/// For full DNS rebinding protection, resolve the hostname at request
-/// time and validate the IP address before each connection.
+/// Also resolves domain hostnames to check for DNS rebinding attacks.
 pub fn validate_base_url(base_url: &str) -> Result<(), String> {
     let parsed =
         url::Url::parse(base_url).map_err(|e| format!("Invalid URL '{}': {}", base_url, e))?;
@@ -56,10 +52,36 @@ pub fn validate_base_url(base_url: &str) -> Result<(), String> {
                     base_url, domain
                 ));
             }
+            check_dns_resolution(domain)?;
         }
     }
 
     Ok(())
+}
+
+fn check_dns_resolution(host: &str) -> Result<(), String> {
+    let addr = format!("{}:0", host);
+    match addr.to_socket_addrs() {
+        Ok(addrs) => {
+            for socket_addr in addrs {
+                let ip = socket_addr.ip();
+                match &ip {
+                    std::net::IpAddr::V4(v4) => {
+                        if v4.is_loopback() || v4.is_private() || is_private_or_reserved_v4(v4) {
+                            return Err(format!("DNS resolved to blocked address: {}", ip));
+                        }
+                    }
+                    std::net::IpAddr::V6(v6) => {
+                        if v6.is_loopback() || is_private_or_reserved_v6(v6) {
+                            return Err(format!("DNS resolved to blocked address: {}", ip));
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("DNS resolution failed: {}", e)),
+    }
 }
 
 fn is_private_or_reserved_v4(addr: &std::net::Ipv4Addr) -> bool {

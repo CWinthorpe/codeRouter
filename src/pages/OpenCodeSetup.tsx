@@ -34,7 +34,7 @@ const AGENT_LABELS: Record<string, string> = {
   summary: 'Summary (system)',
 };
 
-const AGENT_KEYS = ['build', 'plan', 'general', 'explore', 'compaction', 'title', 'summary'] as const;
+const AGENT_KEYS = ['build', 'plan', 'general', 'explore'] as const;
 
 function emptyMapping(): OpenCodeAgentMapping {
   return { build: null, plan: null, general: null, explore: null, compaction: null, title: null, summary: null, small_model: null };
@@ -125,7 +125,7 @@ export default function OpenCodeSetup() {
     return () => {
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
-  }, [mapping, groups, proxyPort, fetchPreview]);
+  }, [mapping, proxyPort, fetchPreview]);
 
   // Check if provider is already enabled on mount
   useEffect(() => {

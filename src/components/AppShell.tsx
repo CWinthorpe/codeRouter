@@ -3,6 +3,7 @@ import { useLocation, Link } from 'react-router-dom';
 import { LayoutDashboard, Server, Layers, Terminal, BarChart3, Settings } from 'lucide-react';
 import { useStore } from '../store';
 import { useProxyStatusPoll } from '../hooks/useProxyStatusPoll';
+import { useMetricsStream } from '../hooks/useMetricsStream';
 import { Onboarding } from './Onboarding';
 import { dismissOnboarding } from '../lib/ipc';
 
@@ -13,6 +14,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   const appConfig = useStore((s) => s.appConfig);
   const [showOnboarding, setShowOnboarding] = useState(false);
   useProxyStatusPoll();
+  useMetricsStream();
 
   useEffect(() => {
     loadInitialData();

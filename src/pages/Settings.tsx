@@ -117,6 +117,8 @@ export default function Settings() {
     }
     try {
       await resetAllConfig();
+      const store = useStore.getState();
+      store.resetAll();
       const config = await getAppConfig();
       setForm(config);
       setAppConfig(config);

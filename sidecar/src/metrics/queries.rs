@@ -49,8 +49,8 @@ pub fn get_daily_summary(
     conn: &Connection,
     provider_id: &str,
     date: NaiveDate,
+    reset_hour: u32,
 ) -> Result<DailySummary> {
-    let reset_hour = 0u32;
     let start_dt = date.and_hms_opt(reset_hour, 0, 0).unwrap().and_utc();
     let end_dt = date
         .succ_opt()
@@ -120,9 +120,9 @@ pub fn get_usage_by_day(
     conn: &Connection,
     provider_id: &str,
     days: u32,
+    reset_hour: u32,
 ) -> Result<Vec<DailyUsage>> {
     let now = Utc::now();
-    let reset_hour = 0u32;
     let start_date = (now - chrono::Duration::days(days as i64)).date_naive();
     let start_ts = start_date
         .and_hms_opt(reset_hour, 0, 0)
@@ -130,36 +130,50 @@ pub fn get_usage_by_day(
         .and_utc()
         .timestamp();
 
+    let shift_secs = (reset_hour as i64) * 3600;
+
     let mut stmt = conn.prepare(
         "SELECT 
-            DATE(ts, 'unixepoch') as date,
+            DATE(ts - ?3, 'unixepoch') as date,
             COUNT(*) as total_requests,
             COALESCE(SUM(prompt_tokens), 0) as total_prompt_tokens,
             COALESCE(SUM(output_tokens), 0) as total_output_tokens,
             COALESCE(SUM(cost_usd), 0.0) as total_cost
          FROM requests
          WHERE provider_id = ?1 AND ts >= ?2
-         GROUP BY DATE(ts, 'unixepoch')
+         GROUP BY DATE(ts - ?3, 'unixepoch')
          ORDER BY date ASC",
     )?;
 
-    let rows = stmt.query_map([provider_id, &start_ts.to_string()], |row| {
-        Ok(DailyUsage {
-            date: row.get(0)?,
-            total_requests: row.get(1)?,
-            total_prompt_tokens: row.get(2)?,
-            total_output_tokens: row.get(3)?,
-            total_cost: row.get(4)?,
-        })
-    })?;
+    let rows = stmt.query_map(
+        rusqlite::params![provider_id, start_ts.to_string(), shift_secs],
+        |row| {
+            Ok(DailyUsage {
+                date: row.get(0)?,
+                total_requests: row.get(1)?,
+                total_prompt_tokens: row.get(2)?,
+                total_output_tokens: row.get(3)?,
+                total_cost: row.get(4)?,
+            })
+        },
+    )?;
 
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Failed to collect daily usage: {}", e))
 }
 
-pub fn get_usage_by_group(conn: &Connection, days: u32) -> Result<Vec<GroupUsage>> {
+pub fn get_usage_by_group(
+    conn: &Connection,
+    days: u32,
+    reset_hour: u32,
+) -> Result<Vec<GroupUsage>> {
     let now = Utc::now();
-    let start_ts = (now - chrono::Duration::days(days as i64)).timestamp();
+    let start_date = (now - chrono::Duration::days(days as i64)).date_naive();
+    let start_ts = start_date
+        .and_hms_opt(reset_hour, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
 
     let mut stmt = conn.prepare(
         "SELECT 
@@ -198,8 +212,8 @@ pub fn get_latency_percentiles(
     conn: &Connection,
     provider_id: &str,
     date: NaiveDate,
+    reset_hour: u32,
 ) -> Result<Option<LatencyPercentiles>> {
-    let reset_hour = 0u32;
     let start_dt = date.and_hms_opt(reset_hour, 0, 0).unwrap().and_utc();
     let end_dt = date
         .succ_opt()
@@ -386,7 +400,7 @@ mod tests {
 
         let today = Utc::now().date_naive();
         let summary =
-            get_daily_summary(&conn, "provider-a", today).expect("Failed to get daily summary");
+            get_daily_summary(&conn, "provider-a", today, 0).expect("Failed to get daily summary");
 
         assert_eq!(summary.total_requests, 2);
         assert_eq!(summary.total_prompt_tokens, 3000);
@@ -400,7 +414,7 @@ mod tests {
         let conn = db::init_in_memory_db().expect("Failed to init DB");
         let today = Utc::now().date_naive();
         let summary =
-            get_daily_summary(&conn, "nonexistent", today).expect("Failed to get daily summary");
+            get_daily_summary(&conn, "nonexistent", today, 0).expect("Failed to get daily summary");
 
         assert_eq!(summary.total_requests, 0);
         assert_eq!(summary.total_prompt_tokens, 0);
@@ -434,7 +448,8 @@ mod tests {
         let mut conn = db::init_in_memory_db().expect("Failed to init DB");
         insert_test_requests(&mut conn);
 
-        let usage = get_usage_by_day(&conn, "provider-a", 7).expect("Failed to get usage by day");
+        let usage =
+            get_usage_by_day(&conn, "provider-a", 7, 0).expect("Failed to get usage by day");
         assert!(!usage.is_empty());
 
         let today_usage = usage.iter().find(|u| {
@@ -450,7 +465,7 @@ mod tests {
         let mut conn = db::init_in_memory_db().expect("Failed to init DB");
         insert_test_requests(&mut conn);
 
-        let usage = get_usage_by_group(&conn, 7).expect("Failed to get usage by group");
+        let usage = get_usage_by_group(&conn, 7, 0).expect("Failed to get usage by group");
         assert_eq!(usage.len(), 2);
         assert_eq!(usage[0].group_alias, "glm-5-router");
         assert_eq!(usage[0].total_requests, 3);
