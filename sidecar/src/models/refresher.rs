@@ -49,6 +49,11 @@ pub async fn fetch_models_for_provider(
     api_key: &str,
     client: &Client,
 ) -> Result<Vec<ProviderModel>> {
+    if let Some(overrides) = &provider.model_overrides {
+        if !overrides.is_empty() {
+            return Ok(overrides.clone());
+        }
+    }
     match provider.protocol.as_str() {
         "anthropic" => Ok(get_anthropic_models(provider)),
         _ => fetch_openai_compatible_models(provider, api_key, client).await,
@@ -94,6 +99,7 @@ async fn fetch_openai_compatible_models(
             input_cost_per_1m: None,
             output_cost_per_1m: None,
             last_refreshed: Some(now.clone()),
+            protocol: None,
         };
 
         if let Ok(detail_resp) = client.get(&detail_url).header("Authorization", format!("Bearer {api_key}")).timeout(std::time::Duration::from_secs(30)).send().await {
@@ -215,6 +221,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(15.0),
             output_cost_per_1m: Some(75.0),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
         ProviderModel {
             id: "claude-sonnet-4-20250514".to_string(),
@@ -223,6 +230,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(3.0),
             output_cost_per_1m: Some(15.0),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
         ProviderModel {
             id: "claude-3-7-sonnet-20250219".to_string(),
@@ -231,6 +239,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(3.0),
             output_cost_per_1m: Some(15.0),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
         ProviderModel {
             id: "claude-3-5-sonnet-20241022".to_string(),
@@ -239,6 +248,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(3.0),
             output_cost_per_1m: Some(15.0),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
         ProviderModel {
             id: "claude-3-5-haiku-20241022".to_string(),
@@ -247,6 +257,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(0.80),
             output_cost_per_1m: Some(4.0),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
         ProviderModel {
             id: "claude-3-opus-20240229".to_string(),
@@ -255,6 +266,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(15.0),
             output_cost_per_1m: Some(75.0),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
         ProviderModel {
             id: "claude-3-sonnet-20240229".to_string(),
@@ -263,6 +275,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(3.0),
             output_cost_per_1m: Some(15.0),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
         ProviderModel {
             id: "claude-3-haiku-20240307".to_string(),
@@ -271,6 +284,7 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
             input_cost_per_1m: Some(0.25),
             output_cost_per_1m: Some(1.25),
             last_refreshed: Some(now.to_string()),
+            protocol: None,
         },
     ]
 }
@@ -457,6 +471,7 @@ mod tests {
             input_cost_per_1m: None,
             output_cost_per_1m: None,
             last_refreshed: Some("2020-01-01T00:00:00Z".to_string()),
+            protocol: None,
         };
 
         let provider = Provider {
@@ -486,6 +501,7 @@ mod tests {
             input_cost_per_1m: None,
             output_cost_per_1m: None,
             last_refreshed: Some(now),
+            protocol: None,
         };
 
         let provider = Provider {
@@ -538,6 +554,7 @@ mod tests {
             input_cost_per_1m: Some(5.0),
             output_cost_per_1m: Some(25.0),
             last_refreshed: None,
+            protocol: None,
         };
 
         let provider = Provider {
@@ -620,6 +637,7 @@ mod tests {
             input_cost_per_1m: None,
             output_cost_per_1m: None,
             last_refreshed: None,
+            protocol: None,
         };
 
         let now = current_iso_timestamp();
@@ -648,6 +666,7 @@ mod tests {
             input_cost_per_1m: None,
             output_cost_per_1m: None,
             last_refreshed: None,
+            protocol: None,
         };
 
         let now = current_iso_timestamp();

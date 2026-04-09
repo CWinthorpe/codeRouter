@@ -89,15 +89,30 @@ impl From<&Provider> for ProviderResponse {
                 protocol: m.protocol.clone(),
             }).collect()).unwrap_or_default(),
             enabled: p.enabled,
-            models: p.models.iter().map(|m| ProviderModelResponse {
-                id: m.id.clone(),
-                context_window: m.context_window,
-                max_output_tokens: m.max_output_tokens,
-                input_cost_per_1m: m.input_cost_per_1m,
-                output_cost_per_1m: m.output_cost_per_1m,
-                last_refreshed: m.last_refreshed.clone(),
-                protocol: m.protocol.clone(),
-            }).collect(),
+            models: {
+                let auto: Vec<ProviderModelResponse> = p.models.iter().map(|m| ProviderModelResponse {
+                    id: m.id.clone(),
+                    context_window: m.context_window,
+                    max_output_tokens: m.max_output_tokens,
+                    input_cost_per_1m: m.input_cost_per_1m,
+                    output_cost_per_1m: m.output_cost_per_1m,
+                    last_refreshed: m.last_refreshed.clone(),
+                    protocol: m.protocol.clone(),
+                }).collect();
+                if auto.is_empty() {
+                    p.model_overrides.as_ref().map(|v| v.iter().map(|m| ProviderModelResponse {
+                        id: m.id.clone(),
+                        context_window: m.context_window,
+                        max_output_tokens: m.max_output_tokens,
+                        input_cost_per_1m: m.input_cost_per_1m,
+                        output_cost_per_1m: m.output_cost_per_1m,
+                        last_refreshed: m.last_refreshed.clone(),
+                        protocol: m.protocol.clone(),
+                    }).collect()).unwrap_or_default()
+                } else {
+                    auto
+                }
+            },
         }
     }
 }
@@ -283,7 +298,7 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
             .header("Authorization", format!("Bearer {}", api_key)),
     };
 
-    match request.send().await {
+    match request.timeout(std::time::Duration::from_secs(10)).send().await {
         Ok(resp) => {
             let status = resp.status().as_u16();
             if resp.status().is_success() {
@@ -292,6 +307,28 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
                     status_code: Some(status),
                     message: format!("Connection successful (HTTP {})", status),
                 })
+            } else if status == 404 {
+                let base_request = match provider.protocol.as_str() {
+                    "anthropic" => client
+                        .get(base_url)
+                        .header("x-api-key", &api_key)
+                        .header("anthropic-version", "2024-06-01"),
+                    _ => client
+                        .get(base_url)
+                        .header("Authorization", format!("Bearer {}", api_key)),
+                };
+                match base_request.timeout(std::time::Duration::from_secs(10)).send().await {
+                    Ok(r) if r.status().as_u16() != 404 => Ok(TestConnectionResult {
+                        success: true,
+                        status_code: Some(r.status().as_u16()),
+                        message: format!("Base URL reachable (HTTP {}) — no /models endpoint", r.status().as_u16()),
+                    }),
+                    _ => Ok(TestConnectionResult {
+                        success: true,
+                        status_code: Some(status),
+                        message: "Provider reachable — no /models endpoint (OK if using model overrides)".to_string(),
+                    }),
+                }
             } else {
                 let body = resp.text().await.unwrap_or_default();
                 Ok(TestConnectionResult {
