@@ -268,9 +268,10 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
 
     let client = Client::new();
     let base_url = provider.base_url.trim_end_matches('/');
-    let models_url = match provider.protocol.as_str() {
-        "anthropic" => format!("{base_url}/v1/models"),
-        _ => format!("{base_url}/v1/models"),
+    let models_url = if base_url.ends_with("/v1") {
+        format!("{base_url}/models")
+    } else {
+        format!("{base_url}/v1/models")
     };
 
     let request = match provider.protocol.as_str() {
@@ -589,6 +590,42 @@ pub fn remove_coderouter_from_opencode() -> Result<(), String> {
 
     config_writer::remove_provider(&config_path).map_err(|e| e.to_string())?;
     config_writer::remove_agent_models(&config_path).map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+pub struct HealthCheckResult {
+    pub running: bool,
+    pub status: Option<String>,
+    pub uptime_seconds: Option<u64>,
+}
+
+#[tauri::command]
+pub async fn check_proxy_health() -> Result<HealthCheckResult, String> {
+    let config = store::load_app_config().unwrap_or_default();
+    let host = config.proxy_host;
+    let port = config.proxy_port;
+    let url = format!("http://{}:{}/health", host, port);
+    let client = Client::new();
+
+    let controller = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        client.get(&url).send().await
+    }).await;
+
+    match controller {
+        Ok(Ok(resp)) if resp.status().is_success() => {
+            let body: serde_json::Value = resp.json().await.unwrap_or_default();
+            Ok(HealthCheckResult {
+                running: true,
+                status: body.get("status").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                uptime_seconds: body.get("uptime_seconds").and_then(|v| v.as_u64()),
+            })
+        }
+        _ => Ok(HealthCheckResult {
+            running: false,
+            status: None,
+            uptime_seconds: None,
+        }),
+    }
 }
 
 #[tauri::command]

@@ -317,12 +317,12 @@ export default function OpenCodeSetup() {
             {AGENT_KEYS.map((key) => (
               <div key={key} className="flex items-center gap-3">
                 <label className="w-40 shrink-0 text-sm text-zinc-300">{AGENT_LABELS[key]}</label>
-                <Select value={mapping[key] ?? ''} onValueChange={(v) => handleMappingChange(key, v)}>
+                <Select value={mapping[key] ?? ''} onValueChange={(v) => handleMappingChange(key, v === '__none__' ? '' : v)}>
                   <SelectTrigger className="flex-1 border-zinc-700 bg-zinc-800 text-zinc-100">
                     <SelectValue />
                   </SelectTrigger>
                   <SelectContent className="bg-zinc-800 border-zinc-700">
-                    <SelectItem value="" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">— use default —</SelectItem>
+                    <SelectItem value="__none__" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">— use default —</SelectItem>
                     {groupAliases.map((alias) => (
                       <SelectItem key={alias} value={alias} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
                         {alias}
@@ -338,12 +338,12 @@ export default function OpenCodeSetup() {
                 Small/Fast model
                 <span className="ml-1 text-zinc-500">(titles, summaries)</span>
               </label>
-              <Select value={mapping.small_model ?? ''} onValueChange={(v) => handleMappingChange('small_model', v)}>
+              <Select value={mapping.small_model ?? ''} onValueChange={(v) => handleMappingChange('small_model', v === '__none__' ? '' : v)}>
                 <SelectTrigger className="flex-1 border-zinc-700 bg-zinc-800 text-zinc-100">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent className="bg-zinc-800 border-zinc-700">
-                  <SelectItem value="" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">— use default —</SelectItem>
+                  <SelectItem value="__none__" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">— use default —</SelectItem>
                   {groupAliases.map((alias) => (
                     <SelectItem key={alias} value={alias} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
                       {alias}

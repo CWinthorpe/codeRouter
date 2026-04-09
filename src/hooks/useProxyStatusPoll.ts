@@ -1,38 +1,28 @@
 import { useEffect, useRef } from 'react';
 import { useStore } from '../store';
+import { checkProxyHealth } from '../lib/ipc';
 
 const POLL_INTERVAL_MS = 5000;
 
 export function useProxyStatusPoll() {
   const setProxyStatus = useStore((s) => s.setProxyStatus);
   const setHealthData = useStore((s) => s.setHealthData);
-  const appConfig = useStore((s) => s.appConfig);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const proxyHost = appConfig?.proxy_host ?? '127.0.0.1';
-  const proxyPort = appConfig?.proxy_port ?? 4141;
-  const healthUrl = `http://${proxyHost}:${proxyPort}/health`;
 
   useEffect(() => {
     const poll = async () => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3000);
       try {
-        const res = await fetch(healthUrl, { signal: controller.signal });
-        clearTimeout(timeoutId);
-        if (res.ok) {
+        const result = await checkProxyHealth();
+        if (result.running) {
           setProxyStatus('running');
-          try {
-            const data = await res.json();
-            setHealthData({ status: data.status, uptime_seconds: data.uptime_seconds });
-          } catch {
-            setHealthData(null);
-          }
+          setHealthData(result.uptime_seconds != null
+            ? { status: result.status ?? 'ok', uptime_seconds: result.uptime_seconds }
+            : null);
         } else {
           setProxyStatus('stopped');
           setHealthData(null);
         }
       } catch {
-        clearTimeout(timeoutId);
         setProxyStatus('stopped');
         setHealthData(null);
       }
@@ -44,5 +34,5 @@ export function useProxyStatusPoll() {
     return () => {
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [setProxyStatus, setHealthData, healthUrl]);
+  }, [setProxyStatus, setHealthData]);
 }
