@@ -36,7 +36,7 @@ pub struct Provider {
     pub enabled: bool,
     #[serde(default)]
     pub models: Vec<ProviderModel>,
-    #[serde(default)]
+    #[serde(default, rename = "modelOverrides")]
     pub model_overrides: Option<Vec<ProviderModel>>,
 }
 
