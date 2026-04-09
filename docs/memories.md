@@ -411,6 +411,24 @@ Test count: 111 sidecar tests passing (8 new tests added). 2 pre-existing Tauri 
 
 ---
 
+## OpenRouter String Pricing Fix (2026-04-10)
+
+OpenRouter's `/api/v1/models` returns pricing as **string values** (`"0.000003"`) not floats, and metadata under `top_provider` instead of top-level. This caused "error decoding response body" on model refresh.
+
+Fix: Custom deserializer `deserialize_string_or_float` for all pricing/cost fields. Added `TopProvider` struct parsing `context_length` and `max_completion_tokens` as fallback source. Fixed `extract_from_raw_json` to handle string pricing values.
+
+Provider coverage after fixes:
+- **Venice**: `model_spec.availableContextTokens`, `model_spec.maxCompletionTokens`, `model_spec.pricing.input.usd`/`output.usd` (per-million)
+- **OpenRouter**: `context_length`, `top_provider.context_length`/`max_completion_tokens`, `pricing.prompt`/`completion` (per-token strings)
+- **Anthropic**: Hardcoded pricing/context
+- **z.ai**: Returns minimal OpenAI format — just `id`, no metadata
+
+Files changed: refresher.rs
+
+Test count: 122 sidecar tests passing (11 new tests added).
+
+---
+
 ## Future Work (from plan.md "Open Questions")
 
 - Request caching for identical requests

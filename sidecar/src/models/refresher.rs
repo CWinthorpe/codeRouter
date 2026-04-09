@@ -8,6 +8,19 @@ use crate::credentials::keychain::get_credential;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+fn deserialize_string_or_float<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match val {
+        None => Ok(None),
+        Some(serde_json::Value::Number(n)) => Ok(n.as_f64()),
+        Some(serde_json::Value::String(s)) => Ok(s.parse::<f64>().ok()),
+        Some(_) => Ok(None),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
     data: Vec<OpenAiModelEntry>,
@@ -24,14 +37,16 @@ struct OpenAiModelEntry {
     max_output_tokens: Option<u64>,
     #[serde(default)]
     max_completion_tokens: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
     input_cost_per_token: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
     output_cost_per_token: Option<f64>,
     #[serde(default)]
     pricing: Option<PricingInfo>,
     #[serde(default)]
     model_spec: Option<ModelSpec>,
+    #[serde(default)]
+    top_provider: Option<TopProvider>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -46,17 +61,25 @@ struct OpenAiModelDetail {
     max_completion_tokens: Option<u64>,
     #[serde(default)]
     pricing: Option<PricingInfo>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
     input_cost_per_token: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
     output_cost_per_token: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
+struct TopProvider {
+    #[serde(default)]
+    context_length: Option<u64>,
+    #[serde(default)]
+    max_completion_tokens: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
 struct PricingInfo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
     prompt: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
     completion: Option<f64>,
 }
 
@@ -134,10 +157,12 @@ async fn fetch_openai_compatible_models(
 
         let entry_ctx = entry.context_window
             .or(entry.context_length)
+            .or_else(|| entry.top_provider.as_ref().and_then(|tp| tp.context_length))
             .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.available_context_tokens));
 
         let entry_max_out = entry.max_output_tokens
             .or(entry.max_completion_tokens)
+            .or_else(|| entry.top_provider.as_ref().and_then(|tp| tp.max_completion_tokens))
             .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.max_completion_tokens));
 
         let entry_input_cost = entry.input_cost_per_token.map(|c| c * 1_000_000.0)
@@ -236,19 +261,31 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
         }
 
         if let Some(pricing) = obj.get("pricing").and_then(|v| v.as_object()) {
-            if let Some(prompt) = pricing.get("prompt").and_then(|v| v.as_f64()) {
-                model.input_cost_per_1m = Some(prompt * 1_000_000.0);
+            if let Some(prompt) = pricing.get("prompt") {
+                let parsed = prompt.as_f64().or_else(|| prompt.as_str().and_then(|s| s.parse::<f64>().ok()));
+                if let Some(p) = parsed {
+                    model.input_cost_per_1m = Some(p * 1_000_000.0);
+                }
             }
-            if let Some(completion) = pricing.get("completion").and_then(|v| v.as_f64()) {
-                model.output_cost_per_1m = Some(completion * 1_000_000.0);
+            if let Some(completion) = pricing.get("completion") {
+                let parsed = completion.as_f64().or_else(|| completion.as_str().and_then(|s| s.parse::<f64>().ok()));
+                if let Some(p) = parsed {
+                    model.output_cost_per_1m = Some(p * 1_000_000.0);
+                }
             }
         }
 
-        if let Some(v) = obj.get("input_cost_per_token").and_then(|v| v.as_f64()) {
-            model.input_cost_per_1m = Some(v * 1_000_000.0);
+        if let Some(v) = obj.get("input_cost_per_token") {
+            let parsed = v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()));
+            if let Some(p) = parsed {
+                model.input_cost_per_1m = Some(p * 1_000_000.0);
+            }
         }
-        if let Some(v) = obj.get("output_cost_per_token").and_then(|v| v.as_f64()) {
-            model.output_cost_per_1m = Some(v * 1_000_000.0);
+        if let Some(v) = obj.get("output_cost_per_token") {
+            let parsed = v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()));
+            if let Some(p) = parsed {
+                model.output_cost_per_1m = Some(p * 1_000_000.0);
+            }
         }
 
         if let Some(spec) = obj.get("model_spec").and_then(|v| v.as_object()) {
@@ -892,5 +929,222 @@ mod tests {
         assert_eq!(result.max_output_tokens, Some(24000));
         assert_eq!(result.input_cost_per_1m, Some(0.15));
         assert_eq!(result.output_cost_per_1m, Some(0.60));
+    }
+
+    #[test]
+    fn test_openrouter_model_entry_string_pricing() {
+        let json = serde_json::json!({
+            "id": "anthropic/claude-sonnet-4",
+            "context_length": 200000,
+            "pricing": {
+                "prompt": "0.000003",
+                "completion": "0.000015"
+            },
+            "top_provider": {
+                "context_length": 200000,
+                "max_completion_tokens": 64000
+            }
+        });
+
+        let entry: OpenAiModelEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.id, "anthropic/claude-sonnet-4");
+        assert_eq!(entry.context_length, Some(200000));
+        let pricing = entry.pricing.unwrap();
+        assert_eq!(pricing.prompt, Some(0.000003));
+        assert_eq!(pricing.completion, Some(0.000015));
+
+        let tp = entry.top_provider.unwrap();
+        assert_eq!(tp.context_length, Some(200000));
+        assert_eq!(tp.max_completion_tokens, Some(64000));
+    }
+
+    #[test]
+    fn test_openrouter_model_entry_numeric_pricing() {
+        let json = serde_json::json!({
+            "id": "test-model",
+            "pricing": {
+                "prompt": 0.000003,
+                "completion": 0.000015
+            }
+        });
+
+        let entry: OpenAiModelEntry = serde_json::from_value(json).unwrap();
+        let pricing = entry.pricing.unwrap();
+        assert_eq!(pricing.prompt, Some(0.000003));
+        assert_eq!(pricing.completion, Some(0.000015));
+    }
+
+    #[test]
+    fn test_pricing_info_null_values() {
+        let json = serde_json::json!({
+            "prompt": null,
+            "completion": null
+        });
+        let pricing: PricingInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(pricing.prompt, None);
+        assert_eq!(pricing.completion, None);
+    }
+
+    #[test]
+    fn test_pricing_info_missing_fields() {
+        let json = serde_json::json!({});
+        let pricing: PricingInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(pricing.prompt, None);
+        assert_eq!(pricing.completion, None);
+    }
+
+    #[test]
+    fn test_pricing_info_sentinel_string() {
+        let json = serde_json::json!({
+            "prompt": "-1",
+            "completion": "free"
+        });
+        let pricing: PricingInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(pricing.prompt, Some(-1.0));
+        assert_eq!(pricing.completion, None);
+    }
+
+    #[test]
+    fn test_top_provider_fallback_context_length() {
+        let json = serde_json::json!({
+            "id": "test-model",
+            "top_provider": {
+                "context_length": 128000,
+                "max_completion_tokens": 4096
+            }
+        });
+
+        let entry: OpenAiModelEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.context_window, None);
+        assert_eq!(entry.context_length, None);
+
+        let tp = entry.top_provider.as_ref().unwrap();
+        assert_eq!(tp.context_length, Some(128000));
+        assert_eq!(tp.max_completion_tokens, Some(4096));
+    }
+
+    #[test]
+    fn test_extract_from_raw_json_string_pricing() {
+        let json = serde_json::json!({
+            "id": "test-model",
+            "context_window": 128000,
+            "pricing": {
+                "prompt": "0.000003",
+                "completion": "0.000015"
+            }
+        });
+
+        let model = ProviderModel {
+            id: "test-model".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            input_cost_per_1m: None,
+            output_cost_per_1m: None,
+            last_refreshed: None,
+            protocol: None,
+        };
+
+        let now = current_iso_timestamp();
+        let result = extract_from_raw_json(&json, model, &now);
+
+        assert_eq!(result.context_window, Some(128000));
+        assert_eq!(result.input_cost_per_1m, Some(3.0));
+        assert_eq!(result.output_cost_per_1m, Some(15.0));
+    }
+
+    #[test]
+    fn test_extract_from_raw_json_string_cost_per_token() {
+        let json = serde_json::json!({
+            "id": "test-model",
+            "input_cost_per_token": "0.000003",
+            "output_cost_per_token": "0.000015"
+        });
+
+        let model = ProviderModel {
+            id: "test-model".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            input_cost_per_1m: None,
+            output_cost_per_1m: None,
+            last_refreshed: None,
+            protocol: None,
+        };
+
+        let now = current_iso_timestamp();
+        let result = extract_from_raw_json(&json, model, &now);
+
+        assert_eq!(result.input_cost_per_1m, Some(3.0));
+        assert_eq!(result.output_cost_per_1m, Some(15.0));
+    }
+
+    #[test]
+    fn test_openai_model_entry_string_cost_per_token() {
+        let json = serde_json::json!({
+            "id": "test-model",
+            "input_cost_per_token": "0.000003",
+            "output_cost_per_token": "0.000015"
+        });
+
+        let entry: OpenAiModelEntry = serde_json::from_value(json).unwrap();
+        assert_eq!(entry.input_cost_per_token, Some(0.000003));
+        assert_eq!(entry.output_cost_per_token, Some(0.000015));
+    }
+
+    #[test]
+    fn test_openai_model_detail_string_cost_per_token() {
+        let json = serde_json::json!({
+            "input_cost_per_token": "0.000003",
+            "output_cost_per_token": "0.000015"
+        });
+
+        let detail: OpenAiModelDetail = serde_json::from_value(json).unwrap();
+        assert_eq!(detail.input_cost_per_token, Some(0.000003));
+        assert_eq!(detail.output_cost_per_token, Some(0.000015));
+    }
+
+    #[test]
+    fn test_openrouter_full_response_string_pricing() {
+        let json = serde_json::json!({
+            "data": [
+                {
+                    "id": "anthropic/claude-sonnet-4",
+                    "context_length": 200000,
+                    "pricing": {
+                        "prompt": "0.000003",
+                        "completion": "0.000015"
+                    },
+                    "top_provider": {
+                        "context_length": 200000,
+                        "max_completion_tokens": 64000
+                    }
+                },
+                {
+                    "id": "openai/gpt-4o",
+                    "pricing": {
+                        "prompt": "0.000005",
+                        "completion": "0.000015"
+                    }
+                }
+            ]
+        });
+
+        let resp: OpenAiModelsResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.data.len(), 2);
+
+        let claude = &resp.data[0];
+        assert_eq!(claude.id, "anthropic/claude-sonnet-4");
+        let pricing = claude.pricing.as_ref().unwrap();
+        assert_eq!(pricing.prompt, Some(0.000003));
+        assert_eq!(pricing.completion, Some(0.000015));
+        let tp = claude.top_provider.as_ref().unwrap();
+        assert_eq!(tp.context_length, Some(200000));
+        assert_eq!(tp.max_completion_tokens, Some(64000));
+
+        let gpt = &resp.data[1];
+        assert_eq!(gpt.id, "openai/gpt-4o");
+        let pricing = gpt.pricing.as_ref().unwrap();
+        assert_eq!(pricing.prompt, Some(0.000005));
+        assert_eq!(pricing.completion, Some(0.000015));
+        assert!(gpt.top_provider.is_none());
     }
 }
