@@ -243,6 +243,7 @@ mod tests {
                 input_cost_per_1m: Some(1.0),
                 output_cost_per_1m: Some(2.0),
                 last_refreshed: Some("2026-04-07T00:00:00Z".to_string()),
+                protocol: None,
             }],
             model_overrides: None,
         }

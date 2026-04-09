@@ -69,8 +69,10 @@ pub async fn start_server() -> anyhow::Result<()> {
     let groups = load_groups().unwrap_or_default();
     let providers = load_providers().unwrap_or_default();
 
+    // No total timeout: streaming responses can run for minutes (reasoning/thinking).
+    // Per-layer timeouts handle each phase: connect (below), TTFB (upstream.rs), inter-chunk (TimeoutStream), non-streaming body (tokio::timeout).
     let client = Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
     let router_state = router::init_and_set_global_router_state(&groups, &providers);
@@ -441,6 +443,11 @@ async fn route_request(
                 let on_consecutive_errors = group.failover_config.on_consecutive_errors;
                 let consecutive_error_cooldown_ms = group.failover_config.consecutive_error_cooldown_ms;
 
+                let (pricing_input, pricing_output) = provider.models.iter()
+                    .find(|m| m.id == entry.model_id)
+                    .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
+                    .unwrap_or((None, None));
+
                 let body_with_metrics = MetricsRecordingStream::new(raw_stream, move |success: bool| {
                     let latency_ms = latency_start.elapsed().as_millis() as i64;
                     let counts = token_counts.lock().unwrap();
@@ -460,8 +467,8 @@ async fn route_request(
                             latency_ms,
                             status: "success".to_string(),
                             error_type: None,
-                            input_cost_per_1m: None,
-                            output_cost_per_1m: None,
+                            input_cost_per_1m: pricing_input,
+                            output_cost_per_1m: pricing_output,
                         };
                         let _ = metrics_recorder.record_request_sync(event.clone());
                         if let Ok(json) = serde_json::to_string(&event) {
@@ -483,8 +490,8 @@ async fn route_request(
                             latency_ms,
                             status: "error".to_string(),
                             error_type: Some("stream_error".to_string()),
-                            input_cost_per_1m: None,
-                            output_cost_per_1m: None,
+                            input_cost_per_1m: pricing_input,
+                            output_cost_per_1m: pricing_output,
                         };
                         let _ = metrics_recorder.record_request_sync(event.clone());
                         if let Ok(json) = serde_json::to_string(&event) {
@@ -533,6 +540,10 @@ async fn route_request(
                 let group_alias = group.alias.clone();
                 let metrics_recorder = state.metrics_recorder.clone();
                 let metrics_broadcast = state.metrics_broadcast.clone();
+                let (pricing_input, pricing_output) = provider.models.iter()
+                    .find(|m| m.id == entry.model_id)
+                    .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
+                    .unwrap_or((None, None));
                 tokio::spawn(async move {
                     let event = RequestEvent {
                         ts: chrono::Utc::now().timestamp(),
@@ -544,8 +555,8 @@ async fn route_request(
                         latency_ms,
                         status: "success".to_string(),
                         error_type: None,
-                        input_cost_per_1m: None,
-                        output_cost_per_1m: None,
+                        input_cost_per_1m: pricing_input,
+                        output_cost_per_1m: pricing_output,
                     };
                     let _ = metrics_recorder.record_request(event.clone()).await;
                     if let Ok(json) = serde_json::to_string(&event) {
@@ -1117,6 +1128,7 @@ mod tests {
     use bytes::Bytes;
     use futures::stream::StreamExt;
     use std::sync::{Arc, Mutex};
+    use crate::config::models::ProviderModel;
 
     #[tokio::test]
     async fn test_timeout_stream_passes_chunks_without_delay() {
@@ -1219,5 +1231,105 @@ mod tests {
         while let Some(_) = metrics_stream.next().await {}
 
         assert_eq!(*called.lock().unwrap(), Some(true));
+    }
+
+    #[test]
+    fn test_pricing_lookup_from_provider_models() {
+        let provider = Provider {
+            id: "test-provider".to_string(),
+            name: "Test".to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com".to_string(),
+            credential_key: "test".to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![
+                ProviderModel {
+                    id: "gpt-4".to_string(),
+                    context_window: Some(128000),
+                    max_output_tokens: Some(4096),
+                    input_cost_per_1m: Some(30.0),
+                    output_cost_per_1m: Some(60.0),
+                    last_refreshed: None,
+                    protocol: None,
+                },
+                ProviderModel {
+                    id: "gpt-3.5".to_string(),
+                    context_window: Some(16384),
+                    max_output_tokens: Some(4096),
+                    input_cost_per_1m: Some(0.5),
+                    output_cost_per_1m: Some(1.5),
+                    last_refreshed: None,
+                    protocol: None,
+                },
+            ],
+            model_overrides: None,
+        };
+
+        let (input_cost, output_cost) = provider.models.iter()
+            .find(|m| m.id == "gpt-4")
+            .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
+            .unwrap_or((None, None));
+
+        assert_eq!(input_cost, Some(30.0));
+        assert_eq!(output_cost, Some(60.0));
+
+        let (input_cost, output_cost) = provider.models.iter()
+            .find(|m| m.id == "gpt-3.5")
+            .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
+            .unwrap_or((None, None));
+
+        assert_eq!(input_cost, Some(0.5));
+        assert_eq!(output_cost, Some(1.5));
+
+        let (input_cost, output_cost) = provider.models.iter()
+            .find(|m| m.id == "nonexistent")
+            .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
+            .unwrap_or((None, None));
+
+        assert_eq!(input_cost, None);
+        assert_eq!(output_cost, None);
+    }
+
+    #[test]
+    fn test_request_event_calculate_cost_with_pricing() {
+        let event = RequestEvent {
+            ts: 0,
+            group_alias: "test".to_string(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            prompt_tokens: 1_000_000,
+            output_tokens: 500_000,
+            latency_ms: 100,
+            status: "success".to_string(),
+            error_type: None,
+            input_cost_per_1m: Some(30.0),
+            output_cost_per_1m: Some(60.0),
+        };
+
+        let cost = event.calculate_cost();
+        assert!((cost - 60.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_request_event_calculate_cost_without_pricing() {
+        let event = RequestEvent {
+            ts: 0,
+            group_alias: "test".to_string(),
+            provider_id: "provider".to_string(),
+            model_id: "model".to_string(),
+            prompt_tokens: 1_000_000,
+            output_tokens: 500_000,
+            latency_ms: 100,
+            status: "success".to_string(),
+            error_type: None,
+            input_cost_per_1m: None,
+            output_cost_per_1m: None,
+        };
+
+        let cost = event.calculate_cost();
+        assert_eq!(cost, 0.0);
     }
 }

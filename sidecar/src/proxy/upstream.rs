@@ -102,8 +102,10 @@ pub enum UpstreamError {
     Timeout,
 }
 
-pub fn create_client(timeout_secs: u64) -> Result<Client, reqwest::Error> {
+// No total timeout: streaming responses can run for minutes (reasoning/thinking).
+// Per-layer timeouts handle each phase: connect (below), TTFB (send_with_timeout), inter-chunk (TimeoutStream).
+pub fn create_client(_timeout_secs: u64) -> Result<Client, reqwest::Error> {
     Client::builder()
-        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .connect_timeout(std::time::Duration::from_secs(30))
         .build()
 }
