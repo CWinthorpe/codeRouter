@@ -53,4 +53,4 @@ npm run tauri build
 echo ""
 echo "=== Build complete ==="
 echo "AppImage output:"
-find "$PROJECT_ROOT/target/$TARGET/release/bundle/appimage/" -name "*.AppImage" 2>/dev/null || echo "No AppImage found — check build logs above."
+find "$PROJECT_ROOT/target/release/bundle/appimage/" -name "*.AppImage" 2>/dev/null || echo "No AppImage found — check build logs above."
