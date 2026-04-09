@@ -28,17 +28,17 @@ const PAGE_SIZE = 50;
 const FETCH_LIMIT = 1000;
 
 function startOfDay(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
 function endOfDay(d: Date): Date {
-  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
 }
 
 function formatDate(d: Date): string {
-  const year = d.getFullYear();
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
+  const year = d.getUTCFullYear();
+  const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
   return `${year}-${month}-${day}`;
 }
 
@@ -195,7 +195,7 @@ export default function UsageMetrics() {
       case 'last30':
         return { start: startOfDay(new Date(now.getTime() - 29 * 86400000)), end: endOfDay(now) };
       case 'custom':
-        return { start: startOfDay(new Date(customStart + 'T00:00:00')), end: endOfDay(new Date(customEnd + 'T23:59:59')) };
+        return { start: startOfDay(new Date(customStart + 'T00:00:00Z')), end: endOfDay(new Date(customEnd + 'T23:59:59Z')) };
     }
   }, [preset, customStart, customEnd]);
 

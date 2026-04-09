@@ -623,7 +623,7 @@ async fn process_response(
     let status = resp.status();
 
     if status.as_u16() == 429 {
-        let _ = resp.bytes().await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), resp.bytes()).await;
         return Err(RequestError::RateLimited);
     }
 
@@ -1000,6 +1000,8 @@ async fn handle_internal_router_set_entry(
                 state.groups.read().unwrap().as_ref().clone()
             });
             *state.groups.write().unwrap() = Arc::new(reloaded);
+            // The scheduler holds a clone of state.groups (same Arc<RwLock<...>>),
+            // so this write is visible on its next tick when it reads groups_clone.
             let reloaded_providers = load_providers().unwrap_or_else(|_| {
                 state.providers.read().unwrap().as_ref().clone()
             });
@@ -1086,7 +1088,14 @@ async fn handle_internal_config_reload(
         guard.entries.retain(|key, _| new_keys.contains(key));
     }
 
-    // Daily totals will be re-synced by the scheduler on the next quota check cycle.
+    match metrics_db::init_db() {
+        Ok(reload_conn) => {
+            router::init_daily_totals_from_db(&state.router_state, &new_providers, &reload_conn);
+        }
+        Err(e) => {
+            eprintln!("[config-reload] failed to reload daily totals: {e}");
+        }
+    }
 
     eprintln!("[config-reload] config reloaded successfully");
     Ok(Json(serde_json::json!({ "status": "ok" })))

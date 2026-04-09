@@ -415,6 +415,9 @@ pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::D
 #[tauri::command]
 pub fn get_usage_by_group(days: u32) -> Result<Vec<queries::GroupUsage>, String> {
     with_metrics_db(|conn| {
+        // reset_hour=0 (UTC midnight) is used because this function aggregates
+        // across ALL providers — no single provider's reset_hour applies.
+        // This is a cross-provider design limitation, not a bug.
         queries::get_usage_by_group(conn, days, 0)
             .map_err(|e| e.to_string())
     })
@@ -455,19 +458,19 @@ impl From<OpenCodeAgentMapping> for AgentMapping {
     }
 }
 
-fn build_entry_statuses() -> std::collections::HashMap<String, String> {
+async fn build_entry_statuses() -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let config = store::load_app_config().unwrap_or_default();
     let url = format!("http://{}:{}/internal/router/status", config.proxy_host, config.proxy_port);
-    let client = reqwest::blocking::Client::new();
-    let resp = match client.get(&url).timeout(std::time::Duration::from_secs(2)).send() {
+    let client = Client::new();
+    let resp = match client.get(&url).timeout(std::time::Duration::from_secs(2)).send().await {
         Ok(r) => r,
         Err(_) => return map,
     };
     if !resp.status().is_success() {
         return map;
     }
-    let body: serde_json::Value = match resp.json() {
+    let body: serde_json::Value = match resp.json().await {
         Ok(b) => b,
         Err(_) => return map,
     };
@@ -500,14 +503,14 @@ pub fn set_opencode_config_path(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
+pub async fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
     let groups = store::load_groups().unwrap_or_default();
     let providers = store::load_providers().unwrap_or_default();
-    let entry_statuses = build_entry_statuses();
+    let entry_statuses = build_entry_statuses().await;
 
     config_writer::inject_provider(&config_path, &groups, &providers, proxy_port, &entry_statuses)
         .map_err(|e| e.to_string())
@@ -544,10 +547,10 @@ pub fn remove_opencode_agent_models() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn preview_opencode_config(proxy_port: u16, mapping: Option<OpenCodeAgentMapping>) -> Result<String, String> {
+pub async fn preview_opencode_config(proxy_port: u16, mapping: Option<OpenCodeAgentMapping>) -> Result<String, String> {
     let groups = store::load_groups().unwrap_or_default();
     let providers = store::load_providers().unwrap_or_default();
-    let entry_statuses = build_entry_statuses();
+    let entry_statuses = build_entry_statuses().await;
 
     let agent_mapping = mapping.map(|m| m.into());
 
@@ -625,15 +628,14 @@ pub fn kill_sidecar(child: &mut Child) {
 
 fn sidecar_target_suffix() -> String {
     let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    let vendor = "unknown";
-    let env = match os {
-        "linux" => "gnu",
-        "macos" => "darwin",
-        "windows" => "msvc",
-        _ => "unknown",
+    let triple = if cfg!(target_os = "macos") {
+        format!("{arch}-apple-darwin")
+    } else if cfg!(target_os = "windows") {
+        format!("{arch}-pc-windows-msvc")
+    } else {
+        format!("{arch}-unknown-linux-gnu")
     };
-    format!("coderouter-proxy-{}-{}-{}-{}", arch, vendor, os, env)
+    format!("coderouter-proxy-{triple}")
 }
 
 pub fn spawn_sidecar() -> Result<Child, String> {
@@ -887,9 +889,9 @@ mod tests {
         assert!(bad_format.is_err());
     }
 
-    #[test]
-    fn test_build_entry_statuses_returns_empty_when_sidecar_unavailable() {
-        let statuses = build_entry_statuses();
+    #[tokio::test]
+    async fn test_build_entry_statuses_returns_empty_when_sidecar_unavailable() {
+        let statuses = build_entry_statuses().await;
         assert!(statuses.is_empty());
     }
 }

@@ -418,11 +418,59 @@ function RequestFeed() {
   );
 }
 
+function LiveMetricsCard() {
+  const recentStreamRequests = useStore((s) => s.recentStreamRequests);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const thirtySecondsAgo = (now / 1000) - 30;
+  const fiveSecondsAgo = (now / 1000) - 5;
+
+  const recent30s = recentStreamRequests.filter((r) => r.ts >= thirtySecondsAgo);
+  const recent5s = recentStreamRequests.filter((r) => r.ts >= fiveSecondsAgo);
+
+  const totalTokens30s = recent30s.reduce((sum, r) => sum + (r.prompt_tokens ?? 0) + (r.output_tokens ?? 0), 0);
+  const elapsed30s = recent30s.length > 0
+    ? Math.max(now / 1000 - Math.min(...recent30s.map((r) => r.ts)), 1)
+    : 30;
+  const tokensPerSecond = totalTokens30s / Math.min(elapsed30s, 30);
+  const activeStreams = recent5s.length;
+  const isActive = activeStreams > 0;
+
+  return (
+    <Card className="bg-zinc-900 border-zinc-800">
+      <CardContent className="flex items-center gap-6 p-4">
+        <div className="flex items-center gap-2">
+          <span
+            className={`inline-block h-2 w-2 rounded-full ${
+              isActive ? 'animate-pulse bg-green-400' : 'bg-zinc-600'
+            }`}
+          />
+          <span className="text-sm font-medium text-zinc-300">Live Metrics</span>
+        </div>
+        <div className="flex items-center gap-1 text-sm">
+          <span className="text-zinc-400">Throughput:</span>
+          <span className="font-mono text-zinc-100">{tokensPerSecond.toFixed(1)} tokens/s</span>
+        </div>
+        <div className="flex items-center gap-1 text-sm">
+          <span className="text-zinc-400">Active streams:</span>
+          <span className={`font-mono ${isActive ? 'text-green-400' : 'text-zinc-100'}`}>{activeStreams}</span>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Dashboard() {
   return (
     <div className="mx-auto max-w-7xl space-y-8">
       <ProxyStatusCard />
       <ProviderHealthCards />
+      <LiveMetricsCard />
       <RequestFeed />
     </div>
   );
