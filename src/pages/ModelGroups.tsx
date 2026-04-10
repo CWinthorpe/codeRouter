@@ -1034,6 +1034,19 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                         className="w-24 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                         min="1"
                       />
+                      <label className="mb-1 mt-3 block text-xs font-medium text-zinc-400">Cooldown after errors (ms)</label>
+                      <input
+                        type="number"
+                        value={failoverConfig.consecutiveErrorCooldownMs}
+                        onChange={(e) =>
+                          setFailoverConfig((c) => ({
+                            ...c,
+                            consecutiveErrorCooldownMs: Math.max(60000, Number(e.target.value)),
+                          }))
+                        }
+                        className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                        min="60000"
+                      />
                     </div>
                   )}
                   <ToggleRow
@@ -1064,23 +1077,6 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                           setFailoverConfig((c) => ({
                             ...c,
                             latencyTimeoutCooldownMs: Math.max(60000, Number(e.target.value)),
-                          }))
-                        }
-                        className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                        min="60000"
-                      />
-                    </div>
-                  )}
-                  {failoverConfig.onConsecutiveErrors && (
-                    <div className="ml-7">
-                      <label className="mb-1 block text-xs font-medium text-zinc-400">Cooldown after errors (ms)</label>
-                      <input
-                        type="number"
-                        value={failoverConfig.consecutiveErrorCooldownMs}
-                        onChange={(e) =>
-                          setFailoverConfig((c) => ({
-                            ...c,
-                            consecutiveErrorCooldownMs: Math.max(60000, Number(e.target.value)),
                           }))
                         }
                         className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
