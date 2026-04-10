@@ -510,6 +510,37 @@ pub fn is_group_alias_referenced(group_alias: &str) -> bool {
     false
 }
 
+pub fn get_current_agent_mapping(config_path: &Path) -> Result<AgentMapping> {
+    let config = read_config(config_path)?;
+    let obj = config.as_object().ok_or("Config is not an object")?;
+
+    let extract = |key: &str| -> Option<String> {
+        obj.get("agent")
+            .and_then(|a| a.get(key))
+            .and_then(|a| a.get("model"))
+            .and_then(|m| m.as_str())
+            .and_then(|s| s.strip_prefix("coderouter/"))
+            .map(|s| s.to_string())
+    };
+
+    let mut mapping = AgentMapping::default();
+    mapping.build = extract("build");
+    mapping.plan = extract("plan");
+    mapping.general = extract("general");
+    mapping.explore = extract("explore");
+    mapping.compaction = extract("compaction");
+    mapping.title = extract("title");
+    mapping.summary = extract("summary");
+
+    if let Some(serde_json::Value::String(small)) = obj.get("small_model") {
+        if let Some(alias) = small.strip_prefix("coderouter/") {
+            mapping.small_model = Some(alias.to_string());
+        }
+    }
+
+    Ok(mapping)
+}
+
 fn json_str(s: &str) -> serde_json::Value {
     serde_json::Value::String(s.to_string())
 }
@@ -1183,6 +1214,150 @@ mod tests {
         let limit = glm_model.get("limit").unwrap().as_object().unwrap();
         assert_eq!(limit.get("context").unwrap().as_u64().unwrap(), 64000);
         assert_eq!(limit.get("output").unwrap().as_u64().unwrap(), 4096);
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_get_current_agent_mapping_with_coderouter_assignments() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let config = serde_json::json!({
+            "model": "anthropic/claude-sonnet-4-5",
+            "agent": {
+                "build": { "model": "coderouter/glm-5-router" },
+                "plan": { "model": "coderouter/fast-model" },
+                "general": { "model": "coderouter/glm-5-router" },
+                "explore": { "model": "coderouter/fast-model" },
+                "compaction": { "model": "coderouter/small" },
+                "title": { "model": "coderouter/small" },
+                "summary": { "model": "coderouter/small" }
+            },
+            "small_model": "coderouter/fast-model"
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let mapping = get_current_agent_mapping(&config_path).unwrap();
+
+        assert_eq!(mapping.build, Some("glm-5-router".to_string()));
+        assert_eq!(mapping.plan, Some("fast-model".to_string()));
+        assert_eq!(mapping.general, Some("glm-5-router".to_string()));
+        assert_eq!(mapping.explore, Some("fast-model".to_string()));
+        assert_eq!(mapping.compaction, Some("small".to_string()));
+        assert_eq!(mapping.title, Some("small".to_string()));
+        assert_eq!(mapping.summary, Some("small".to_string()));
+        assert_eq!(mapping.small_model, Some("fast-model".to_string()));
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_get_current_agent_mapping_no_coderouter_assignments() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let config = serde_json::json!({
+            "model": "anthropic/claude-sonnet-4-5",
+            "agent": {
+                "build": { "model": "openai/gpt-4" },
+                "plan": { "model": "anthropic/claude" }
+            }
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let mapping = get_current_agent_mapping(&config_path).unwrap();
+
+        assert_eq!(mapping.build, None);
+        assert_eq!(mapping.plan, None);
+        assert_eq!(mapping.general, None);
+        assert_eq!(mapping.explore, None);
+        assert_eq!(mapping.compaction, None);
+        assert_eq!(mapping.title, None);
+        assert_eq!(mapping.summary, None);
+        assert_eq!(mapping.small_model, None);
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_get_current_agent_mapping_mixed_assignments() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let config = serde_json::json!({
+            "agent": {
+                "build": { "model": "coderouter/glm-5-router" },
+                "plan": { "model": "openai/gpt-4" },
+                "general": { "model": "coderouter/fast-model" }
+            }
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let mapping = get_current_agent_mapping(&config_path).unwrap();
+
+        assert_eq!(mapping.build, Some("glm-5-router".to_string()));
+        assert_eq!(mapping.plan, None);
+        assert_eq!(mapping.general, Some("fast-model".to_string()));
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_get_current_agent_mapping_small_model() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let config = serde_json::json!({
+            "small_model": "coderouter/fast-model",
+            "agent": {
+                "build": { "model": "coderouter/glm-5-router" }
+            }
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let mapping = get_current_agent_mapping(&config_path).unwrap();
+
+        assert_eq!(mapping.build, Some("glm-5-router".to_string()));
+        assert_eq!(mapping.small_model, Some("fast-model".to_string()));
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_get_current_agent_mapping_empty_config() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        fs::write(&config_path, "{}").unwrap();
+
+        let mapping = get_current_agent_mapping(&config_path).unwrap();
+
+        assert_eq!(mapping.build, None);
+        assert_eq!(mapping.plan, None);
+        assert_eq!(mapping.general, None);
+        assert_eq!(mapping.explore, None);
+        assert_eq!(mapping.compaction, None);
+        assert_eq!(mapping.title, None);
+        assert_eq!(mapping.summary, None);
+        assert_eq!(mapping.small_model, None);
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_get_current_agent_mapping_non_coderouter_small_model() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let config = serde_json::json!({
+            "small_model": "openai/gpt-4o-mini"
+        });
+        fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+        let mapping = get_current_agent_mapping(&config_path).unwrap();
+
+        assert_eq!(mapping.small_model, None);
 
         cleanup_test_dir(&test_dir);
     }
