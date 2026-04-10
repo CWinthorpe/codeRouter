@@ -516,6 +516,20 @@ Added `CooldownReason` enum to track WHY a provider entry was put in cooldown, d
 
 Test count: 138 sidecar tests passing (7 new), TypeScript clean.
 
+Released as v0.1.10: https://github.com/CWinthorpe/codeRouter/releases/tag/v0.1.10
+
+---
+
+## Failover UI Layout Fix (2026-04-10)
+
+The "Cooldown after errors (ms)" input in ModelGroups failover settings was rendered after the entire latency timeout section, making it appear to belong to the latency timeout settings. Moved it into the same conditional block as "Error threshold" so both fields sit directly under "Failover on consecutive errors".
+
+| Fix | Description |
+|-----|-------------|
+| fix-059 | Merged two separate `onConsecutiveErrors` conditional blocks into one; "Cooldown after errors" now adjacent to "Error threshold" |
+
+Files changed: ModelGroups.tsx
+
 ---
 
 ## Future Work (from plan.md "Open Questions")
