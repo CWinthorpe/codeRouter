@@ -279,18 +279,21 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
         })
         .map(|g| {
             let (context_window, max_output_tokens) = {
-                let mut found = (None, None);
-                let sorted_entries: Vec<_> = g
+                let mut resolved_context: Option<u64> = None;
+                let mut resolved_max_output: Option<u64> = None;
+
+                let mut sorted_entries: Vec<_> = g
                     .entries
                     .iter()
                     .enumerate()
                     .filter(|(_, e)| e.enabled)
-                    .map(|(idx, e)| (idx, e))
                     .collect();
-                let mut sorted_by_priority = sorted_entries.clone();
-                sorted_by_priority.sort_by_key(|(_, e)| e.priority);
+                sorted_entries.sort_by_key(|(_, e)| e.priority);
 
-                for (idx, entry) in sorted_by_priority {
+                for (idx, entry) in &sorted_entries {
+                    if resolved_context.is_some() && resolved_max_output.is_some() {
+                        break;
+                    }
                     let key = format!("{}:{}", entry.provider_id, idx);
                     let is_active = router_state.entries.get(&key)
                         .map(|es| es.status == router::EntryStatus::Active)
@@ -298,14 +301,18 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
 
                     if is_active {
                         if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id) {
-                            if let Some(model_meta) = provider.models.iter().find(|m| m.id == entry.model_id) {
-                                found = (model_meta.context_window, model_meta.max_output_tokens);
+                            if let Some((ctx, max_out)) = provider.resolve_model_meta(&entry.model_id) {
+                                if resolved_context.is_none() {
+                                    resolved_context = ctx;
+                                }
+                                if resolved_max_output.is_none() {
+                                    resolved_max_output = max_out;
+                                }
                             }
                         }
-                        break;
                     }
                 }
-                found
+                (resolved_context, resolved_max_output)
             };
 
             ModelObject {

@@ -532,6 +532,20 @@ Files changed: ModelGroups.tsx
 
 ---
 
+## Model Overrides Metadata Fallback Fix (2026-04-10)
+
+Model overrides (`provider.model_overrides`) were ignored when looking up context_window and max_output_tokens for OpenCode config writing and `/v1/models` proxy responses. Only `provider.models` was checked. Additionally, no fallback across group entries occurred — if the highest-priority entry had no metadata, the group got no `limit` block.
+
+| Fix | Description |
+|-----|-------------|
+| fix-062 | Added `Provider::resolve_model_meta()` method that merges metadata from both `models` and `model_overrides` (preferring overrides). Updated config_writer (inject_provider + preview_opencode_config) and server (handle_models) to walk all group entries in priority order, using first non-None metadata found. 7 new unit tests. |
+
+Files changed: models.rs, config_writer.rs, server.rs
+
+Test count: 144 sidecar tests passing (6 new), TypeScript clean.
+
+---
+
 ## Future Work (from plan.md "Open Questions")
 
 - Request caching for identical requests

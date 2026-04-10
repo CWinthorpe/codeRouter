@@ -194,26 +194,41 @@ pub fn inject_provider(
             .min_by_key(|(_, e)| e.priority)
             .map(|(_, e)| e);
 
-        if let Some(entry) = highest_active {
-            let provider = providers.iter().find(|p| p.id == entry.provider_id);
-
+        if let Some(_entry) = highest_active {
             let mut model_obj = serde_json::Map::new();
             model_obj.insert("name".to_string(), json_str(&group.display_name));
 
-            // Attach context/output limits when model metadata is available.
-            if let Some(provider) = provider {
-                if let Some(model_meta) = provider.models.iter().find(|m| m.id == entry.model_id) {
-                    let mut limit = serde_json::Map::new();
-                    if let Some(ctx) = model_meta.context_window {
-                        limit.insert("context".to_string(), json_num(ctx));
-                    }
-                    if let Some(out) = model_meta.max_output_tokens {
-                        limit.insert("output".to_string(), json_num(out));
-                    }
-                    if !limit.is_empty() {
-                        model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
+            let mut resolved_context: Option<u64> = None;
+            let mut resolved_max_output: Option<u64> = None;
+
+            let mut sorted_entries: Vec<_> = group.entries.iter().filter(|e| e.enabled).collect();
+            sorted_entries.sort_by_key(|e| e.priority);
+
+            for ent in &sorted_entries {
+                if resolved_context.is_some() && resolved_max_output.is_some() {
+                    break;
+                }
+                if let Some(provider) = providers.iter().find(|p| p.id == ent.provider_id) {
+                    if let Some((ctx, max_out)) = provider.resolve_model_meta(&ent.model_id) {
+                        if resolved_context.is_none() {
+                            resolved_context = ctx;
+                        }
+                        if resolved_max_output.is_none() {
+                            resolved_max_output = max_out;
+                        }
                     }
                 }
+            }
+
+            let mut limit = serde_json::Map::new();
+            if let Some(ctx) = resolved_context {
+                limit.insert("context".to_string(), json_num(ctx));
+            }
+            if let Some(out) = resolved_max_output {
+                limit.insert("output".to_string(), json_num(out));
+            }
+            if !limit.is_empty() {
+                model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
             }
 
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
@@ -231,7 +246,6 @@ pub fn inject_provider(
     });
 
     {
-        // Insert or replace the coderouter provider entry, preserving other providers.
         let obj = config.as_object_mut().unwrap();
         if let Some(serde_json::Value::Object(provider_obj)) = obj.get_mut("provider") {
             provider_obj.insert("coderouter".to_string(), coderouter_provider);
@@ -246,7 +260,6 @@ pub fn inject_provider(
     }
 
     write_config(config_path, &config)?;
-    // Cache the config so we can fall back if the original is removed.
     let _ = save_opencode_cache(config_path);
     Ok(())
 }
@@ -449,25 +462,41 @@ pub fn preview_opencode_config(
             .min_by_key(|(_, e)| e.priority)
             .map(|(_, e)| e);
 
-        if let Some(entry) = highest_active {
-            let provider = providers.iter().find(|p| p.id == entry.provider_id);
-
+        if let Some(_entry) = highest_active {
             let mut model_obj = serde_json::Map::new();
             model_obj.insert("name".to_string(), json_str(&group.display_name));
 
-            if let Some(provider) = provider {
-                if let Some(model_meta) = provider.models.iter().find(|m| m.id == entry.model_id) {
-                    let mut limit = serde_json::Map::new();
-                    if let Some(ctx) = model_meta.context_window {
-                        limit.insert("context".to_string(), json_num(ctx));
-                    }
-                    if let Some(out) = model_meta.max_output_tokens {
-                        limit.insert("output".to_string(), json_num(out));
-                    }
-                    if !limit.is_empty() {
-                        model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
+            let mut resolved_context: Option<u64> = None;
+            let mut resolved_max_output: Option<u64> = None;
+
+            let mut sorted_entries: Vec<_> = group.entries.iter().filter(|e| e.enabled).collect();
+            sorted_entries.sort_by_key(|e| e.priority);
+
+            for ent in &sorted_entries {
+                if resolved_context.is_some() && resolved_max_output.is_some() {
+                    break;
+                }
+                if let Some(provider) = providers.iter().find(|p| p.id == ent.provider_id) {
+                    if let Some((ctx, max_out)) = provider.resolve_model_meta(&ent.model_id) {
+                        if resolved_context.is_none() {
+                            resolved_context = ctx;
+                        }
+                        if resolved_max_output.is_none() {
+                            resolved_max_output = max_out;
+                        }
                     }
                 }
+            }
+
+            let mut limit = serde_json::Map::new();
+            if let Some(ctx) = resolved_context {
+                limit.insert("context".to_string(), json_num(ctx));
+            }
+            if let Some(out) = resolved_max_output {
+                limit.insert("output".to_string(), json_num(out));
+            }
+            if !limit.is_empty() {
+                model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
             }
 
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
@@ -1572,5 +1601,181 @@ mod tests {
         assert_eq!(reviewer.get("prompt").unwrap(), "Review code");
 
         cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_resolve_model_meta_base_only() {
+        let provider = Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com/v1".to_string(),
+            credential_key: "test".to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![ProviderModel {
+                id: "gpt-4".to_string(),
+                context_window: Some(128000),
+                max_output_tokens: Some(4096),
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }],
+            model_overrides: None,
+        };
+
+        let result = provider.resolve_model_meta("gpt-4");
+        assert_eq!(result, Some((Some(128000), Some(4096))));
+    }
+
+    #[test]
+    fn test_resolve_model_meta_override_only() {
+        let provider = Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com/v1".to_string(),
+            credential_key: "test".to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![],
+            model_overrides: Some(vec![ProviderModel {
+                id: "gpt-4".to_string(),
+                context_window: Some(96000),
+                max_output_tokens: Some(8192),
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }]),
+        };
+
+        let result = provider.resolve_model_meta("gpt-4");
+        assert_eq!(result, Some((Some(96000), Some(8192))));
+    }
+
+    #[test]
+    fn test_resolve_model_meta_both_override_fills_gaps() {
+        let provider = Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com/v1".to_string(),
+            credential_key: "test".to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![ProviderModel {
+                id: "gpt-4".to_string(),
+                context_window: Some(128000),
+                max_output_tokens: None,
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }],
+            model_overrides: Some(vec![ProviderModel {
+                id: "gpt-4".to_string(),
+                context_window: None,
+                max_output_tokens: Some(16384),
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }]),
+        };
+
+        let result = provider.resolve_model_meta("gpt-4");
+        assert_eq!(result, Some((Some(128000), Some(16384))));
+    }
+
+    #[test]
+    fn test_resolve_model_meta_override_takes_precedence() {
+        let provider = Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com/v1".to_string(),
+            credential_key: "test".to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![ProviderModel {
+                id: "gpt-4".to_string(),
+                context_window: Some(128000),
+                max_output_tokens: Some(4096),
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }],
+            model_overrides: Some(vec![ProviderModel {
+                id: "gpt-4".to_string(),
+                context_window: Some(96000),
+                max_output_tokens: Some(8192),
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }]),
+        };
+
+        let result = provider.resolve_model_meta("gpt-4");
+        assert_eq!(result, Some((Some(96000), Some(8192))));
+    }
+
+    #[test]
+    fn test_resolve_model_meta_neither() {
+        let provider = Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com/v1".to_string(),
+            credential_key: "test".to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![ProviderModel {
+                id: "gpt-4".to_string(),
+                context_window: None,
+                max_output_tokens: None,
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }],
+            model_overrides: None,
+        };
+
+        let result = provider.resolve_model_meta("gpt-4");
+        assert_eq!(result, Some((None, None)));
+    }
+
+    #[test]
+    fn test_resolve_model_meta_model_not_found() {
+        let provider = Provider {
+            id: "test".to_string(),
+            name: "Test".to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.test.com/v1".to_string(),
+            credential_key: "test".to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![],
+            model_overrides: None,
+        };
+
+        let result = provider.resolve_model_meta("nonexistent");
+        assert_eq!(result, None);
     }
 }
