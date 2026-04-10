@@ -3,15 +3,23 @@ use chrono::{NaiveDate, Utc};
 use rusqlite::Connection;
 use serde::Serialize;
 
+/// Aggregate counters for a single provider-day window.
 #[derive(Debug, Clone, Serialize)]
 pub struct DailySummary {
+    /// Total number of requests in the window (success + error).
     pub total_requests: i64,
+    /// Sum of prompt tokens across all requests.
     pub total_prompt_tokens: i64,
+    /// Sum of output tokens across all requests.
     pub total_output_tokens: i64,
+    /// Total estimated cost in USD.
     pub total_cost: f64,
+    /// Number of requests whose status was not `"success"`.
     pub error_count: i64,
 }
 
+/// A single row from the `requests` table, suitable for serialisation in API
+/// responses.
 #[derive(Debug, Clone, Serialize)]
 pub struct RequestRow {
     pub id: i64,
@@ -27,8 +35,10 @@ pub struct RequestRow {
     pub error_type: Option<String>,
 }
 
+/// Token usage and cost aggregated per calendar day.
 #[derive(Debug, Clone, Serialize)]
 pub struct DailyUsage {
+    /// Date string in `YYYY-MM-DD` format, adjusted for the provider's reset hour.
     pub date: String,
     pub total_requests: i64,
     pub total_prompt_tokens: i64,
@@ -36,6 +46,7 @@ pub struct DailyUsage {
     pub total_cost: f64,
 }
 
+/// Token usage and cost aggregated per router group alias.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupUsage {
     pub group_alias: String,
@@ -45,12 +56,28 @@ pub struct GroupUsage {
     pub total_cost: f64,
 }
 
+/// Returns a [`DailySummary`] for the given provider on a specific date.
+///
+/// The window is defined as `[date + reset_hour UTC, next_day + reset_hour UTC)`.
+/// This accounts for providers whose billing day starts at a non-midnight hour.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `provider_id` — Provider to filter on.
+/// - `date` — Calendar date for the summary window.
+/// - `reset_hour` — UTC hour at which the provider's daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
 pub fn get_daily_summary(
     conn: &Connection,
     provider_id: &str,
     date: NaiveDate,
     reset_hour: u32,
 ) -> Result<DailySummary> {
+    // Compute the timestamp boundaries of the provider-day window.
     let start_dt = date.and_hms_opt(reset_hour, 0, 0).unwrap().and_utc();
     let end_dt = date
         .succ_opt()
@@ -88,6 +115,17 @@ pub fn get_daily_summary(
     Ok(summary)
 }
 
+/// Returns the most recent `limit` requests across all providers, ordered by
+/// timestamp descending.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `limit` — Maximum number of rows to return.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
 pub fn get_recent_requests(conn: &Connection, limit: usize) -> Result<Vec<RequestRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, ts, group_alias, provider_id, model_id, prompt_tokens, output_tokens, cost_usd, latency_ms, status, error_type
@@ -116,6 +154,22 @@ pub fn get_recent_requests(conn: &Connection, limit: usize) -> Result<Vec<Reques
         .map_err(|e| anyhow::anyhow!("Failed to collect recent requests: {}", e))
 }
 
+/// Returns daily usage buckets for a specific provider over the last `days`
+/// days, aligned to the provider's quota reset hour.
+///
+/// Dates are shifted by `reset_hour` so that each bucket starts at the
+/// correct boundary rather than at midnight.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `provider_id` — Provider to filter on.
+/// - `days` — How many days back to include.
+/// - `reset_hour` — UTC hour at which the provider's daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
 pub fn get_usage_by_day(
     conn: &Connection,
     provider_id: &str,
@@ -130,6 +184,8 @@ pub fn get_usage_by_day(
         .and_utc()
         .timestamp();
 
+    // Shift timestamps by reset_hour so SQLite's DATE() groups rows
+    // into the correct provider-day bucket.
     let shift_secs = (reset_hour as i64) * 3600;
 
     let mut stmt = conn.prepare(
@@ -162,6 +218,20 @@ pub fn get_usage_by_day(
         .map_err(|e| anyhow::anyhow!("Failed to collect daily usage: {}", e))
 }
 
+/// Returns per-group aggregated usage over the last `days` days.
+///
+/// Unlike the per-provider queries, this aggregates across *all* providers
+/// belonging to each group alias.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `days` — How many days back to include.
+/// - `reset_hour` — UTC hour at which the daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
 pub fn get_usage_by_group(
     conn: &Connection,
     days: u32,
@@ -202,12 +272,30 @@ pub fn get_usage_by_group(
         .map_err(|e| anyhow::anyhow!("Failed to collect group usage: {}", e))
 }
 
+/// P50 and P95 latency values in milliseconds.
 #[derive(Debug, Clone, Serialize)]
 pub struct LatencyPercentiles {
+    /// 50th-percentile latency (median).
     pub p50: i64,
+    /// 95th-percentile latency.
     pub p95: i64,
 }
 
+/// Computes P50 and P95 latency percentiles for a given provider-day window.
+///
+/// Returns `None` when there are zero qualifying requests (i.e. no rows with
+/// `latency_ms > 0`) so callers can distinguish "no data" from "zero latency".
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `provider_id` — Provider to filter on.
+/// - `date` — Calendar date for the window.
+/// - `reset_hour` — UTC hour at which the provider's daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
 pub fn get_latency_percentiles(
     conn: &Connection,
     provider_id: &str,
@@ -224,6 +312,8 @@ pub fn get_latency_percentiles(
     let start_ts = start_dt.timestamp();
     let end_ts = end_dt.timestamp();
 
+    // Fetch all positive latencies sorted ascending so we can pick indices
+    // for percentile calculation without SQLite's percentile extension.
     let mut stmt = conn.prepare(
         "SELECT latency_ms FROM requests
          WHERE provider_id = ?1 AND ts >= ?2 AND ts < ?3 AND latency_ms > 0
@@ -243,6 +333,7 @@ pub fn get_latency_percentiles(
         return Ok(None);
     }
 
+    // Nearest-rank percentile: ceil(p * n) - 1 gives the 0-based index.
     let n = latencies.len();
     let p50_idx = (n as f64 * 0.50).ceil() as usize - 1;
     let p95_idx = (n as f64 * 0.95).ceil() as usize - 1;
@@ -253,6 +344,20 @@ pub fn get_latency_percentiles(
     }))
 }
 
+/// Returns total token usage (prompt + output) per provider for the current
+/// quota period, starting at the given `quota_reset_utc_hour`.
+///
+/// If the reset hour has not yet been reached today, the window starts at
+/// *yesterday*'s reset hour instead.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `quota_reset_utc_hour` — UTC hour at which the daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
 pub fn get_today_token_totals(
     conn: &Connection,
     quota_reset_utc_hour: u32,
@@ -263,6 +368,7 @@ pub fn get_today_token_totals(
         .and_hms_opt(quota_reset_utc_hour, 0, 0)
         .unwrap()
         .and_utc();
+    // If today's reset hasn't happened yet, use yesterday's reset as the start.
     let start_ts = if today_start <= now {
         today_start.timestamp()
     } else {
@@ -286,6 +392,18 @@ pub fn get_today_token_totals(
         .map_err(|e| anyhow::anyhow!("Failed to collect today's token totals: {}", e))
 }
 
+/// Returns total request counts per provider for the current quota period.
+///
+/// Uses the same time-window logic as [`get_today_token_totals`].
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `quota_reset_utc_hour` — UTC hour at which the daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
 pub fn get_today_request_counts(
     conn: &Connection,
     quota_reset_utc_hour: u32,
@@ -319,6 +437,20 @@ pub fn get_today_request_counts(
         .map_err(|e| anyhow::anyhow!("Failed to collect today's request counts: {}", e))
 }
 
+/// Returns the cumulative cost in USD for a specific provider over the last
+/// `days` days, aligned to the provider's quota reset hour.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `provider_id` — Provider to filter on.
+/// - `days` — How many days back to include.
+/// - `reset_hour` — UTC hour at which the daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query fails (returns `0.0` as a fallback if the
+/// query returns no rows).
 pub fn get_cost_summary(
     conn: &Connection,
     provider_id: &str,

@@ -3,23 +3,44 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
+/// A recorded API request event, carrying all data needed to persist it to the metrics store.
+///
+/// The optional `input_cost_per_1m` / `output_cost_per_1m` fields allow
+/// per-request cost calculation when pricing data is available from the
+/// provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestEvent {
+    /// Unix-epoch timestamp of the request.
     pub ts: i64,
+    /// Router group alias this request was routed through.
     pub group_alias: String,
+    /// Provider identifier (e.g. `"openai"`, `"anthropic"`).
     pub provider_id: String,
+    /// Model identifier within the provider (e.g. `"gpt-4o"`).
     pub model_id: String,
+    /// Number of tokens in the prompt / input.
     pub prompt_tokens: i64,
+    /// Number of tokens in the completion / output.
     pub output_tokens: i64,
+    /// Round-trip latency in milliseconds.
     pub latency_ms: i64,
+    /// Request outcome — `"success"` or `"error"`.
     pub status: String,
+    /// Error classification when the request failed (e.g. `"429"`).
     pub error_type: Option<String>,
+    /// Cost per 1M input tokens in USD, if known.
     pub input_cost_per_1m: Option<f64>,
+    /// Cost per 1M output tokens in USD, if known.
     pub output_cost_per_1m: Option<f64>,
 }
 
 impl RequestEvent {
+    /// Computes the total cost in USD for this request based on per-1M-token pricing.
+    ///
+    /// When either price component is `None`, its contribution is treated as zero —
+    /// this lets callers record requests even when pricing data is unavailable.
     pub fn calculate_cost(&self) -> f64 {
+        // Price is per 1M tokens, so divide token count by 1M before multiplying.
         let input_cost = match self.input_cost_per_1m {
             Some(cost) => (self.prompt_tokens as f64 / 1_000_000.0) * cost,
             None => 0.0,
@@ -32,19 +53,39 @@ impl RequestEvent {
     }
 }
 
+/// A non-blocking metrics recorder that sends [`RequestEvent`]s through a channel
+/// to a background tokio task for database insertion.
+///
+/// The recorder is clone-safe: the sender side can be shared across tasks.
 #[derive(Debug, Clone)]
 pub struct MetricsRecorder {
     sender: mpsc::Sender<RequestEvent>,
 }
 
 impl MetricsRecorder {
+    /// Creates a new recorder backed by the given connection.
+    ///
+    /// Spawns a background tokio task that drains the channel and inserts each
+    /// event into the database. The returned [`JoinHandle`] should **not** be
+    /// aborted lightly — dropping the [`MetricsRecorder`] (which closes the
+    /// channel) will cause the task to exit gracefully after all queued events
+    /// have been processed.
+    ///
+    /// # Returns
+    ///
+    /// A tuple of `(MetricsRecorder, JoinHandle)` where the handle represents
+    /// the background insertion task.
     pub fn new(conn: Connection) -> (Self, tokio::task::JoinHandle<()>) {
+        // Bounded channel prevents unbounded memory growth if the DB cannot keep up.
         let (tx, mut rx) = mpsc::channel::<RequestEvent>(1024);
 
         let handle = tokio::spawn(async move {
             let mut conn = conn;
+            // Drain events until the sender side is dropped, then exit.
             while let Some(event) = rx.recv().await {
                 let cost = event.calculate_cost();
+                // Errors during insertion are intentionally ignored — metrics
+                // are best-effort and must not crash the proxy.
                 let _ = insert_request(&mut conn, &event, cost);
             }
         });
@@ -52,6 +93,14 @@ impl MetricsRecorder {
         (Self { sender: tx }, handle)
     }
 
+    /// Enqueues a [`RequestEvent`] for asynchronous insertion.
+    ///
+    /// Awaits until the channel has capacity. Returns an error only if the
+    /// background task has already exited (channel closed).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the receiver has been dropped.
     pub async fn record_request(&self, event: RequestEvent) -> Result<()> {
         self.sender
             .send(event)
@@ -59,6 +108,15 @@ impl MetricsRecorder {
             .map_err(|_| anyhow::anyhow!("Metrics recorder channel closed"))
     }
 
+    /// Enqueues a [`RequestEvent`] without awaiting — suitable for call-sites
+    /// that are not in an async context and cannot block.
+    ///
+    /// If the channel is full, the event is dropped and an error is returned.
+    /// This prevents non-async callers from blocking when the DB falls behind.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the channel is full or closed.
     pub fn record_request_sync(&self, event: RequestEvent) -> Result<()> {
         self.sender
             .try_send(event)
@@ -70,6 +128,14 @@ impl MetricsRecorder {
     }
 }
 
+/// Inserts a single request row into the database.
+///
+/// This is the internal function used by the background recorder task. It
+/// executes a parameterised `INSERT` statement.
+///
+/// # Errors
+///
+/// Returns an error if the SQL execution fails.
 fn insert_request(conn: &mut Connection, event: &RequestEvent, cost: f64) -> Result<()> {
     conn.execute(
         "INSERT INTO requests (ts, group_alias, provider_id, model_id, prompt_tokens, output_tokens, cost_usd, latency_ms, status, error_type)
@@ -90,6 +156,13 @@ fn insert_request(conn: &mut Connection, event: &RequestEvent, cost: f64) -> Res
     Ok(())
 }
 
+/// Synchronous, single-threaded helper for inserting a [`RequestEvent`] directly
+/// into the database. Intended **only** for use in unit tests where the
+/// channel-based recorder is not available.
+///
+/// # Errors
+///
+/// Propagates any SQLite insert error.
 pub fn record_request_sync_for_test(conn: &mut Connection, event: &RequestEvent) -> Result<()> {
     let cost = event.calculate_cost();
     insert_request(conn, event, cost)

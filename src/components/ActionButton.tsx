@@ -1,3 +1,8 @@
+/**
+ * Compact icon+label button used in table rows and toolbar areas.
+ * Supports an optional `disabled` state that dims the button and
+ * blocks pointer events.
+ */
 export function ActionButton({
   icon,
   label,

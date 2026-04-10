@@ -8,6 +8,7 @@ import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@
 import { getAppConfig, saveAppConfig, clearMetricsData, resetAllConfig, restartProxy, getAppVersion } from '../lib/ipc';
 import type { AppConfig } from '../types';
 
+/** Options for the automatic model refresh interval dropdown. */
 const REFRESH_INTERVAL_OPTIONS: { label: string; value: number }[] = [
   { label: 'Every 12 hours', value: 12 },
   { label: 'Every 24 hours', value: 24 },
@@ -15,8 +16,15 @@ const REFRESH_INTERVAL_OPTIONS: { label: string; value: number }[] = [
   { label: 'Manual only', value: 0 },
 ];
 
+/** Available log verbosity levels. */
 const LOG_VERBOSITY_OPTIONS = ['Error', 'Info', 'Debug'];
 
+/**
+ * Settings page. Allows configuring proxy host/port, model refresh
+ * interval, log verbosity, and provides destructive actions for
+ * resetting usage data or all settings. Prompts a proxy restart when
+ * the listen address changes.
+ */
 export default function Settings() {
   const setAppConfig = useStore((s) => s.setAppConfig);
   const [form, setForm] = useState<AppConfig | null>(null);
@@ -56,11 +64,16 @@ export default function Settings() {
     load();
   }, [addToast]);
 
+  /** Generic field updater that patches a single key in the form state. */
   const updateField = <K extends keyof AppConfig>(key: K, value: AppConfig[K]) => {
     if (!form) return;
     setForm({ ...form, [key]: value });
   };
 
+  /**
+   * Validates the port number and persists the full form via IPC.
+   * Shows a restart banner if the proxy host or port changed.
+   */
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!form) return;
@@ -93,6 +106,7 @@ export default function Settings() {
     }
   };
 
+  /** Opens the proxy log file in the system's default text editor via Tauri's shell plugin. */
   const handleViewLogs = async () => {
     const { open } = await import('@tauri-apps/plugin-shell');
     const { homeDir, join } = await import('@tauri-apps/api/path');
@@ -105,6 +119,7 @@ export default function Settings() {
     }
   };
 
+  /** Prompts the user and, on confirmation, clears all usage/metrics data via IPC. */
   const handleResetUsageData = async () => {
     if (!confirm('Are you sure you want to reset all usage data? This will permanently delete all request metrics.')) {
       return;
@@ -117,6 +132,11 @@ export default function Settings() {
     }
   };
 
+  /**
+   * Prompts the user and, on confirmation, resets all configuration files
+   * (config.json, providers.json, groups.json) to empty defaults and
+   * reloads the store. Does NOT affect OpenCode config.
+   */
   const handleResetSettings = async () => {
     if (!confirm('Are you sure you want to reset all settings? This will clear providers, groups, and app config. OpenCode config will NOT be affected.')) {
       return;
@@ -137,6 +157,7 @@ export default function Settings() {
     }
   };
 
+  /** Restarts the proxy process via IPC and dismisses the restart banner. */
   const handleRestartProxy = async () => {
     setRestarting(true);
     try {

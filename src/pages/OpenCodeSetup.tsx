@@ -26,6 +26,7 @@ import {
 } from '../lib/ipc';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 
+/** Maps internal agent keys to human-readable labels for the UI. */
 const AGENT_LABELS: Record<string, string> = {
   build: 'Build agent',
   plan: 'Plan agent',
@@ -36,12 +37,21 @@ const AGENT_LABELS: Record<string, string> = {
   summary: 'Summary (system)',
 };
 
+/** User-facing agent keys that should have dropdowns in the UI. */
 const AGENT_KEYS = ['build', 'plan', 'general', 'explore'] as const;
 
+/** Creates a blank agent mapping object with all fields set to null. */
 function emptyMapping(): OpenCodeAgentMapping {
   return { build: null, plan: null, general: null, explore: null, compaction: null, title: null, summary: null, small_model: null };
 }
 
+/**
+ * OpenCode setup page. Allows users to:
+ * - Detect or manually set the OpenCode config path
+ * - Toggle CodeRouter as a provider in OpenCode config
+ * - Assign model groups to OpenCode agents (build, plan, etc.)
+ * - Preview and apply the resulting JSON configuration
+ */
 export default function OpenCodeSetup() {
   const groups = useStore((s) => s.groups);
   const appConfig = useStore((s) => s.appConfig);
@@ -78,6 +88,7 @@ export default function OpenCodeSetup() {
     detectPath();
   }, []);
 
+  /** Tries to auto-detect the OpenCode config path via IPC and updates state. */
   const detectPath = useCallback(async () => {
     try {
       const path = await getOpencodeConfigPath();
@@ -91,6 +102,7 @@ export default function OpenCodeSetup() {
   }, []);
 
   // Build mapping object for preview (convert empty strings to null)
+  // so the preview reflects what will actually be written to config.
   const mappingForPreview = useCallback((): OpenCodeAgentMapping => {
     return {
       build: mapping.build || null,
@@ -104,6 +116,7 @@ export default function OpenCodeSetup() {
     };
   }, [mapping]);
 
+  /** Fetches a JSON preview of the OpenCode config with current settings applied. */
   const fetchPreview = useCallback(async () => {
     setPreviewLoading(true);
     try {
@@ -118,7 +131,8 @@ export default function OpenCodeSetup() {
     }
   }, [mappingForPreview, proxyPort]);
 
-  // Debounced preview update
+  // Debounced preview update: waits 500ms after the last mapping/port
+  // change before fetching the preview to avoid excessive IPC calls.
   useEffect(() => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
@@ -129,7 +143,8 @@ export default function OpenCodeSetup() {
     };
   }, [mapping, proxyPort, fetchPreview]);
 
-  // Check if provider is already enabled on mount
+  // Check if CodeRouter is already configured as a provider in the
+  // OpenCode config by parsing the preview JSON on mount.
   useEffect(() => {
     const checkProviderStatus = async () => {
       try {
@@ -143,7 +158,8 @@ export default function OpenCodeSetup() {
     checkProviderStatus();
   }, [proxyPort]);
 
-  // Load current agent assignments on mount
+  // Load the current agent→model assignments from OpenCode config on mount
+  // so the dropdowns show the persisted values.
   useEffect(() => {
     const loadAgentModels = async () => {
       try {
@@ -165,6 +181,7 @@ export default function OpenCodeSetup() {
     loadAgentModels();
   }, []);
 
+  /** Toggles CodeRouter as a provider in the OpenCode config (inject or remove). */
   const handleToggleProvider = useCallback(async () => {
     setTogglingProvider(true);
     try {
@@ -184,10 +201,12 @@ export default function OpenCodeSetup() {
     }
   }, [providerEnabled, proxyPort, addToast]);
 
+  /** Updates a single agent→group mapping key, converting empty strings to null. */
   const handleMappingChange = useCallback((key: keyof OpenCodeAgentMapping, value: string) => {
     setMapping((prev) => ({ ...prev, [key]: value || null }));
   }, []);
 
+  /** Persists the current agent mapping to the OpenCode config file via IPC. */
   const handleApplyMapping = useCallback(async () => {
     setApplyingMapping(true);
     try {
@@ -201,6 +220,7 @@ export default function OpenCodeSetup() {
     }
   }, [mappingForPreview, addToast]);
 
+  /** Removes all agent model assignments from the OpenCode config and resets the form. */
   const handleClearMapping = useCallback(async () => {
     setClearingMapping(true);
     try {
@@ -442,6 +462,7 @@ export default function OpenCodeSetup() {
   );
 }
 
+/** Simple section card wrapper providing consistent styling for each config section. */
 function SectionCard({ children }: { children: React.ReactNode }) {
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900/60 p-5">{children}</div>

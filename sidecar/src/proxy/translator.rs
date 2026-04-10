@@ -1,3 +1,11 @@
+//! Protocol translator between OpenAI and Anthropic API formats.
+//!
+//! Handles:
+//! - Converting OpenAI chat-completion requests to Anthropic `/messages` format.
+//! - Converting Anthropic `/messages` responses back to OpenAI format.
+//! - Real-time SSE stream translation (Anthropic events → OpenAI chunks).
+//! - Token counting for OpenAI streams that don't report `usage`.
+
 use bytes::Bytes;
 use futures::Stream;
 use serde::{Deserialize, Serialize};
@@ -7,12 +15,14 @@ use std::task::{Context, Poll};
 
 // ── Anthropic request types ──
 
+/// A single message in an Anthropic request.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AnthropicMessage {
     pub role: String,
     pub content: serde_json::Value,
 }
 
+/// Anthropic `/messages` request body.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MessagesRequest {
     pub model: String,
@@ -30,6 +40,7 @@ pub struct MessagesRequest {
 
 // ── Anthropic response types ──
 
+/// A content block inside an Anthropic response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AnthropicContentBlock {
     #[serde(default)]
@@ -38,12 +49,14 @@ pub struct AnthropicContentBlock {
     pub content_type: String,
 }
 
+/// Token usage reported by the Anthropic API.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AnthropicUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
 
+/// Anthropic `/messages` non-streaming response body.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MessagesResponse {
     pub id: String,
@@ -61,12 +74,14 @@ pub struct MessagesResponse {
 
 // ── OpenAI response types ──
 
+/// A message inside an OpenAI chat-completion response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OpenAIMessage {
     pub role: String,
     pub content: String,
 }
 
+/// A single choice inside an OpenAI chat-completion response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OpenAIChoice {
     pub index: u32,
@@ -75,6 +90,7 @@ pub struct OpenAIChoice {
     pub finish_reason: String,
 }
 
+/// Token usage returned in an OpenAI chat-completion response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OpenAIUsage {
     pub prompt_tokens: u64,
@@ -82,6 +98,7 @@ pub struct OpenAIUsage {
     pub total_tokens: u64,
 }
 
+/// OpenAI non-streaming chat-completion response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatCompletionResponse {
     pub id: String,
@@ -94,6 +111,7 @@ pub struct ChatCompletionResponse {
 
 // ── OpenAI streaming chunk types ──
 
+/// Delta content inside an OpenAI streaming chunk.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OpenAIChunkDelta {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -102,6 +120,7 @@ pub struct OpenAIChunkDelta {
     pub content: Option<String>,
 }
 
+/// A single choice inside an OpenAI streaming chunk.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct OpenAIChunkChoice {
     pub index: u32,
@@ -110,6 +129,7 @@ pub struct OpenAIChunkChoice {
     pub finish_reason: Option<String>,
 }
 
+/// OpenAI streaming chat-completion chunk.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatCompletionChunk {
     pub id: String,
@@ -120,6 +140,7 @@ pub struct ChatCompletionChunk {
 
 // ── Anthropic streaming event types ──
 
+/// An SSE event from the Anthropic streaming API.
 #[derive(Deserialize, Debug)]
 pub struct AnthropicStreamEvent {
     #[serde(rename = "type")]
@@ -136,6 +157,13 @@ pub struct AnthropicStreamEvent {
 
 // ── Translation functions ──
 
+/// Converts an OpenAI-format request body into an Anthropic `/messages`
+/// request body.
+///
+/// - `"system"` messages are merged into the Anthropic `system` field.
+/// - `"user"` and `"assistant"` messages are passed through.
+/// - `max_tokens` defaults to 4096 if not specified (Anthropic requires it).
+/// - Other OpenAI-only fields (`n`, `logprobs`, etc.) are silently dropped.
 pub fn openai_to_anthropic(
     openai_body: &serde_json::Value,
     upstream_model: &str,
@@ -199,6 +227,17 @@ pub fn openai_to_anthropic(
     }
 }
 
+/// Converts an Anthropic `/messages` response into an OpenAI
+/// `chat.completion` response.
+///
+/// Maps Anthropic stop reasons:
+/// - `"end_turn"` → `"stop"`
+/// - `"max_tokens"` → `"length"`
+/// - `"stop_sequence"` → `"stop"`
+/// - `"tool_use"` → `"tool_calls"`
+///
+/// The `model` field is set to `group_alias` so the client sees the
+/// original alias, not the upstream model name.
 pub fn anthropic_to_openai(
     anthropic_resp: &MessagesResponse,
     group_alias: &str,
@@ -244,11 +283,18 @@ pub fn anthropic_to_openai(
 
 // ── Streaming SSE translator ──
 
+/// Accumulated token counts during stream processing.
 pub struct StreamTokenCounts {
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
 
+/// SSE stream translator that converts Anthropic streaming events into
+/// OpenAI-compatible SSE chunks in real time.
+///
+/// Reads raw bytes from the inner stream, line-buffers SSE `data:` lines,
+/// and emits translated OpenAI chunks. Tracks token counts from
+/// `message_start` and `message_delta` events.
 pub struct AnthropicToOpenAIStream<S> {
     inner: S,
     group_alias: String,
@@ -258,8 +304,11 @@ pub struct AnthropicToOpenAIStream<S> {
     token_counts: Arc<Mutex<StreamTokenCounts>>,
 }
 
+/// Internal state machine for [`AnthropicToOpenAIStream`].
 enum StreamState {
+    /// Waiting for more data from the inner stream.
     Waiting,
+    /// Stream has ended; `poll_next` will return `None`.
     Done,
 }
 
@@ -267,6 +316,14 @@ impl<S> AnthropicToOpenAIStream<S>
 where
     S: Stream<Item = Result<bytes::Bytes, std::io::Error>>,
 {
+    /// Creates a new stream translator.
+    ///
+    /// # Arguments
+    ///
+    /// * `inner` — The raw byte stream from the Anthropic SSE endpoint.
+    /// * `group_alias` — Model alias used in `model` fields of output chunks.
+    /// * `token_counts` — Shared counter updated with `input_tokens` and
+    ///   `output_tokens` as they are observed in the stream.
     pub fn new(inner: S, group_alias: String, token_counts: Arc<Mutex<StreamTokenCounts>>) -> Self {
         Self {
             inner,
@@ -278,6 +335,8 @@ where
         }
     }
 
+    /// Translates a single Anthropic SSE event data payload to an
+    /// OpenAI-format SSE line, or `None` if the event should be skipped.
     fn translate_event(&mut self, data: &str) -> Option<String> {
         let event: AnthropicStreamEvent = match serde_json::from_str(data) {
             Ok(e) => e,
@@ -381,6 +440,8 @@ where
     }
 }
 
+/// [`Stream`] implementation that reads Anthropic SSE bytes and yields
+/// translated OpenAI SSE bytes.
 impl<S> Stream for AnthropicToOpenAIStream<S>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
@@ -454,6 +515,11 @@ where
     }
 }
 
+/// Wraps an Anthropic stream into an [`axum::body::Body`] that yields
+/// translated OpenAI SSE chunks.
+///
+/// Returns a tuple of `(body, token_counts)` so the caller can read final
+/// counts after the stream completes.
 pub fn translate_anthropic_stream<S>(
     stream: S,
     group_alias: String,
@@ -474,6 +540,9 @@ where
     (body, token_counts)
 }
 
+/// Pass-through SSE stream that parses OpenAI streaming chunks to extract
+/// token usage information from `usage` fields. The raw bytes are forwarded
+/// unchanged; only token counts are updated as a side effect.
 pub struct OpenAIStreamTracker<S> {
     inner: S,
     buffer: Vec<u8>,
@@ -482,6 +551,7 @@ pub struct OpenAIStreamTracker<S> {
 }
 
 impl<S> OpenAIStreamTracker<S> {
+    /// Creates a new tracker wrapping the given inner SSE stream.
     pub fn new(inner: S, token_counts: Arc<Mutex<StreamTokenCounts>>) -> Self {
         Self {
             inner,
@@ -491,6 +561,9 @@ impl<S> OpenAIStreamTracker<S> {
         }
     }
 
+    /// Parses a single SSE `data:` payload for `usage` and `choices` fields,
+    /// updating `token_counts` accordingly. If no `usage` block is present,
+    /// estimates output tokens from delta text length.
     fn parse_sse_chunk(&mut self, data: &str) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
             if let Some(usage) = json.get("usage") {
@@ -525,6 +598,11 @@ impl<S> OpenAIStreamTracker<S> {
     }
 }
 
+/// [`Stream`] implementation for OpenAI stream tracking.
+///
+/// Buffers incoming bytes line-by-line, parses `usage` from each SSE
+/// `data:` line, and forwards all bytes unchanged to the downstream
+/// consumer.
 impl<S> Stream for OpenAIStreamTracker<S>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
@@ -603,15 +681,19 @@ where
     }
 }
 
-// Crude heuristic: ~4 characters per token for English text.
-// This is acceptable for estimation purposes (e.g. output token
-// counting in streams where the provider does not report usage).
-// Actual token counts from the provider should be preferred when available.
+/// Crude heuristic: ~4 characters per token for English text.
+/// This is acceptable for estimation purposes (e.g. output token
+/// counting in streams where the provider does not report usage).
+/// Actual token counts from the provider should be preferred when available.
 fn estimate_tokens_from_text(text: &str) -> u64 {
     let char_count = text.chars().count() as u64;
     char_count.saturating_div(4).max(1)
 }
 
+/// Wraps an OpenAI-compatible SSE stream, tracking token counts from
+/// `usage` fields in the stream chunks.
+///
+/// Returns a tuple of `(body, token_counts)`.
 pub fn translate_openai_stream<S>(
     stream: S,
     token_counts: Arc<Mutex<StreamTokenCounts>>,
@@ -633,6 +715,8 @@ where
 
 // ── HTTP headers helper ──
 
+/// Returns the HTTP headers required for authenticating with the Anthropic
+/// Messages API: `x-api-key`, `anthropic-version`, and `content-type`.
 pub fn anthropic_headers(api_key: &str) -> Vec<(String, String)> {
     vec![
         ("x-api-key".to_string(), api_key.to_string()),
@@ -643,6 +727,7 @@ pub fn anthropic_headers(api_key: &str) -> Vec<(String, String)> {
 
 // ── UUID helper ──
 
+/// Generates a short UUID for use in OpenAI-compatible response IDs.
 fn uuid_short() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }

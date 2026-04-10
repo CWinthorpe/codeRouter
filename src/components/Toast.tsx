@@ -1,5 +1,9 @@
 import { CheckCircle2, XCircle } from 'lucide-react';
 
+/**
+ * Simple ephemeral toast notification shown after user actions.
+ * Renders a styled bar with an icon — checkmark for success, X for error.
+ */
 export function Toast({ type, message }: { type: 'success' | 'error'; message: string }) {
   const bgColor = type === 'success' ? 'bg-emerald-600' : 'bg-red-600';
   const icon = type === 'success' ? <CheckCircle2 className="h-4 w-4" /> : <XCircle className="h-4 w-4" />;

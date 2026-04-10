@@ -7,12 +7,22 @@ import { useMetricsStream } from '../hooks/useMetricsStream';
 import { Onboarding } from './Onboarding';
 import { dismissOnboarding } from '../lib/ipc';
 
+/**
+ * Top-level layout shell for the application.
+ * Renders the sidebar, main content area, and conditionally shows the
+ * first-run onboarding overlay when no providers or groups are configured
+ * and the user hasn't dismissed it yet.
+ */
 export function AppShell({ children }: { children: React.ReactNode }) {
   const loadInitialData = useStore((s) => s.loadInitialData);
   const providers = useStore((s) => s.providers);
   const groups = useStore((s) => s.groups);
   const appConfig = useStore((s) => s.appConfig);
+
+  // Track whether to show the onboarding dialog separately so dismissal persists
   const [showOnboarding, setShowOnboarding] = useState(false);
+
+  // Kick off periodic proxy health checks and live metrics via SSE
   useProxyStatusPoll();
   useMetricsStream();
 
@@ -20,17 +30,20 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     loadInitialData();
   }, [loadInitialData]);
 
+  // Show onboarding when first-run conditions are met: config loaded but
+  // onboarding not yet dismissed AND no providers/groups exist yet
   useEffect(() => {
     if (appConfig) {
       setShowOnboarding(!appConfig.onboarding_dismissed && (providers.length === 0 || groups.length === 0));
     }
   }, [appConfig, providers.length, groups.length]);
 
+  /** Persist onboarding dismissal via IPC so it survives restarts */
   const handleDismissOnboarding = async () => {
     try {
       await dismissOnboarding();
     } catch {
-      // IPC may fail
+      // IPC may fail if the backend isn't ready yet
     }
     setShowOnboarding(false);
   };
@@ -50,6 +63,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   );
 }
 
+/** Application sidebar with navigation links organized by feature area. */
 function Sidebar() {
   return (
     <aside className="flex w-56 flex-col border-r border-zinc-800 bg-zinc-900 p-3">
@@ -69,12 +83,18 @@ function Sidebar() {
   );
 }
 
+/** Green/red indicator dot showing whether the proxy process is running. */
 function StatusDot() {
   const status = useStore((s) => s.proxyStatus);
+  // Green when proxy is running, red otherwise to signal a problem
   const color = status === 'running' ? 'bg-green-500' : 'bg-red-500';
   return <div className={`h-2.5 w-2.5 rounded-full ${color}`} />;
 }
 
+/**
+ * Individual sidebar navigation item with active-state highlighting.
+ * Uses the current route path to determine which item is highlighted.
+ */
 function SidebarItem({
   to,
   icon: Icon,

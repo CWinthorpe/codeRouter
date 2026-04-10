@@ -1,3 +1,13 @@
+//! Credential storage backed by the OS secret service with an encrypted
+//! file fallback.
+//!
+//! On Linux the primary store is the Secret Service (GNOME Keyring / KDE
+//! Wallet) accessed via the `secret-service` crate. When the daemon is not
+//! available (e.g. headless CI, SSH sessions) the module transparently falls
+//! back to `~/.config/coderouter/credentials.json` with 0600 permissions.
+//!
+//! All public functions are async because the secret-service calls are async.
+
 use secret_service::{EncryptionType, SecretService};
 use std::collections::HashMap;
 use std::fs;
@@ -6,9 +16,14 @@ use std::path::PathBuf;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Secret Service collection name used to group all coderouter credentials.
 const SERVICE_NAME: &str = "coderouter";
+
+/// Attribute key under which the `provider_id` is stored in each secret item.
 const ATTRIBUTE_KEY: &str = "provider_id";
 
+/// Returns the path to the fallback credentials file
+/// (`~/.config/coderouter/credentials.json`).
 fn fallback_path() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("coderouter");
@@ -16,15 +31,24 @@ fn fallback_path() -> PathBuf {
     path
 }
 
+/// Reads the fallback credentials file and deserialises it into a `HashMap`.
+///
+/// Returns an empty map if the file does not exist or contains invalid JSON,
+/// so callers always get a valid (possibly empty) map.
 fn read_fallback_file() -> HashMap<String, String> {
     let path = fallback_path();
     let data = match fs::read_to_string(&path) {
         Ok(d) => d,
+        // File missing — return empty map
         Err(_) => return HashMap::new(),
     };
     serde_json::from_str(&data).unwrap_or_default()
 }
 
+/// Serialises and writes the credential map to the fallback file with 0600
+/// permissions.
+///
+/// Creates the parent directory if it does not already exist.
 fn write_fallback_file(map: &HashMap<String, String>) -> Result<()> {
     let path = fallback_path();
     if let Some(parent) = path.parent() {
@@ -34,10 +58,15 @@ fn write_fallback_file(map: &HashMap<String, String>) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(map)?;
     fs::write(&path, &json)?;
+    // Restrict file to owner-only to protect API keys
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
+/// Attempts to store `api_key` under `provider_id` in the Secret Service.
+///
+/// Connects to the D-Bus secret service, opens the default collection, and
+/// creates (or updates) an item keyed by the provider ID.
 async fn try_store_secret_service(provider_id: &str, api_key: &str) -> Result<()> {
     let ss = SecretService::connect(EncryptionType::Dh).await?;
     let collection = ss.get_default_collection().await?;
@@ -57,6 +86,10 @@ async fn try_store_secret_service(provider_id: &str, api_key: &str) -> Result<()
     Ok(())
 }
 
+/// Attempts to retrieve the API key for `provider_id` from the Secret Service.
+///
+/// Returns the stored secret as a UTF-8 string, or an error if the item is
+/// not found or the secret service is unavailable.
 async fn try_get_secret_service(provider_id: &str) -> Result<String> {
     let ss = SecretService::connect(EncryptionType::Dh).await?;
     let collection = ss.get_default_collection().await?;
@@ -72,6 +105,9 @@ async fn try_get_secret_service(provider_id: &str) -> Result<String> {
     String::from_utf8(secret).map_err(|e| e.into())
 }
 
+/// Attempts to delete the credential for `provider_id` from the Secret Service.
+///
+/// Silently succeeds if the item does not exist (deletion is idempotent).
 async fn try_delete_secret_service(provider_id: &str) -> Result<()> {
     let ss = SecretService::connect(EncryptionType::Dh).await?;
     let collection = ss.get_default_collection().await?;
@@ -87,6 +123,11 @@ async fn try_delete_secret_service(provider_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stores an API key for the given provider.
+///
+/// Tries the Secret Service first; on failure falls back to the local
+/// credentials file. A warning is printed to stderr when the fallback path
+/// is taken.
 pub async fn store_credential(provider_id: &str, api_key: &str) -> Result<()> {
     match try_store_secret_service(provider_id, api_key).await {
         Ok(()) => Ok(()),
@@ -100,6 +141,11 @@ pub async fn store_credential(provider_id: &str, api_key: &str) -> Result<()> {
     }
 }
 
+/// Retrieves the API key for the given provider.
+///
+/// Tries the Secret Service first; on failure falls back to the local
+/// credentials file. Returns an error if the credential is not found in
+/// either store.
 pub async fn get_credential(provider_id: &str) -> Result<String> {
     match try_get_secret_service(provider_id).await {
         Ok(val) => Ok(val),
@@ -113,6 +159,11 @@ pub async fn get_credential(provider_id: &str) -> Result<String> {
     }
 }
 
+/// Deletes the credential for the given provider.
+///
+/// Tries the Secret Service first; on failure falls back to the local
+/// credentials file. Deletion from the file fallback removes the entry and
+/// rewrites the file.
 pub async fn delete_credential(provider_id: &str) -> Result<()> {
     match try_delete_secret_service(provider_id).await {
         Ok(()) => Ok(()),

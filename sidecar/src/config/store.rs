@@ -1,3 +1,13 @@
+//! Atomic, file-locked JSON configuration store.
+//!
+//! All reads go through [`read_locked`] which acquires a shared lock, and all
+//! writes go through [`atomic_write`] which writes to a temp file and renames
+//! it into place. This ensures concurrent processes never see a half-written
+//! config file.
+//!
+//! Each public function returns a [`Result`] that boxes the error so callers
+//! don't need to juggle multiple error types.
+
 use std::fs;
 use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -9,12 +19,17 @@ use crate::config::models::{AppConfig, Group, Provider};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Returns the coderouter configuration directory (`~/.config/coderouter/`).
+///
+/// Falls back to `./coderouter` when the OS config directory cannot be
+/// determined (e.g. in minimal containers).
 fn config_dir() -> PathBuf {
     let mut path = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     path.push("coderouter");
     path
 }
 
+/// Creates the coderouter config directory if it does not already exist.
 fn ensure_config_dir() -> Result<()> {
     let dir = config_dir();
     if !dir.exists() {
@@ -23,15 +38,28 @@ fn ensure_config_dir() -> Result<()> {
     Ok(())
 }
 
+/// Appends `name` to the config directory path, producing a full file path.
 fn config_file(name: &str) -> PathBuf {
     let mut path = config_dir();
     path.push(name);
     path
 }
 
+/// Writes `content` to `path` atomically.
+///
+/// The write proceeds by:
+/// 1. Writing to a temp file suffixed with the current PID,
+/// 2. acquiring an exclusive flock,
+/// 3. flushing and fsync-ing,
+/// 4. setting 0600 permissions,
+/// 5. renaming into the final location.
+///
+/// If the write fails at any step the temp file is removed so no partial
+/// artefacts remain.
 fn atomic_write(path: &Path, content: &str) -> Result<()> {
     let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
 
+    // Ensure the parent directory exists before opening the temp file
     if let Some(parent) = path.parent() {
         if !parent.exists() {
             fs::create_dir_all(parent)?;
@@ -50,6 +78,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
         file.flush()?;
         file.sync_all()?;
 
+        // Owner-only permissions keep API keys private on multi-user systems
         let mut perms = file.metadata()?.permissions();
         perms.set_mode(0o600);
         file.set_permissions(perms)?;
@@ -58,7 +87,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 
         fs::rename(&tmp_path, path)?;
 
-        // Ensure the final file also has 0600 permissions (rename preserves perms, but be explicit)
+        // rename preserves permissions on most Unix systems, but be explicit
         if let Ok(metadata) = fs::metadata(path) {
             let mut perms = metadata.permissions();
             perms.set_mode(0o600);
@@ -68,6 +97,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
         Ok(())
     })();
 
+    // Clean up the temp file if anything went wrong
     if write_result.is_err() {
         let _ = fs::remove_file(&tmp_path);
     }
@@ -75,6 +105,10 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
     write_result
 }
 
+/// Reads the entire contents of `path` under a shared file lock.
+///
+/// The shared lock guarantees that a concurrent writer using
+/// [`atomic_write`] won't swap the file out from under us.
 fn read_locked(path: &Path) -> Result<String> {
     let mut file = fs::OpenOptions::new().read(true).open(path)?;
 
@@ -86,6 +120,12 @@ fn read_locked(path: &Path) -> Result<String> {
     Ok(contents)
 }
 
+/// Reads a JSON file under a shared lock and deserialises it into `T`.
+///
+/// # Errors
+///
+/// Returns an error if the file does not exist, cannot be read, or contains
+/// invalid JSON.
 fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     if !path.exists() {
         return Err(format!("Config file not found: {}", path.display()).into());
@@ -95,32 +135,55 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     Ok(value)
 }
 
+/// Serialises `value` as pretty-printed JSON and writes it atomically to `path`.
 fn write_json<T: serde::Serialize + ?Sized>(path: &Path, value: &T) -> Result<()> {
     let content = serde_json::to_string_pretty(value)?;
     atomic_write(path, &content)
 }
 
+/// Returns the path to `providers.json` inside the config directory.
 pub fn providers_path() -> PathBuf {
     config_file("providers.json")
 }
 
+/// Returns the path to `groups.json` inside the config directory.
 pub fn groups_path() -> PathBuf {
     config_file("groups.json")
 }
 
+/// Returns the path to `config.json` inside the config directory.
 pub fn app_config_path() -> PathBuf {
     config_file("config.json")
 }
 
+/// Loads the list of providers from the on-disk JSON file.
+///
+/// # Errors
+///
+/// Returns an error if the file is missing or contains invalid JSON.
 pub fn load_providers() -> Result<Vec<Provider>> {
     read_json(&providers_path())
 }
 
+/// Saves the list of providers to the on-disk JSON file atomically.
+///
+/// Creates the config directory if necessary.
 pub fn save_providers(providers: &[Provider]) -> Result<()> {
     ensure_config_dir()?;
     write_json(&providers_path(), providers)
 }
 
+/// Atomically reads, modifies, and writes the providers list under an
+/// exclusive file lock.
+///
+/// The closure `f` receives a mutable reference to the current providers
+/// vector (which may be empty if the file did not previously exist). After
+/// `f` returns the modified list is serialised back to disk in-place.
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, read, serialised, or
+/// written.
 pub fn update_providers_with_lock<F: FnOnce(&mut Vec<Provider>)>(f: F) -> Result<()> {
     let path = providers_path();
     ensure_config_dir()?;
@@ -136,6 +199,7 @@ pub fn update_providers_with_lock<F: FnOnce(&mut Vec<Provider>)>(f: F) -> Result
     let mut contents = String::new();
     file.read_to_string(&mut contents)?;
 
+    // An empty file means no providers yet — start with a blank vector
     let mut providers: Vec<Provider> = if contents.is_empty() {
         Vec::new()
     } else {
@@ -151,6 +215,7 @@ pub fn update_providers_with_lock<F: FnOnce(&mut Vec<Provider>)>(f: F) -> Result
     file.flush()?;
     file.sync_all()?;
 
+    // Re-assert 0600 permissions after the in-place rewrite
     let mut perms = file.metadata()?.permissions();
     perms.set_mode(0o600);
     file.set_permissions(perms)?;
@@ -160,24 +225,44 @@ pub fn update_providers_with_lock<F: FnOnce(&mut Vec<Provider>)>(f: F) -> Result
     Ok(())
 }
 
+/// Loads the list of groups from the on-disk JSON file.
+///
+/// # Errors
+///
+/// Returns an error if the file is missing or contains invalid JSON.
 pub fn load_groups() -> Result<Vec<Group>> {
     read_json(&groups_path())
 }
 
+/// Saves the list of groups to the on-disk JSON file atomically.
+///
+/// Creates the config directory if necessary.
 pub fn save_groups(groups: &[Group]) -> Result<()> {
     ensure_config_dir()?;
     write_json(&groups_path(), groups)
 }
 
+/// Loads the application configuration from the on-disk JSON file.
+///
+/// # Errors
+///
+/// Returns an error if the file is missing or contains invalid JSON.
 pub fn load_app_config() -> Result<AppConfig> {
     read_json(&app_config_path())
 }
 
+/// Saves the application configuration to the on-disk JSON file atomically.
+///
+/// Creates the config directory if necessary.
 pub fn save_app_config(config: &AppConfig) -> Result<()> {
     ensure_config_dir()?;
     write_json(&app_config_path(), config)
 }
 
+/// Resets all configuration files to their defaults.
+///
+/// Writes `config.json`, `providers.json`, and `groups.json` with empty or
+/// default values.
 pub fn reset_all_config() -> Result<()> {
     ensure_config_dir()?;
     let default_config = AppConfig::default();

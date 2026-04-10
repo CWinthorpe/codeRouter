@@ -35,6 +35,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 
+/** Generates a URL-safe, lowercase ID from a provider name. */
 function generateId(name: string): string {
   return name
     .toLowerCase()
@@ -43,6 +44,7 @@ function generateId(name: string): string {
     .slice(0, 40);
 }
 
+/** Formats an ISO timestamp string for display, returning 'Never' for falsy values. */
 function formatTimestamp(ts?: string): string {
   if (!ts) return 'Never';
   try {
@@ -53,16 +55,24 @@ function formatTimestamp(ts?: string): string {
   }
 }
 
+/** Formats a number as a USD cost string (e.g., "$1.50"). */
 function formatCost(n?: number): string {
   if (n == null) return '—';
   return `$${n.toFixed(2)}`;
 }
 
+/** Formats a number with locale-aware separators. */
 function formatNumber(n?: number): string {
   if (n == null) return '—';
   return n.toLocaleString();
 }
 
+/**
+ * Providers page. Lists all configured LLM providers with expand/collapse
+ * to browse models, inline actions for testing connections, refreshing
+ * models, editing, deleting, and toggling enabled state. New providers
+ * are created via the {@link ProviderModal} dialog.
+ */
 export default function Providers() {
   const providers = useStore((s) => s.providers);
   const setProviders = useStore((s) => s.setProviders);
@@ -74,12 +84,17 @@ export default function Providers() {
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
   const toastCounterRef = useRef(0);
 
+  /**
+   * Enqueue a toast notification that auto-dismisses after 4 seconds.
+   * Uses a counter ref to guarantee unique IDs even for rapid calls.
+   */
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
     const id = Date.now() * 1000 + (++toastCounterRef.current);
     setToasts((prev) => [...prev, { id, type, message }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
   }, []);
 
+  /** Toggle the expanded state of a provider card to show/hide its model browser. */
   const toggleExpand = useCallback((id: string) => {
     setExpandedProviders((prev) => {
       const next = new Set(prev);
@@ -89,6 +104,7 @@ export default function Providers() {
     });
   }, []);
 
+  /** Sends a test connection request to the provider and shows the result as a toast. */
   const handleTestConnection = useCallback(
     async (provider: Provider) => {
       setTestingId(provider.id);
@@ -108,6 +124,7 @@ export default function Providers() {
     [addToast],
   );
 
+  /** Fetches fresh model listings from the provider's API and updates the store. */
   const handleRefreshModels = useCallback(
     async (provider: Provider) => {
       setRefreshingId(provider.id);
@@ -124,6 +141,10 @@ export default function Providers() {
     [addToast, setProviders],
   );
 
+  /**
+   * Deletes a provider after user confirmation. Warns the user if the
+   * provider is currently referenced by any model groups.
+   */
   const handleDelete = useCallback(
     async (provider: Provider) => {
       const currentGroups = await getGroups();
@@ -151,6 +172,7 @@ export default function Providers() {
     [setProviders, addToast],
   );
 
+  /** Persists provider config (with API key) via IPC, then refreshes the store list. */
   const handleSave = useCallback(
     async (provider: Provider, apiKey: string) => {
       await saveProvider(provider, apiKey);
@@ -163,6 +185,7 @@ export default function Providers() {
     [setProviders, addToast],
   );
 
+  /** Toggles a provider's enabled flag and persists the change. */
   const handleToggleEnabled = useCallback(
     async (provider: Provider) => {
       const newEnabled = !provider.enabled;
@@ -246,6 +269,11 @@ export default function Providers() {
   );
 }
 
+/**
+ * Renders a single provider as a collapsible card showing name, protocol,
+ * enabled state, model count, last refresh time, and action buttons.
+ * When expanded, shows the {@link ModelBrowser} table.
+ */
 function ProviderCard({
   provider,
   isExpanded,
@@ -365,6 +393,11 @@ function ProviderCard({
   );
 }
 
+/**
+ * Displays a table of models available from a provider. Each row has an
+ * "Add to group" action that opens a dropdown of existing groups to
+ * which the model can be added as a new entry.
+ */
 function ModelBrowser({ models, providerName, providerId }: { models: ProviderModel[]; providerName: string; providerId: string }) {
   const [addingModelId, setAddingModelId] = useState<string | null>(null);
   const [groups, setGroups] = useState<Group[]>([]);
@@ -409,6 +442,7 @@ function ModelBrowser({ models, providerName, providerId }: { models: ProviderMo
     }
   };
 
+  /** Adds a model to an existing group by appending a new GroupEntry. */
   const handleSelectGroup = async (group: Group, modelId: string) => {
     setSaving(true);
     try {
@@ -511,6 +545,11 @@ function ModelBrowser({ models, providerName, providerId }: { models: ProviderMo
   );
 }
 
+/**
+ * Modal dialog for creating or editing a provider. Handles form validation
+ * for name, base URL, API key, quotas, and optional model overrides that
+ * replace auto-discovered models with a custom list.
+ */
 function ProviderModal({
   provider,
   onSave,
@@ -547,6 +586,7 @@ function ProviderModal({
   const [overrideOutputCost, setOverrideOutputCost] = useState('');
   const [overrideProtocol, setOverrideProtocol] = useState<string>('');
 
+  /** Builds a ProviderModel from the override form fields and appends it. */
   const handleAddOverride = () => {
     if (!overrideModelId.trim()) return;
     const entry: ProviderModel = { id: overrideModelId.trim() };
@@ -564,6 +604,10 @@ function ProviderModal({
     setOverrideProtocol('');
   };
 
+  /**
+   * Validates all form fields (name, URL, API key, quotas), constructs
+   * a Provider object, and delegates persistence to the parent's onSave.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
