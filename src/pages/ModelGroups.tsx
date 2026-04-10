@@ -102,6 +102,18 @@ function statusLabel(status: string): string {
   }
 }
 
+const COOLDOWN_REASON_LABELS: Record<string, string> = {
+  rate_limited: 'Rate limited (HTTP 429)',
+  consecutive_errors: 'Consecutive errors',
+  latency_timeout: 'Latency timeout',
+  quota_exhausted: 'Daily quota exhausted',
+};
+
+function formatCooldownReason(reason?: string): string | null {
+  if (!reason) return null;
+  return COOLDOWN_REASON_LABELS[reason] ?? reason;
+}
+
 /**
  * Returns a human-readable countdown string (e.g., "2m 30s") from a
  * cooldownUntil ISO timestamp. Returns 'Expiring…' when the timestamp
@@ -499,6 +511,12 @@ function LiveStatusPanel({
                     )}
                   </span>
                 </div>
+
+                {(status === 'cooldown' || status === 'quota_exhausted') && st?.cooldown_reason && (
+                  <p className="mt-0.5 text-xs text-yellow-400">
+                    {formatCooldownReason(st.cooldown_reason)}
+                  </p>
+                )}
 
                 {quota != null && quota > 0 && (
                   <div className="mt-2 flex items-center gap-2">

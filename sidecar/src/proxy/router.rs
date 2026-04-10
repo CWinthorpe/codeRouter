@@ -37,6 +37,25 @@ pub enum EntryStatus {
     QuotaExhausted,
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub enum CooldownReason {
+    RateLimited,
+    ConsecutiveErrors,
+    LatencyTimeout,
+    QuotaExhausted,
+}
+
+impl CooldownReason {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CooldownReason::RateLimited => "rate_limited",
+            CooldownReason::ConsecutiveErrors => "consecutive_errors",
+            CooldownReason::LatencyTimeout => "latency_timeout",
+            CooldownReason::QuotaExhausted => "quota_exhausted",
+        }
+    }
+}
+
 /// Per-entry runtime state tracked by the router.
 #[derive(Clone, Debug)]
 pub struct EntryState {
@@ -47,6 +66,7 @@ pub struct EntryState {
     pub daily_requests_used: u64,
     pub daily_reset_at: DateTime<Utc>,
     pub cooldown_duration_seconds: Option<i64>,
+    pub cooldown_reason: Option<CooldownReason>,
 }
 
 impl EntryState {
@@ -73,6 +93,7 @@ impl EntryState {
             daily_requests_used: 0,
             daily_reset_at,
             cooldown_duration_seconds: Some(60),
+            cooldown_reason: None,
         }
     }
 }
@@ -214,6 +235,7 @@ pub fn select_entry<'a>(
                         entry_state.status = EntryStatus::Active;
                         entry_state.cooldown_until = None;
                         entry_state.consecutive_errors = 0;
+                        entry_state.cooldown_reason = None;
                         return true;
                     }
                     return false;
@@ -270,6 +292,7 @@ pub struct EntryStatusResponse {
     pub daily_requests_used: u64,
     pub daily_reset_at: DateTime<Utc>,
     pub cooldown_duration_seconds: Option<i64>,
+    pub cooldown_reason: Option<String>,
 }
 
 /// Full router status response containing all entry states.
@@ -297,6 +320,7 @@ pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusR
                     daily_requests_used: 0,
                     daily_reset_at: Utc::now(),
                     cooldown_duration_seconds: Some(60),
+                    cooldown_reason: None,
                 });
             entries.push(EntryStatusResponse {
                 group_id: group.id.clone(),
@@ -312,6 +336,10 @@ pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusR
                 daily_requests_used: entry_state.daily_requests_used,
                 daily_reset_at: entry_state.daily_reset_at,
                 cooldown_duration_seconds: entry_state.cooldown_duration_seconds,
+                cooldown_reason: entry_state
+                    .cooldown_reason
+                    .as_ref()
+                    .map(|r| r.as_str().to_string()),
             });
         }
     }
@@ -348,6 +376,7 @@ pub fn record_success(
         if entry_state.status == EntryStatus::Cooldown {
             entry_state.status = EntryStatus::Active;
             entry_state.cooldown_until = None;
+            entry_state.cooldown_reason = None;
         }
         if let Some(quota) = effective_quota {
             if entry_state.daily_tokens_used >= quota && on_quota_exhausted {
@@ -390,6 +419,7 @@ pub fn record_429(
         entry_state.cooldown_duration_seconds = Some(new_backoff);
         entry_state.status = EntryStatus::Cooldown;
         entry_state.cooldown_until = Some(Utc::now() + chrono::Duration::seconds(new_backoff));
+        entry_state.cooldown_reason = Some(CooldownReason::RateLimited);
     }
 }
 
@@ -399,6 +429,7 @@ pub fn record_quota_exhausted(state: &mut RouterState, provider_id: &str, entry_
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.status = EntryStatus::QuotaExhausted;
         entry_state.cooldown_until = None;
+        entry_state.cooldown_reason = Some(CooldownReason::QuotaExhausted);
     }
 }
 
@@ -423,6 +454,7 @@ pub fn record_consecutive_error(
             entry_state.cooldown_until =
                 Some(Utc::now() + chrono::Duration::milliseconds(cooldown_ms as i64));
             entry_state.consecutive_errors = 0;
+            entry_state.cooldown_reason = Some(CooldownReason::ConsecutiveErrors);
         }
     }
 }
@@ -447,6 +479,7 @@ pub fn record_latency_timeout(
         entry_state.cooldown_until =
             Some(Utc::now() + chrono::Duration::milliseconds(cooldown_ms as i64));
         entry_state.consecutive_errors = 0;
+        entry_state.cooldown_reason = Some(CooldownReason::LatencyTimeout);
         Ok(())
     } else {
         Err("entry state not found")
@@ -897,5 +930,126 @@ mod tests {
         let entry1 = state.entries.get("p1:1").unwrap();
         assert_eq!(entry0.status, EntryStatus::QuotaExhausted);
         assert_eq!(entry1.status, EntryStatus::Active);
+    }
+
+    #[test]
+    fn test_cooldown_reason_set_by_record_429() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.cooldown_reason, Some(CooldownReason::RateLimited));
+        }
+    }
+
+    #[test]
+    fn test_cooldown_reason_set_by_consecutive_errors() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(
+                entry.cooldown_reason,
+                Some(CooldownReason::ConsecutiveErrors)
+            );
+        }
+    }
+
+    #[test]
+    fn test_cooldown_reason_set_by_latency_timeout() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_latency_timeout(&mut s, "p1", 0, 300000).unwrap();
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.cooldown_reason, Some(CooldownReason::LatencyTimeout));
+        }
+    }
+
+    #[test]
+    fn test_cooldown_reason_set_by_quota_exhausted() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_quota_exhausted(&mut s, "p1", 0);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.cooldown_reason, Some(CooldownReason::QuotaExhausted));
+        }
+    }
+
+    #[test]
+    fn test_cooldown_reason_cleared_on_success() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::Cooldown);
+            assert_eq!(entry.cooldown_reason, Some(CooldownReason::RateLimited));
+            record_success(&mut s, "p1", 0, 50, None, None, false);
+            let entry = s.entries.get("p1:0").unwrap();
+            assert_eq!(entry.status, EntryStatus::Active);
+            assert_eq!(entry.cooldown_reason, None);
+        }
+    }
+
+    #[test]
+    fn test_cooldown_reason_cleared_on_cooldown_expiry() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+            let entry = s.entries.get_mut("p1:0").unwrap();
+            assert_eq!(entry.cooldown_reason, Some(CooldownReason::RateLimited));
+            entry.cooldown_until = Some(Utc::now() - chrono::Duration::seconds(1));
+        }
+        let mut state = state.lock().unwrap();
+        let skip = std::collections::HashSet::new();
+        let result = select_entry(&group, &mut state, &providers, &skip);
+        assert!(result.is_some());
+        let entry = state.entries.get("p1:0").unwrap();
+        assert_eq!(entry.status, EntryStatus::Active);
+        assert_eq!(entry.cooldown_reason, None);
+    }
+
+    #[test]
+    fn test_cooldown_reason_in_router_status() {
+        let providers = vec![test_provider("p1", None)];
+        let entries = vec![make_entry("p1", 1, true)];
+        let group = test_group_with_entries(entries);
+        let state = init_router_state(&[group.clone()], &providers);
+        {
+            let mut s = state.lock().unwrap();
+            record_429(&mut s, "p1", 0, 60);
+        }
+        let state = state.lock().unwrap();
+        let status = get_router_status(&[group.clone()], &state);
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(
+            status.entries[0].cooldown_reason,
+            Some("rate_limited".to_string())
+        );
     }
 }

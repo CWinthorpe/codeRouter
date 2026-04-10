@@ -64,6 +64,19 @@ function getEntryStatusCounts(entries: EntryStatusResponse[], providerId: string
   };
 }
 
+const COOLDOWN_REASON_LABELS: Record<string, string> = {
+  rate_limited: 'Rate limited (HTTP 429)',
+  consecutive_errors: 'Consecutive errors',
+  latency_timeout: 'Latency timeout',
+  quota_exhausted: 'Daily quota exhausted',
+};
+
+function getCooldownReasons(entries: EntryStatusResponse[], providerId: string): string[] {
+  return entries
+    .filter((e) => e.provider_id === providerId && (e.status === 'cooldown' || e.status === 'quota_exhausted') && e.cooldown_reason)
+    .map((e) => COOLDOWN_REASON_LABELS[e.cooldown_reason!] ?? e.cooldown_reason!);
+}
+
 /**
  * Determines the overall status label for a provider based on its enabled
  * state and entry counts. Prioritizes the most severe status.
@@ -173,12 +186,14 @@ function ProxyStatusCard() {
 function ProviderHealthCard({
   provider,
   entryCounts,
+  cooldownReasons,
   summary,
   weeklyCost,
   monthlyCost,
 }: {
   provider: Provider;
   entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number };
+  cooldownReasons: string[];
   summary: DailySummary | null;
   weeklyCost: number;
   monthlyCost: number;
@@ -228,6 +243,17 @@ function ProviderHealthCard({
             {entryCounts.disabled} Disabled
           </span>
         </div>
+
+        {cooldownReasons.length > 0 && (
+          <div className="mt-2 flex flex-col gap-0.5">
+            {cooldownReasons.map((reason, i) => (
+              <p key={i} className="text-xs text-yellow-400">
+                <AlertTriangle className="mr-1 inline h-3 w-3" />
+                {reason}
+              </p>
+            ))}
+          </div>
+        )}
 
         {quota && quota > 0 && (
           <div className="mt-4">
@@ -348,11 +374,13 @@ function ProviderHealthCards() {
     <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
       {sortedProviders.map((provider) => {
         const entryCounts = getEntryStatusCounts(entryStatusData.entries, provider.id);
+        const cooldownReasons = getCooldownReasons(entryStatusData.entries, provider.id);
         return (
           <ProviderHealthCard
             key={provider.id}
             provider={provider}
             entryCounts={entryCounts}
+            cooldownReasons={cooldownReasons}
             summary={summaries[provider.id] ?? null}
             weeklyCost={weeklyCosts[provider.id] ?? 0}
             monthlyCost={monthlyCosts[provider.id] ?? 0}
