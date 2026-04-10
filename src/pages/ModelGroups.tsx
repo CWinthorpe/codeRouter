@@ -1034,18 +1034,18 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                         className="w-24 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                         min="1"
                       />
-                      <label className="mb-1 mt-3 block text-xs font-medium text-zinc-400">Cooldown after errors (ms)</label>
+                      <label className="mb-1 mt-3 block text-xs font-medium text-zinc-400">Cooldown after errors (seconds)</label>
                       <input
                         type="number"
-                        value={failoverConfig.consecutiveErrorCooldownMs}
+                        value={failoverConfig.consecutiveErrorCooldownMs / 1000}
                         onChange={(e) =>
                           setFailoverConfig((c) => ({
                             ...c,
-                            consecutiveErrorCooldownMs: Math.max(60000, Number(e.target.value)),
+                            consecutiveErrorCooldownMs: Math.max(60000, Number(e.target.value) * 1000),
                           }))
                         }
                         className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                        min="60000"
+                        min="60"
                       />
                     </div>
                   )}
@@ -1056,31 +1056,31 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                   />
                   {failoverConfig.onLatencyTimeout && (
                     <div className="ml-7">
-                      <label className="mb-1 block text-xs font-medium text-zinc-400">Timeout (ms)</label>
+                      <label className="mb-1 block text-xs font-medium text-zinc-400">Timeout (seconds)</label>
                       <input
                         type="number"
-                        value={failoverConfig.latencyTimeoutMs}
+                        value={failoverConfig.latencyTimeoutMs / 1000}
                         onChange={(e) =>
                           setFailoverConfig((c) => ({
                             ...c,
-                            latencyTimeoutMs: Math.max(1000, Number(e.target.value)),
+                            latencyTimeoutMs: Math.max(1000, Number(e.target.value) * 1000),
                           }))
                         }
                         className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                        min="1000"
+                        min="1"
                       />
-                      <label className="mb-1 mt-3 block text-xs font-medium text-zinc-400">Cooldown after timeout (ms)</label>
+                      <label className="mb-1 mt-3 block text-xs font-medium text-zinc-400">Cooldown after timeout (seconds)</label>
                       <input
                         type="number"
-                        value={failoverConfig.latencyTimeoutCooldownMs}
+                        value={failoverConfig.latencyTimeoutCooldownMs / 1000}
                         onChange={(e) =>
                           setFailoverConfig((c) => ({
                             ...c,
-                            latencyTimeoutCooldownMs: Math.max(60000, Number(e.target.value)),
+                            latencyTimeoutCooldownMs: Math.max(60000, Number(e.target.value) * 1000),
                           }))
                         }
                         className="w-32 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                        min="60000"
+                        min="60"
                       />
                     </div>
                   )}
