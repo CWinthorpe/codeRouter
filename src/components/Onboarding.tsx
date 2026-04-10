@@ -8,10 +8,17 @@ interface OnboardingProps {
   onDismiss: () => void;
 }
 
+/**
+ * First-run onboarding wizard that guides new users through adding a
+ * provider and creating a model group. Rendered as a modal overlay with
+ * step navigation. Automatically returns null when providers and groups
+ * already exist, or when dismissed by the user.
+ */
 export function Onboarding({ providersCount, groupsCount, onDismiss }: OnboardingProps) {
   const navigate = useNavigate();
   const [step, setStep] = useState(0);
 
+  // Close the onboarding modal on Escape key press for convenience
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onDismiss();
@@ -20,10 +27,12 @@ export function Onboarding({ providersCount, groupsCount, onDismiss }: Onboardin
     return () => document.removeEventListener('keydown', handler);
   }, [onDismiss]);
 
+  // Only show when the user hasn't set up providers or groups yet
   const shouldShow = providersCount === 0 || groupsCount === 0;
 
   if (!shouldShow) return null;
 
+  // Each step has a title, description, icon, and optional route action
   const steps = [
     {
       title: 'Welcome to CodeRouter',

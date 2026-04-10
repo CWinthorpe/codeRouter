@@ -3,8 +3,16 @@ use rusqlite::Connection;
 use std::fs;
 use std::path::PathBuf;
 
+/// Default SQLite filename used for the metrics database.
 const DB_FILENAME: &str = "metrics.db";
 
+/// Returns the platform-specific data directory for coderouter, creating it if necessary.
+///
+/// Falls back to `/tmp/coderouter` when the OS does not provide a local data directory.
+///
+/// # Errors
+///
+/// Returns an error if the directory cannot be created.
 pub fn data_dir() -> Result<PathBuf> {
     let dir = dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -18,10 +26,23 @@ pub fn data_dir() -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Returns the full path to the metrics SQLite database file.
+///
+/// # Errors
+///
+/// Propagates errors from [`data_dir`] if the data directory is unavailable.
 pub fn db_path() -> Result<PathBuf> {
     Ok(data_dir()?.join(DB_FILENAME))
 }
 
+/// Opens the on-disk metrics database and runs any pending migrations.
+///
+/// The database file is located via [`db_path`]. If it does not exist, SQLite
+/// will create it automatically.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or migrations fail.
 pub fn init_db() -> Result<Connection> {
     let path = db_path()?;
     let conn = Connection::open(&path)
@@ -32,12 +53,26 @@ pub fn init_db() -> Result<Connection> {
     Ok(conn)
 }
 
+/// Opens an in-memory SQLite database with the same schema as the on-disk variant.
+///
+/// Primarily useful in tests where persistence is not needed.
+///
+/// # Errors
+///
+/// Returns an error if the in-memory connection or migrations fail.
 pub fn init_in_memory_db() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
     run_migrations(&conn)?;
     Ok(conn)
 }
 
+/// Creates the `requests` table and supporting indexes if they do not already exist.
+///
+/// This function is idempotent — running it on an existing database has no effect.
+///
+/// # Errors
+///
+/// Returns an error if the SQL batch execution fails.
 fn run_migrations(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "
@@ -65,6 +100,13 @@ fn run_migrations(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Deletes all rows from the `requests` table in the on-disk metrics database.
+///
+/// This permanently removes all stored metrics data.
+///
+/// # Errors
+///
+/// Returns an error if the database cannot be opened or the `DELETE` statement fails.
 pub fn clear_metrics() -> Result<()> {
     let path = db_path()?;
     let conn = Connection::open(&path)

@@ -1,3 +1,6 @@
+//! Router module: group/entry selection, priority-based failover,
+//! cooldown/quota tracking, and state management for upstream providers.
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -7,24 +10,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::models::{Group, GroupEntry, Provider};
 
+/// Global singleton for the router state, set once at startup.
 static GLOBAL_ROUTER_STATE: std::sync::OnceLock<SharedRouterState> = std::sync::OnceLock::new();
 
+/// Returns a clone of the global router state, if it has been initialised.
 pub fn get_global_router_state() -> Option<SharedRouterState> {
     GLOBAL_ROUTER_STATE.get().cloned()
 }
 
+/// Sets the global router state. Silently ignores the call if already set.
 pub fn set_global_router_state(state: SharedRouterState) {
     let _ = GLOBAL_ROUTER_STATE.set(state);
 }
 
+/// The operational status of a single group entry.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub enum EntryStatus {
+    /// Entry is healthy and eligible for routing.
     Active,
+    /// Entry is temporarily disabled due to a cooldown (429 backoff,
+    /// consecutive errors, or latency timeout).
     Cooldown,
+    /// Entry was explicitly disabled via the internal API.
     ManuallyDisabled,
+    /// Daily token or request quota has been exhausted.
     QuotaExhausted,
 }
 
+/// Per-entry runtime state tracked by the router.
 #[derive(Clone, Debug)]
 pub struct EntryState {
     pub status: EntryStatus,
@@ -37,6 +50,8 @@ pub struct EntryState {
 }
 
 impl EntryState {
+    /// Creates a new `EntryState` with `Active` status and a daily reset
+    /// timestamp based on the provider's `quota_reset_utc_hour`.
     fn new(provider: &Provider) -> Self {
         let now = Utc::now();
         let reset_hour = provider.quota_reset_utc_hour.min(23);
@@ -62,17 +77,24 @@ impl EntryState {
     }
 }
 
+/// Holds all per-entry states keyed by `"{provider_id}:{entry_index}"`.
 #[derive(Default)]
 pub struct RouterState {
     pub entries: HashMap<String, EntryState>,
 }
 
+/// Thread-safe wrapper around [`RouterState`].
 pub type SharedRouterState = Arc<Mutex<RouterState>>;
 
+/// Builds the lookup key for an entry: `"{provider_id}:{entry_index}"`.
 pub fn entry_key(provider_id: &str, entry_index: u32) -> String {
     format!("{provider_id}:{entry_index}")
 }
 
+/// Initialises a fresh `RouterState` from the given groups and providers.
+///
+/// Creates an [`EntryState`] for every enabled entry. Disabled entries
+/// start with [`EntryStatus::ManuallyDisabled`].
 pub fn init_router_state(groups: &[Group], providers: &[Provider]) -> SharedRouterState {
     let mut state = RouterState::default();
     for group in groups {
@@ -90,6 +112,7 @@ pub fn init_router_state(groups: &[Group], providers: &[Provider]) -> SharedRout
     Arc::new(Mutex::new(state))
 }
 
+/// Convenience wrapper: [`init_router_state`] + [`set_global_router_state`].
 pub fn init_and_set_global_router_state(
     groups: &[Group],
     providers: &[Provider],
@@ -99,6 +122,9 @@ pub fn init_and_set_global_router_state(
     state
 }
 
+/// Loads today's token and request counts from the metrics database into
+/// each entry's `daily_tokens_used` / `daily_requests_used`. Called once
+/// at startup so that daily quotas are correctly enforced across restarts.
 pub fn init_daily_totals_from_db(
     state: &SharedRouterState,
     providers: &[Provider],
@@ -144,12 +170,27 @@ pub fn init_daily_totals_from_db(
     }
 }
 
+/// Selects the highest-priority **eligible** entry from a group.
+///
+/// An entry is eligible when it is:
+/// - Enabled (`entry.enabled == true`)
+/// - Not in `skip_indices` (used by the failover loop to skip entries that
+///   just returned an error)
+/// - Not in `Cooldown` (unless its cooldown has expired, in which case it
+///   transitions back to `Active` automatically)
+/// - Not `ManuallyDisabled`
+/// - Not `QuotaExhausted` or over its daily token/request quota
+///
+/// Returns `Some((entry_ref, entry_index))` for the best candidate, or
+/// `None` if no entry is available.
 pub fn select_entry<'a>(
     group: &'a Group,
     state: &mut RouterState,
     providers: &[Provider],
     skip_indices: &std::collections::HashSet<u32>,
 ) -> Option<(&'a GroupEntry, u32)> {
+    // Collect enabled, non-skipped, non-quota-exhausted, non-cooldown
+    // entries and sort by priority (lowest number = highest priority).
     let mut candidates: Vec<(&GroupEntry, u32)> = group
         .entries
         .iter()
@@ -213,6 +254,7 @@ pub fn select_entry<'a>(
     candidates.into_iter().next()
 }
 
+/// JSON-serialisable status snapshot for a single group entry.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct EntryStatusResponse {
     pub group_id: String,
@@ -230,11 +272,14 @@ pub struct EntryStatusResponse {
     pub cooldown_duration_seconds: Option<i64>,
 }
 
+/// Full router status response containing all entry states.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RouterStatusResponse {
     pub entries: Vec<EntryStatusResponse>,
 }
 
+/// Builds a [`RouterStatusResponse`] from the current group definitions and
+/// live router state, suitable for the `/internal/router/status` endpoint.
 pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusResponse {
     let mut entries = Vec::new();
     for group in groups {
@@ -273,6 +318,14 @@ pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusR
     RouterStatusResponse { entries }
 }
 
+/// Records a successful request for the given entry.
+///
+/// - Increments `daily_tokens_used` and `daily_requests_used` across **all**
+///   entries that share the same provider (because quotas are provider-level).
+/// - Resets `consecutive_errors` to 0 and transitions `Cooldown` → `Active`
+///   for the specific entry.
+/// - If `on_quota_exhausted` is true and the quota is now exceeded, sets the
+///   status to `QuotaExhausted`.
 pub fn record_success(
     state: &mut RouterState,
     provider_id: &str,
@@ -311,6 +364,12 @@ pub fn record_success(
     }
 }
 
+/// Records an HTTP 429 (rate-limited) response.
+///
+/// Uses exponential backoff: the first 429 sets the cooldown to
+/// `base_backoff_seconds`; subsequent 429s double the backoff up to a
+/// maximum of 3600 s. Resets to `base_backoff_seconds` if the entry was
+/// not previously in cooldown.
 pub fn record_429(
     state: &mut RouterState,
     provider_id: &str,
@@ -334,6 +393,7 @@ pub fn record_429(
     }
 }
 
+/// Marks an entry as quota-exhausted (no cooldown expiry).
 pub fn record_quota_exhausted(state: &mut RouterState, provider_id: &str, entry_index: u32) {
     let key = entry_key(provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
@@ -342,6 +402,11 @@ pub fn record_quota_exhausted(state: &mut RouterState, provider_id: &str, entry_
     }
 }
 
+/// Records a consecutive error for the given entry.
+///
+/// When `trigger_enabled` is true and the error count reaches `threshold`,
+/// the entry is put into `Cooldown` for `cooldown_ms` and the counter is
+/// reset. This prevents hammering a failing upstream.
 pub fn record_consecutive_error(
     state: &mut RouterState,
     provider_id: &str,
@@ -362,6 +427,14 @@ pub fn record_consecutive_error(
     }
 }
 
+/// Records a latency timeout for the given entry.
+///
+/// Immediately puts the entry into `Cooldown` for `cooldown_ms` and resets
+/// its consecutive error counter.
+///
+/// # Errors
+///
+/// Returns `"entry state not found"` if the entry key is missing.
 pub fn record_latency_timeout(
     state: &mut RouterState,
     provider_id: &str,
@@ -380,6 +453,8 @@ pub fn record_latency_timeout(
     }
 }
 
+/// Builds the JSON error body returned when all providers for a model are
+/// unavailable: `{"error":{"message":…,"type":"coderouter_error","code":"all_providers_exhausted"}}`.
 pub fn build_exhausted_response(alias: &str) -> serde_json::Value {
     serde_json::json!({
         "error": {

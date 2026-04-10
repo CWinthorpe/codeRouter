@@ -9,16 +9,23 @@ interface State {
   error: Error | null;
 }
 
+/**
+ * React error boundary that catches rendering errors in the subtree and
+ * displays a friendly error screen with a reload button instead of a blank page.
+ * Errors are logged to the console via componentDidCatch for debugging.
+ */
 export class ErrorBoundary extends Component<Props, State> {
   constructor(props: Props) {
     super(props);
     this.state = { hasError: false, error: null };
   }
 
+  // Capture the error so the next render can show the fallback UI
   static getDerivedStateFromError(error: Error): State {
     return { hasError: true, error };
   }
 
+  // Log the full error + component stack for developer troubleshooting
   componentDidCatch(error: Error, errorInfo: ErrorInfo) {
     console.error('ErrorBoundary caught:', error, errorInfo);
   }

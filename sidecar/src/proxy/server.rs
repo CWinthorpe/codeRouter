@@ -1,3 +1,10 @@
+//! Axum HTTP server for the sidecar proxy.
+//!
+//! Handles incoming OpenAI-compatible API requests, routes them to the
+//! appropriate upstream provider via the router module, translates between
+//! OpenAI and Anthropic protocols as needed, streams responses back to the
+//! client, and records metrics/usage.
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -31,6 +38,8 @@ use crate::config::{
     store::{load_app_config, load_groups, load_providers},
 };
 
+/// Maximum time (ms) to wait between SSE chunks before declaring a timeout.
+/// Long timeout accounts for models that "think" (reasoning) before emitting tokens.
 const STREAM_INTER_CHUNK_TIMEOUT_MS: u64 = 120_000;
 use crate::credentials::keychain::get_credential;
 use crate::metrics::db as metrics_db;
@@ -45,6 +54,10 @@ use crate::proxy::ssrf;
 use crate::proxy::translator;
 use crate::proxy::upstream::{self, UpstreamError};
 
+/// Shared application state passed to every Axum route handler via [`State`].
+///
+/// Wraps config, groups, providers, the HTTP client pool, router state,
+/// metrics recorder, and a broadcast channel for real-time metric streaming.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<RwLock<Arc<AppConfig>>>,
@@ -56,8 +69,20 @@ pub struct AppState {
     pub metrics_broadcast: broadcast::Sender<String>,
 }
 
+/// Unix epoch timestamp recorded at server start, used to compute uptime.
 static START_TIME: AtomicI64 = AtomicI64::new(0);
 
+/// Bootstraps and starts the Axum HTTP server.
+///
+/// Loads config, groups, and providers from disk; initialises the router
+/// state, metrics DB, scheduler, and model-refresher background tasks;
+/// binds to the configured `proxy_host:proxy_port`; and serves requests
+/// until a SIGTERM or SIGINT is received, then performs graceful shutdown.
+///
+/// # Errors
+///
+/// Returns an error if the TCP listener cannot bind, the HTTP client
+/// cannot be built, or the metrics DB cannot be initialised.
 pub async fn start_server() -> anyhow::Result<()> {
     let start_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -72,6 +97,7 @@ pub async fn start_server() -> anyhow::Result<()> {
     // No total timeout: streaming responses can run for minutes (reasoning/thinking).
     // Per-layer timeouts handle each phase: connect (below), TTFB (upstream.rs), inter-chunk (TimeoutStream), non-streaming body (tokio::timeout).
     let client = Client::builder()
+        // 30 s connect timeout prevents hanging on unreachable upstreams
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
@@ -184,12 +210,14 @@ pub async fn start_server() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Response body for `GET /v1/models`.
 #[derive(Serialize)]
 struct ModelResponse {
     object: String,
     data: Vec<ModelObject>,
 }
 
+/// Single model entry inside [`ModelResponse`].
 #[derive(Serialize)]
 struct ModelObject {
     id: String,
@@ -202,6 +230,11 @@ struct ModelObject {
     max_output_tokens: Option<u64>,
 }
 
+/// `GET /v1/models` — lists groups as OpenAI model objects.
+///
+/// Only groups that have at least one **active, under-quota** entry are
+/// included. Context-window and max-output-token metadata are taken from
+/// the highest-priority active entry's provider model definition.
 async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse> {
     let providers = state.providers.read().unwrap();
     let router_state = state.router_state.lock().unwrap();
@@ -292,6 +325,10 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
     })
 }
 
+/// `POST /v1/chat/completions` — OpenAI-compatible chat completion endpoint.
+///
+/// Validates the request body is a JSON object, then delegates to
+/// [`route_request`].
 async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -302,6 +339,11 @@ async fn handle_chat_completions(
     route_request(&state, body, "chat/completions").await
 }
 
+/// `POST /v1/completions` — OpenAI-compatible legacy completion endpoint.
+///
+/// Validates the request body is a JSON object, then delegates to
+/// [`route_request`]. Note: Anthropic entries are skipped for this
+/// endpoint because Anthropic has no `/completions` equivalent.
 async fn handle_completions(
     State(state): State<Arc<AppState>>,
     Json(body): Json<Value>,
@@ -312,6 +354,20 @@ async fn handle_completions(
     route_request(&state, body, "completions").await
 }
 
+/// Core request routing logic shared by both chat and legacy completions.
+///
+/// Resolves the requested model alias to a group, then iterates over
+/// entries in priority order (with failover). For each attempt it:
+///
+/// 1. Picks the highest-priority available entry via [`router::select_entry`].
+/// 2. Resolves the provider, API key, and protocol (OpenAI vs Anthropic).
+/// 3. Validates the upstream URL against SSRF rules.
+/// 4. Builds and sends the upstream request with a latency timeout.
+/// 5. Processes the response — streaming or non-streaming — translating
+///    Anthropic protocol back to OpenAI format when necessary.
+/// 6. Records metrics and updates router state (success, 429, quota, errors).
+///
+/// If all entries are exhausted, returns `503 All providers unavailable`.
 async fn route_request(
     state: &AppState,
     body: Value,
@@ -344,6 +400,7 @@ async fn route_request(
     let max_retries = group.entries.len();
     let mut skip_indices = HashSet::new();
 
+    // Failover loop: try each eligible entry in priority order until one succeeds
     for _attempt in 0..max_retries {
         let (entry, entry_index) = {
             let mut router_state = state.router_state.lock().unwrap();
@@ -364,6 +421,7 @@ async fn route_request(
             AppError::InternalError("upstream provider configuration error".to_string())
         })?;
 
+        // Determine protocol: per-model override takes precedence over provider default
         let model_protocol = provider.models.iter()
             .find(|m| m.id == entry.model_id)
             .and_then(|m| m.protocol.clone())
@@ -388,6 +446,7 @@ async fn route_request(
             format!("{base}/chat/completions")
         };
 
+        // Anthropic doesn't have a /completions equivalent — skip this entry
         if endpoint == "completions" && is_anthropic {
             skip_indices.insert(entry_index);
             continue;
@@ -448,6 +507,8 @@ async fn route_request(
                     .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
                     .unwrap_or((None, None));
 
+                // Wrap the stream in MetricsRecordingStream so success/error is captured
+                // after the entire stream has been consumed by the client.
                 let body_with_metrics = MetricsRecordingStream::new(raw_stream, move |success: bool| {
                     let latency_ms = latency_start.elapsed().as_millis() as i64;
                     let counts = token_counts.lock().unwrap();
@@ -614,26 +675,64 @@ async fn route_request(
         }
     }
 
+    // All entries exhausted — return 503
     let exhausted_body = router::build_exhausted_response(&model);
     Ok((StatusCode::SERVICE_UNAVAILABLE, Json(exhausted_body)).into_response())
 }
 
+/// Errors that can occur while processing a proxied request.
+///
+/// Each variant maps to a specific failover behaviour in [`route_request`].
 #[allow(dead_code)]
 enum RequestError {
+    /// Upstream returned HTTP 429 (rate-limited).
     RateLimited,
+    /// Daily token/request quota has been exhausted.
     QuotaExhausted,
+    /// Network-level error (connection, DNS, etc.).
     Network(String),
+    /// Upstream returned a non-success HTTP status.
     ServerError(String),
 }
 
+/// Result of processing an upstream response.
 enum StreamProcessResult {
+    /// Streaming response (SSE) — the body is a translated byte stream,
+    /// and `Arc<Mutex<StreamTokenCounts>>` accumulates token counts.
     Streaming(
         Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static>,
         Arc<std::sync::Mutex<translator::StreamTokenCounts>>,
     ),
+    /// Non-streaming response — contains the final HTTP response plus
+    /// prompt/output token counts extracted from the body.
     NonStreaming(Response, u64, u64),
 }
 
+/// Processes the raw upstream HTTP response.
+///
+/// Handles three major branches:
+///
+/// - **429**: immediately returns [`RequestError::RateLimited`] so the
+///   caller can trigger failover.
+/// - **Streaming** (`stream: true` + `text/event-stream` content type):
+///   wraps the byte stream in [`TimeoutStream`] for inter-chunk timeouts,
+///   then translates via the appropriate translator.
+/// - **Non-streaming** or unexpected content type: reads the full body,
+///   translates if Anthropic, and returns token counts.
+///
+/// # Arguments
+///
+/// * `resp` — The raw [`reqwest::Response`] from the upstream provider.
+/// * `stream` — Whether the client requested SSE streaming.
+/// * `group_alias` — The group alias used as the model name in responses.
+/// * `is_anthropic` — Whether the upstream speaks the Anthropic protocol.
+/// * `_latency_timeout_ms` — Currently unused; inter-chunk timeout is
+///   configured via [`STREAM_INTER_CHUNK_TIMEOUT_MS`].
+///
+/// # Errors
+///
+/// Returns [`RequestError`] variants for rate-limiting, server errors,
+/// network failures, or body-parse failures.
 async fn process_response(
     resp: reqwest::Response,
     stream: bool,
@@ -761,6 +860,8 @@ async fn process_response(
     }
 }
 
+/// Extracts `prompt_tokens` and `completion_tokens` from an OpenAI-style
+/// JSON response's `usage` field. Returns `(0, 0)` if usage is absent.
 fn extract_openai_tokens(json: &Value) -> (u64, u64) {
     let prompt_tokens = json
         .get("usage")
@@ -775,12 +876,19 @@ fn extract_openai_tokens(json: &Value) -> (u64, u64) {
     (prompt_tokens, completion_tokens)
 }
 
+/// Extracts token counts from an Anthropic [`MessagesResponse`].
 fn extract_anthropic_tokens(resp: &translator::MessagesResponse) -> (u64, u64) {
     let prompt_tokens = resp.usage.input_tokens as u64;
     let output_tokens = resp.usage.output_tokens as u64;
     (prompt_tokens, output_tokens)
 }
 
+/// A [`Stream`] wrapper that enforces a maximum gap between consecutive chunks.
+///
+/// If no chunk arrives within `timeout` of the last successful chunk (or
+/// stream creation), the stream produces an [`std::io::ErrorKind::TimedOut`]
+/// error. This prevents silently hanging connections during streaming
+/// responses (e.g., when an upstream silently drops the connection).
 struct TimeoutStream<S> {
     inner: S,
     timeout: std::time::Duration,
@@ -788,6 +896,8 @@ struct TimeoutStream<S> {
 }
 
 impl<S> TimeoutStream<S> {
+    /// Creates a new `TimeoutStream` wrapping `inner` with the given
+    /// inter-chunk timeout in milliseconds.
     fn new(inner: S, timeout_ms: u64) -> Self {
         Self {
             inner,
@@ -797,6 +907,14 @@ impl<S> TimeoutStream<S> {
     }
 }
 
+/// Implements the [`Stream`] trait for `TimeoutStream`.
+///
+/// On each `poll_next`:
+/// - A successful chunk resets `last_activity` and is yielded.
+/// - An error is forwarded as-is.
+/// - A `Pending` result checks whether the elapsed time since the last
+///   activity exceeds `timeout`; if so, yields a `TimedOut` error.
+/// - Stream end (`None`) is forwarded.
 impl<S> Stream for TimeoutStream<S>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
@@ -825,12 +943,17 @@ where
     }
 }
 
+/// A [`Stream`] wrapper that invokes a callback when the inner stream ends
+/// (success) or encounters an error (failure). Used to record metrics on
+/// stream completion.
 struct MetricsRecordingStream<S> {
     inner: S,
     on_complete: Option<Box<dyn FnOnce(bool) + Send + 'static>>,
 }
 
 impl<S> MetricsRecordingStream<S> {
+    /// Creates a new `MetricsRecordingStream` that calls `on_complete(bool)`
+    /// exactly once — `true` for a clean end-of-stream, `false` for an error.
     fn new<F>(inner: S, on_complete: F) -> Self
     where
         F: FnOnce(bool) + Send + 'static,
@@ -842,6 +965,11 @@ impl<S> MetricsRecordingStream<S> {
     }
 }
 
+/// Implements [`Stream`] for `MetricsRecordingStream`.
+///
+/// Delegates to the inner stream and fires `on_complete(false)` on error
+/// or `on_complete(true)` on clean end-of-stream. The callback is called
+/// at most once.
 impl<S> Stream for MetricsRecordingStream<S>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
@@ -868,6 +996,8 @@ where
     }
 }
 
+/// `GET /internal/metrics/stream` — SSE endpoint that pushes real-time
+/// request metrics to subscribers as JSON events.
 async fn handle_metrics_stream(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -894,6 +1024,8 @@ async fn handle_metrics_stream(
     )
 }
 
+/// `GET /health` — returns a JSON object with server uptime, provider info,
+/// and the current failover state of every group entry.
 async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     let start = START_TIME.load(Ordering::Relaxed);
     let now = std::time::SystemTime::now()
@@ -949,6 +1081,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     }))
 }
 
+/// Application-level error type mapped to HTTP status codes.
 #[derive(Debug)]
 enum AppError {
     BadRequest(String),
@@ -956,6 +1089,8 @@ enum AppError {
     InternalError(String),
 }
 
+/// Converts [`AppError`] into an Axum [`Response`] with an OpenAI-style
+/// error JSON body: `{"error":{"message":…,"type":"coderouter_error","code":…}}`.
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -979,12 +1114,15 @@ impl IntoResponse for AppError {
     }
 }
 
+/// Response body for `GET /internal/router/status`.
 #[derive(Serialize)]
 struct InternalRouterStatusResponse {
     pub status: String,
     pub data: Option<router::RouterStatusResponse>,
 }
 
+/// `GET /internal/router/status` — returns the full failover/state
+/// snapshot for every group entry (for admin dashboards).
 async fn handle_internal_router_status(
     State(state): State<Arc<AppState>>,
 ) -> Json<InternalRouterStatusResponse> {
@@ -997,6 +1135,7 @@ async fn handle_internal_router_status(
     })
 }
 
+/// Request body for `POST /internal/router/entry`.
 #[derive(Deserialize)]
 struct InternalSetEntryRequest {
     pub group_id: String,
@@ -1004,6 +1143,10 @@ struct InternalSetEntryRequest {
     pub enabled: bool,
 }
 
+/// `POST /internal/router/entry` — enable or disable a specific group entry.
+///
+/// After updating the entry's enabled state, reloads groups and providers
+/// from disk so the scheduler picks up the change.
 async fn handle_internal_router_set_entry(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InternalSetEntryRequest>,
@@ -1036,6 +1179,12 @@ async fn handle_internal_router_set_entry(
     }
 }
 
+/// `POST /internal/config/reload` — hot-reloads `app_config`, groups, and
+/// providers from disk without restarting the process.
+///
+/// Preserves router state (cooldowns, quotas, consecutive errors) for
+/// entries that still exist after the reload, and removes entries that
+/// are no longer present.
 async fn handle_internal_config_reload(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {

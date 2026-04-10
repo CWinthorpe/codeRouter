@@ -1,3 +1,4 @@
+/** shadcn/ui Table component family for tabular data. */
 import * as React from 'react';
 import { cn } from '@/lib/utils';
 

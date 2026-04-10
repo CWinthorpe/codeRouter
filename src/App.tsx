@@ -9,6 +9,7 @@ import OpenCodeSetup from './pages/OpenCodeSetup';
 import UsageMetrics from './pages/UsageMetrics';
 import Settings from './pages/Settings';
 
+/** 404 page shown for unrecognized routes. */
 function NotFound() {
   return (
     <div className="flex flex-col items-center justify-center py-16">
@@ -19,6 +20,7 @@ function NotFound() {
   );
 }
 
+/** Wraps all pages in the sidebar shell and group-status polling provider. */
 function Layout() {
   return (
     <AppShell>
@@ -29,6 +31,7 @@ function Layout() {
   );
 }
 
+// Route definitions — each path maps to a dedicated page component
 const router = createBrowserRouter([
   {
     element: <Layout />,
@@ -44,6 +47,10 @@ const router = createBrowserRouter([
   },
 ]);
 
+/**
+ * Root application component. Mounts the router inside an ErrorBoundary
+ * so that unhandled rendering errors are caught gracefully.
+ */
 export default function App() {
   return (
     <ErrorBoundary>

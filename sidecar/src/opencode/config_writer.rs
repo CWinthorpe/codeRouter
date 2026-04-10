@@ -1,3 +1,10 @@
+//! OpenCode configuration file management.
+//!
+//! This module handles reading, writing, and modifying the OpenCode JSON config
+//! to inject/remove the CodeRouter provider and manage agent-to-group mappings.
+//! All writes use an atomic temp-file-and-rename strategy with exclusive locking
+//! to prevent corruption from concurrent access.
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -7,26 +14,43 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use std::os::unix::fs::PermissionsExt;
 
+/// Result type alias for config operations, boxing errors for IO and JSON failures.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 use crate::config::models::{Group, Provider};
 
+/// Maps OpenCode agent roles to CodeRouter group aliases.
+///
+/// Each field corresponds to an agent slot in the OpenCode configuration.
+/// When set, the agent will be configured to use the model
+/// `coderouter/<alias>` where `<alias>` is the group alias.
+///
+/// `small_model` is stored separately at the top level of the OpenCode config
+/// rather than inside the `agent` block.
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct AgentMapping {
+    /// The model alias used for the build agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<String>,
+    /// The model alias used for the plan agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
+    /// The model alias used for the general agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub general: Option<String>,
+    /// The model alias used for the explore agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explore: Option<String>,
+    /// The model alias used for the compaction agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compaction: Option<String>,
+    /// The model alias used for the title generation agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The model alias used for the summary agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+    /// The model alias used for the `small_model` top-level setting.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -35,18 +59,29 @@ pub struct AgentMapping {
     pub small_model: Option<String>,
 }
 
+/// Returns the default OpenCode config path at `~/.config/opencode/opencode.json`,
+/// or `None` if the home directory cannot be resolved.
 pub fn detect_opencode_config() -> Option<PathBuf> {
     let mut path = dirs::home_dir()?;
     path.push(".config/opencode/opencode.json");
     Some(path)
 }
 
+/// Returns the path used for caching a backup of the OpenCode config,
+/// located at `<config_dir>/coderouter/opencode.json`.
 pub fn opencode_cache_path() -> Option<PathBuf> {
     let mut path = dirs::config_dir()?;
     path.push("coderouter/opencode.json");
     Some(path)
 }
 
+/// Copies the current OpenCode config file to the CodeRouter cache location.
+///
+/// This cache is used by [`read_config_or_empty`] to preserve user settings
+/// even when the original config file has been temporarily removed.
+///
+/// # Errors
+/// Returns an error if the config file cannot be read or the cache cannot be written.
 pub fn save_opencode_cache(config_path: &Path) -> Result<()> {
     if !config_path.exists() {
         return Ok(());
@@ -65,6 +100,9 @@ pub fn save_opencode_cache(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Loads the cached OpenCode config from the CodeRouter cache location.
+///
+/// Returns `None` if the cache file does not exist or cannot be parsed.
 pub fn load_opencode_cache() -> Option<serde_json::Value> {
     let cache_path = opencode_cache_path()?;
     if !cache_path.exists() {
@@ -74,10 +112,17 @@ pub fn load_opencode_cache() -> Option<serde_json::Value> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Resolves the OpenCode config path from a stored path or auto-detection.
+///
+/// If `stored_path` is a non-empty string pointing to an existing file (or a
+/// path whose parent directory exists), it is used directly. Otherwise falls
+/// back to [`detect_opencode_config`].
 pub fn resolve_opencode_config_path(stored_path: Option<&str>) -> Option<PathBuf> {
     if let Some(path) = stored_path {
         if !path.is_empty() {
             let p = PathBuf::from(path);
+            // Accept the path if it exists, or if its parent exists (so a not-yet-created
+            // config file can still be targeted rather than falling back to auto-detection).
             if p.exists() || p.parent().map(|p| p.exists()).unwrap_or(true) {
                 return Some(p);
             }
@@ -86,6 +131,11 @@ pub fn resolve_opencode_config_path(stored_path: Option<&str>) -> Option<PathBuf
     detect_opencode_config()
 }
 
+/// Persists the OpenCode config path in the app configuration so that
+/// subsequent lookups use the same path without re-detecting.
+///
+/// # Errors
+/// Returns an error if the app config cannot be loaded or saved.
 pub fn save_opencode_config_path(path: &str) -> Result<()> {
     use crate::config::store::{load_app_config, save_app_config};
     let mut config = load_app_config().unwrap_or_default();
@@ -94,6 +144,23 @@ pub fn save_opencode_config_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Injects the CodeRouter provider into the OpenCode configuration file.
+///
+/// For each group, the highest-priority active entry is selected (respecting
+/// the `entry_statuses` map and `enabled` flag). The provider entry includes
+/// the base URL pointing at the local proxy, an API key placeholder, model
+/// metadata (name, context/output limits), and is written under the
+/// `provider.coderouter` key. Existing config keys are preserved.
+///
+/// # Arguments
+/// * `config_path` - Path to the OpenCode JSON config file.
+/// * `groups` - The router group definitions.
+/// * `providers` - Provider configs used to look up model metadata.
+/// * `proxy_port` - The local port the CodeRouter proxy listens on.
+/// * `entry_statuses` - Map of `"provider_id:idx"` → `"active"`/`"cooldown"` strings.
+///
+/// # Errors
+/// Returns an error if the config cannot be read, written, or cached.
 pub fn inject_provider(
     config_path: &Path,
     groups: &[Group],
@@ -108,6 +175,8 @@ pub fn inject_provider(
     let mut models = serde_json::Map::new();
 
     for group in groups {
+        // Find the highest-priority enabled entry whose status is "active"
+        // (or absent from the status map, which defaults to active).
         let highest_active = group
             .entries
             .iter()
@@ -131,6 +200,7 @@ pub fn inject_provider(
             let mut model_obj = serde_json::Map::new();
             model_obj.insert("name".to_string(), json_str(&group.display_name));
 
+            // Attach context/output limits when model metadata is available.
             if let Some(provider) = provider {
                 if let Some(model_meta) = provider.models.iter().find(|m| m.id == entry.model_id) {
                     let mut limit = serde_json::Map::new();
@@ -161,6 +231,7 @@ pub fn inject_provider(
     });
 
     {
+        // Insert or replace the coderouter provider entry, preserving other providers.
         let obj = config.as_object_mut().unwrap();
         if let Some(serde_json::Value::Object(provider_obj)) = obj.get_mut("provider") {
             provider_obj.insert("coderouter".to_string(), coderouter_provider);
@@ -175,10 +246,18 @@ pub fn inject_provider(
     }
 
     write_config(config_path, &config)?;
+    // Cache the config so we can fall back if the original is removed.
     let _ = save_opencode_cache(config_path);
     Ok(())
 }
 
+/// Removes the CodeRouter provider from the OpenCode configuration.
+///
+/// Deletes the `provider.coderouter` key. If the `provider` object becomes
+/// empty as a result, the entire `provider` key is removed.
+///
+/// # Errors
+/// Returns an error if the config cannot be read or written.
 pub fn remove_provider(config_path: &Path) -> Result<()> {
     let mut config = read_config(config_path)?;
 
@@ -197,6 +276,18 @@ pub fn remove_provider(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Writes agent model assignments into the OpenCode configuration.
+///
+/// Each non-`None` field in `mapping` is written as `agent.<role>.model =
+/// "coderouter/<alias>"`. The `small_model` field is written as a top-level
+/// `"small_model"` key. Existing keys in each agent object are preserved.
+///
+/// # Arguments
+/// * `config_path` - Path to the OpenCode JSON config file.
+/// * `mapping` - The agent-to-group mapping to apply.
+///
+/// # Errors
+/// Returns an error if the config cannot be read or written.
 pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()> {
     let mut config = read_config(config_path)?;
 
@@ -210,6 +301,8 @@ pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()
         ("summary", &mapping.summary),
     ];
 
+    // For each mapped agent role, merge the model assignment into the existing
+    // agent config object, preserving sibling keys like "tools" or "prompt".
     for (agent_name, model_alias) in &agent_map {
         if let Some(alias) = model_alias {
             let obj = config.as_object_mut().unwrap();
@@ -245,12 +338,23 @@ pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()
     Ok(())
 }
 
+/// Removes all CodeRouter-managed agent model assignments from the OpenCode config.
+///
+/// Any agent entry whose `model` starts with `"coderouter/"` has that key
+/// removed. If the agent entry becomes empty afterward, the agent is removed
+/// entirely. If the `agent` object becomes empty, it is removed. The
+/// `small_model` top-level key is also removed if it references a CodeRouter
+/// model.
+///
+/// # Errors
+/// Returns an error if the config cannot be read or written.
 pub fn remove_agent_models(config_path: &Path) -> Result<()> {
     let mut config = read_config(config_path)?;
 
     {
         let obj = config.as_object_mut().unwrap();
         if let Some(serde_json::Value::Object(agents)) = obj.get_mut("agent") {
+            // Collect agent keys whose model references a coderouter alias.
             let keys_to_remove: Vec<String> = agents
                 .iter()
                 .filter_map(|(key, value)| {
@@ -265,6 +369,8 @@ pub fn remove_agent_models(config_path: &Path) -> Result<()> {
                 })
                 .collect();
 
+            // Remove the "model" key from each coderouter-referencing agent,
+            // and clean up the agent entry entirely if it becomes empty.
             for key in keys_to_remove {
                 if let Some(serde_json::Value::Object(agent_config)) = agents.get_mut(&key) {
                     agent_config.remove("model");
@@ -274,11 +380,13 @@ pub fn remove_agent_models(config_path: &Path) -> Result<()> {
                 }
             }
 
+            // Remove the entire agent block if no agents remain.
             if agents.is_empty() {
                 obj.remove("agent");
             }
         }
 
+        // Also remove the top-level small_model if it references coderouter.
         if let Some(serde_json::Value::String(small)) = obj.get("small_model") {
             if small.starts_with("coderouter/") {
                 obj.remove("small_model");
@@ -289,6 +397,25 @@ pub fn remove_agent_models(config_path: &Path) -> Result<()> {
     write_config(config_path, &config)
 }
 
+/// Builds a JSON string preview of what the OpenCode config would look like
+/// after injecting the CodeRouter provider and (optionally) agent mappings.
+///
+/// This performs the same merge logic as [`inject_provider`] and
+/// [`set_agent_models`] combined, but without writing to disk — instead
+/// returning the pretty-printed JSON for display purposes.
+///
+/// # Arguments
+/// * `groups` - The router group definitions.
+/// * `providers` - Provider configs used to look up model metadata.
+/// * `proxy_port` - The local port the CodeRouter proxy listens on.
+/// * `mapping` - Optional agent mapping to include in the preview.
+/// * `entry_statuses` - Map of `"provider_id:idx"` → `"active"`/`"cooldown"`.
+///
+/// # Returns
+/// A pretty-printed JSON string of the merged configuration.
+///
+/// # Errors
+/// Returns an error if the config cannot be read or serialized.
 pub fn preview_opencode_config(
     groups: &[Group],
     providers: &[Provider],
@@ -303,6 +430,8 @@ pub fn preview_opencode_config(
     let mut models = serde_json::Map::new();
 
     for group in groups {
+        // Find the highest-priority enabled entry whose status is "active"
+        // (or absent from the status map, which defaults to active).
         let highest_active = group
             .entries
             .iter()
@@ -380,6 +509,8 @@ pub fn preview_opencode_config(
             ("summary", &mapping.summary),
         ];
 
+        // For each mapped agent role, merge the model assignment into the
+        // preview config object (same logic as set_agent_models).
         for (agent_name, model_alias) in &agent_map {
             if let Some(alias) = model_alias {
                 let obj = config.as_object_mut().unwrap();
@@ -402,6 +533,7 @@ pub fn preview_opencode_config(
             }
         }
 
+        // small_model lives at the top level, not inside the agent block.
         if let Some(ref small) = mapping.small_model {
             let obj = config.as_object_mut().unwrap();
             obj.insert(
@@ -414,6 +546,8 @@ pub fn preview_opencode_config(
     serde_json::to_string_pretty(&config).map_err(|e| e.into())
 }
 
+/// Reads the OpenCode config file. Returns an empty JSON object if the file
+/// does not exist.
 fn read_config(config_path: &Path) -> Result<serde_json::Value> {
     if config_path.exists() {
         let contents = fs::read_to_string(config_path)?;
@@ -424,6 +558,8 @@ fn read_config(config_path: &Path) -> Result<serde_json::Value> {
     }
 }
 
+/// Reads the OpenCode config from the auto-detected path, falling back to
+/// the cached copy if the file has been removed since it was last seen.
 fn read_config_or_empty() -> Result<serde_json::Value> {
     let path = detect_opencode_config();
     match path {
@@ -436,6 +572,12 @@ fn read_config_or_empty() -> Result<serde_json::Value> {
     }
 }
 
+/// Atomically writes a JSON config to disk using a temp-file-and-rename pattern.
+///
+/// The file is written with exclusive locking (`flock`), flushed, `fsync`'d,
+/// then renamed over the target. Permissions are set to `0o600` (owner
+/// read/write only) on both the temp file and the final file because the
+/// config may contain API keys.
 fn write_config(config_path: &Path, config: &serde_json::Value) -> Result<()> {
     if let Some(parent) = config_path.parent() {
         if !parent.exists() {
@@ -444,6 +586,7 @@ fn write_config(config_path: &Path, config: &serde_json::Value) -> Result<()> {
     }
 
     let content = serde_json::to_string_pretty(config)?;
+    // Write to a temp file first, then rename for atomic replacement.
     let tmp_path = config_path.with_extension(format!("tmp.{}", std::process::id()));
 
     let mut file = fs::OpenOptions::new()
@@ -452,18 +595,22 @@ fn write_config(config_path: &Path, config: &serde_json::Value) -> Result<()> {
         .truncate(true)
         .open(&tmp_path)?;
 
+    // Exclusive lock prevents concurrent writes from multiple processes.
     file.lock_exclusive()?;
     file.write_all(content.as_bytes())?;
     file.flush()?;
     file.sync_all()?;
     file.unlock()?;
 
+    // Restrict permissions to owner-only because the config may contain API keys.
     let mut perms = file.metadata()?.permissions();
     perms.set_mode(0o600);
     file.set_permissions(perms)?;
 
+    // Atomic rename replaces the old file without leaving a corrupt state.
     fs::rename(&tmp_path, config_path)?;
 
+    // Also set permissions on the final path in case rename didn't preserve them.
     if let Ok(metadata) = fs::metadata(config_path) {
         let mut perms = metadata.permissions();
         perms.set_mode(0o600);
@@ -473,6 +620,10 @@ fn write_config(config_path: &Path, config: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Checks whether a group alias is currently referenced in the OpenCode config
+/// by any agent's `model` field or by `small_model`.
+///
+/// This is used to warn users before deleting a group that is in active use.
 pub fn is_group_alias_referenced(group_alias: &str) -> bool {
     let path = match detect_opencode_config() {
         Some(p) => p,
@@ -491,6 +642,7 @@ pub fn is_group_alias_referenced(group_alias: &str) -> bool {
         return false;
     };
     let coderouter_model = format!("coderouter/{}", group_alias);
+    // Check agent entries for references to this group alias.
     if let Some(serde_json::Value::Object(agents)) = obj.get("agent") {
         for (_key, value) in agents {
             if let serde_json::Value::Object(agent_config) = value {
@@ -502,6 +654,7 @@ pub fn is_group_alias_referenced(group_alias: &str) -> bool {
             }
         }
     }
+    // Also check the top-level small_model key.
     if let Some(serde_json::Value::String(small)) = obj.get("small_model") {
         if small == &coderouter_model {
             return true;
@@ -510,10 +663,27 @@ pub fn is_group_alias_referenced(group_alias: &str) -> bool {
     false
 }
 
+/// Reads the OpenCode config and extracts any CodeRouter-managed agent assignments
+/// into an [`AgentMapping`].
+///
+/// Only agent slots whose `model` value starts with `"coderouter/"` are
+/// extracted; others are left as `None`. The `"coderouter/"` prefix is stripped
+/// so the mapping contains bare group aliases.
+///
+/// # Arguments
+/// * `config_path` - Path to the OpenCode JSON config file.
+///
+/// # Returns
+/// An [`AgentMapping`] reflecting current CodeRouter assignments.
+///
+/// # Errors
+/// Returns an error if the config file cannot be read or is not a JSON object.
 pub fn get_current_agent_mapping(config_path: &Path) -> Result<AgentMapping> {
     let config = read_config(config_path)?;
     let obj = config.as_object().ok_or("Config is not an object")?;
 
+    // Helper closure: extract the group alias from agent.<key>.model,
+    // stripping the "coderouter/" prefix if present.
     let extract = |key: &str| -> Option<String> {
         obj.get("agent")
             .and_then(|a| a.get(key))
@@ -541,10 +711,12 @@ pub fn get_current_agent_mapping(config_path: &Path) -> Result<AgentMapping> {
     Ok(mapping)
 }
 
+/// Wraps a string slice as a JSON string value.
 fn json_str(s: &str) -> serde_json::Value {
     serde_json::Value::String(s.to_string())
 }
 
+/// Wraps a `u64` as a JSON number value.
 fn json_num(n: u64) -> serde_json::Value {
     serde_json::Value::Number(serde_json::Number::from(n))
 }

@@ -17,6 +17,7 @@ import type { RequestRow } from '../types';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 
+/** Date range preset options for the metrics view. */
 type Preset = 'today' | 'last7' | 'last30' | 'custom';
 
 interface DateRange {
@@ -24,17 +25,22 @@ interface DateRange {
   end: Date;
 }
 
+/** Maximum number of request rows displayed per page in the table. */
 const PAGE_SIZE = 50;
+/** Maximum number of rows fetched from the backend in a single IPC call. */
 const FETCH_LIMIT = 1000;
 
+/** Returns the start of the given day in UTC (midnight). */
 function startOfDay(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
 }
 
+/** Returns the end of the given day in UTC (23:59:59.999). */
 function endOfDay(d: Date): Date {
   return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate(), 23, 59, 59, 999));
 }
 
+/** Formats a Date as a YYYY-MM-DD string. */
 function formatDate(d: Date): string {
   const year = d.getUTCFullYear();
   const month = String(d.getUTCMonth() + 1).padStart(2, '0');
@@ -42,10 +48,12 @@ function formatDate(d: Date): string {
   return `${year}-${month}-${day}`;
 }
 
+/** Formats a Date for human-readable display (e.g., "Jan 5, 2026"). */
 function formatDisplayDate(d: Date): string {
   return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+/** Formats a Unix timestamp (seconds) as a localized short date+time string. */
 function formatTs(ts: number): string {
   return new Date(ts * 1000).toLocaleString('en-US', {
     month: 'short',
@@ -55,12 +63,14 @@ function formatTs(ts: number): string {
   });
 }
 
+/** Formats a token count with K/M suffixes for large numbers. */
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return `${n}`;
 }
 
+/** Generates an array of YYYY-MM-DD date strings covering the inclusive range from start to end. */
 function getDaysInRange(start: Date, end: Date): string[] {
   const days: string[] = [];
   const current = new Date(start.getFullYear(), start.getMonth(), start.getDate());
@@ -72,6 +82,7 @@ function getDaysInRange(start: Date, end: Date): string[] {
   return days;
 }
 
+/** Returns an array of n distinct hex color strings from a fixed palette, cycling if needed. */
 function generateColors(n: number): string[] {
   const palette = [
     '#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6',
@@ -81,6 +92,10 @@ function generateColors(n: number): string[] {
   return Array.from({ length: n }, (_, i) => palette[i % palette.length]);
 }
 
+/**
+ * Sortable table header cell. Displays the column name and an ascending/
+ * descending arrow indicator for the currently sorted column.
+ */
 function SortHeader({ column, children, sortColumn, sortDirection, onSort }: { column: keyof RequestRow; children: React.ReactNode; sortColumn: keyof RequestRow; sortDirection: 'asc' | 'desc'; onSort: (column: keyof RequestRow) => void }) {
   return (
     <TableHead
@@ -97,6 +112,10 @@ function SortHeader({ column, children, sortColumn, sortDirection, onSort }: { c
   );
 }
 
+/**
+ * Multi-select filter dropdown with checkboxes. Closes on outside click.
+ * Shows a badge with the count of selected items when non-empty.
+ */
 function FilterDropdown({
   label,
   options,
@@ -165,6 +184,11 @@ function FilterDropdown({
   );
 }
 
+/**
+ * Usage & Metrics page. Provides a date range picker, summary cards,
+ * recharts visualizations (cost/tokens by provider, request volume by group),
+ * and a filterable, sortable, paginated request log table with CSV export.
+ */
 export default function UsageMetrics() {
   const [preset, setPreset] = useState<Preset>('last7');
   const [customStart, setCustomStart] = useState(formatDate(new Date(Date.now() - 7 * 86400000)));
@@ -185,6 +209,7 @@ export default function UsageMetrics() {
   const [showFilterGroups, setShowFilterGroups] = useState(false);
   const [showFilterStatuses, setShowFilterStatuses] = useState(false);
 
+  // Compute the effective date range from the selected preset or custom dates.
   const dateRange: DateRange = useMemo(() => {
     const now = new Date();
     switch (preset) {
@@ -199,6 +224,9 @@ export default function UsageMetrics() {
     }
   }, [preset, customStart, customEnd]);
 
+  // Fetch requests from the backend on mount and every 30 seconds.
+  // Adjusts the fetch limit based on the selected preset to balance
+  // memory usage vs. coverage.
   useEffect(() => {
     const loadData = async () => {
       setLoading(true);
@@ -216,6 +244,7 @@ export default function UsageMetrics() {
     return () => clearInterval(interval);
   }, [preset, customStart, customEnd]);
 
+  // Filter requests by date range, provider, group, and status.
   const filteredRequests = useMemo(() => {
     const startTs = dateRange.start.getTime() / 1000;
     const endTs = dateRange.end.getTime() / 1000;
@@ -229,6 +258,7 @@ export default function UsageMetrics() {
     });
   }, [allRequests, dateRange, filterProviders, filterGroups, filterStatuses]);
 
+  // Sort the filtered list by the currently selected column and direction.
   const sortedRequests = useMemo(() => {
     return [...filteredRequests].sort((a, b) => {
       const aVal = a[sortColumn];
@@ -247,15 +277,18 @@ export default function UsageMetrics() {
   }, [filteredRequests, sortColumn, sortDirection]);
 
   const totalPages = Math.max(1, Math.ceil(sortedRequests.length / PAGE_SIZE));
+  // Slice the sorted results for the current page.
   const pagedRequests = useMemo(() => {
     const startIdx = (page - 1) * PAGE_SIZE;
     return sortedRequests.slice(startIdx, startIdx + PAGE_SIZE);
   }, [sortedRequests, page]);
 
+  // Reset to page 1 whenever filters or sort change.
   useEffect(() => {
     setPage(1);
   }, [dateRange, filterProviders, filterGroups, filterStatuses, sortColumn, sortDirection]);
 
+  /** Toggles sort direction if the column is already active, otherwise sorts ascending (descending for timestamps). */
   const handleSort = (column: keyof RequestRow) => {
     if (sortColumn === column) {
       setSortDirection((d) => (d === 'asc' ? 'desc' : 'asc'));
@@ -265,10 +298,12 @@ export default function UsageMetrics() {
     }
   };
 
+  /** Toggles a value in a filter list (adds if absent, removes if present). */
   const toggleFilter = (list: string[], value: string, setter: (v: string[]) => void) => {
     setter(list.includes(value) ? list.filter((v) => v !== value) : [...list, value]);
   };
 
+  // Compute aggregate summary stats from filtered requests.
   const summary = useMemo(() => {
     const totalRequests = filteredRequests.length;
     const totalTokens = filteredRequests.reduce((s, r) => s + r.prompt_tokens + r.output_tokens, 0);
@@ -278,6 +313,13 @@ export default function UsageMetrics() {
     return { totalRequests, totalTokens, totalCost, p50 };
   }, [filteredRequests]);
 
+  /**
+   * Transforms filtered requests into chart-ready data series:
+   * - costChartData: stacked bar chart of daily cost by provider
+   * - tokensChartData: stacked bar chart of daily tokens by provider
+   * - volumeChartData: line chart of daily request count by group
+   * Also computes color assignments for each provider and group.
+   */
   const chartData = useMemo(() => {
     const days = getDaysInRange(dateRange.start, dateRange.end);
     const providerColors: Record<string, string> = {};
@@ -325,6 +367,7 @@ export default function UsageMetrics() {
     return { costChartData, tokensChartData, volumeChartData, providerNames, groupNames, providerColors, groupColors };
   }, [filteredRequests, allRequests, dateRange]);
 
+  /** Exports the currently filtered requests as a CSV file download. */
   const exportCSV = useCallback(() => {
     const headers = ['Timestamp', 'Group', 'Provider', 'Model', 'Prompt Tokens', 'Output Tokens', 'Cost', 'Latency (ms)', 'Status', 'Error'];
     const rows = filteredRequests.map((r) => [
@@ -613,6 +656,7 @@ export default function UsageMetrics() {
   );
 }
 
+/** Displays a single metric (label + value) in a card. */
 function SummaryCard({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900 p-4">
@@ -622,6 +666,7 @@ function SummaryCard({ label, value }: { label: string; value: string }) {
   );
 }
 
+/** Wrapper card for a chart section with a title header. */
 function ChartCard({ title, children, className = '' }: { title: string; children: React.ReactNode; className?: string }) {
   return (
     <div className={`rounded-lg border border-zinc-800 bg-zinc-900 p-5 ${className}`}>
@@ -631,6 +676,7 @@ function ChartCard({ title, children, className = '' }: { title: string; childre
   );
 }
 
+/** Placeholder shown when a chart has no data for the selected range. */
 function EmptyChart() {
   return (
     <div className="flex h-[280px] items-center justify-center text-sm text-zinc-500">

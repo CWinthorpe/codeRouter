@@ -1,3 +1,15 @@
+//! Model discovery and scheduled refresh for provider model catalogues.
+//!
+//! Supports two discovery strategies:
+//! - **Anthropic**: returns a hardcoded model list because Anthropic has no public
+//!   `/v1/models` endpoint.
+//! - **OpenAI-compatible**: queries the provider's `/v1/models` list endpoint and
+//!   optionally the per-model detail endpoint, handling multiple response formats
+//!   including OpenRouter's `top_provider`, `pricing`, and `model_spec` extensions.
+//!
+//! Pricing fields may be expressed as per-token costs, per-million-token costs, or
+//! even quoted strings; this module normalizes everything to USD per million tokens.
+
 use reqwest::Client;
 use serde::Deserialize;
 use chrono::Utc;
@@ -6,8 +18,15 @@ use crate::config::models::{Provider, ProviderModel};
 use crate::config::store::{load_app_config, load_providers, save_providers, update_providers_with_lock};
 use crate::credentials::keychain::get_credential;
 
+/// Result type alias for model refresh operations, boxing errors for flexibility across IO and HTTP failures.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+/// Deserializes a JSON value that may be a number, a quoted string, or null into `Option<f64>`.
+///
+/// Some providers (e.g. OpenRouter) return pricing values as strings like `"0.000003"`
+/// instead of native numbers, and may also use `null` as a sentinel for "not applicable".
+/// This custom deserializer handles all three cases so that downstream price-per-token
+/// fields never fail deserialization regardless of the wire format.
 fn deserialize_string_or_float<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -21,11 +40,17 @@ where
     }
 }
 
+/// Top-level response envelope from OpenAI-compatible `/v1/models` endpoints.
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
     data: Vec<OpenAiModelEntry>,
 }
 
+/// A single model entry returned in the list response.
+///
+/// Fields are optional because different providers expose varying levels of detail
+/// in list vs. detail endpoints. `top_provider` and `model_spec` are OpenRouter
+/// extensions that carry provider-specific metadata.
 #[derive(Debug, Deserialize)]
 struct OpenAiModelEntry {
     id: String,
@@ -49,6 +74,10 @@ struct OpenAiModelEntry {
     top_provider: Option<TopProvider>,
 }
 
+/// Detailed model information retrieved from a per-model detail endpoint.
+///
+/// Some providers expose richer metadata (context limits, pricing) only when
+/// querying `/v1/models/{id}` rather than in the list response.
 #[derive(Debug, Deserialize)]
 struct OpenAiModelDetail {
     #[serde(default)]
@@ -67,6 +96,8 @@ struct OpenAiModelDetail {
     output_cost_per_token: Option<f64>,
 }
 
+/// OpenRouter-specific metadata embedded in each model entry, providing
+/// provider-level context length and output token limits.
 #[derive(Debug, Deserialize)]
 struct TopProvider {
     #[serde(default)]
@@ -75,6 +106,8 @@ struct TopProvider {
     max_completion_tokens: Option<u64>,
 }
 
+/// OpenRouter-style pricing object where `prompt` and `completion` are per-token
+/// costs that may appear as either numbers or quoted strings.
 #[derive(Debug, Deserialize)]
 struct PricingInfo {
     #[serde(default, deserialize_with = "deserialize_string_or_float")]
@@ -83,6 +116,8 @@ struct PricingInfo {
     completion: Option<f64>,
 }
 
+/// OpenRouter `model_spec` extension carrying capability and pricing metadata
+/// in a structured format distinct from the flat top-level fields.
 #[derive(Debug, Deserialize)]
 struct ModelSpec {
     #[serde(default, rename = "availableContextTokens")]
@@ -93,6 +128,8 @@ struct ModelSpec {
     pricing: Option<ModelSpecPricing>,
 }
 
+/// Nested pricing inside a `model_spec`, using dollar amounts per million tokens
+/// rather than per-token costs.
 #[derive(Debug, Deserialize)]
 struct ModelSpecPricing {
     #[serde(default)]
@@ -101,17 +138,37 @@ struct ModelSpecPricing {
     output: Option<ModelSpecPrice>,
 }
 
+/// A single price point (in USD per million tokens) within a `model_spec.pricing` block.
 #[derive(Debug, Deserialize)]
 struct ModelSpecPrice {
     #[serde(default)]
     usd: Option<f64>,
 }
 
+/// Fetches the list of available models for a given provider.
+///
+/// For Anthropic providers, returns a hardcoded model list because Anthropic has no
+/// public model discovery API. For all other providers (OpenAI, OpenRouter, etc.),
+/// calls the OpenAI-compatible `/v1/models` endpoint and enriches each entry with
+/// per-model detail data when available.
+///
+/// # Arguments
+/// * `provider` - The provider configuration, including protocol and base URL.
+/// * `api_key` - The credential used to authenticate with the provider API.
+/// * `client` - A reusable HTTP client for making requests.
+///
+/// # Returns
+/// A vector of [`ProviderModel`] entries, or an error if the API call fails.
+///
+/// # Errors
+/// Returns an error if the HTTP request fails, the response is non-success, or
+/// the response body cannot be parsed.
 pub async fn fetch_models_for_provider(
     provider: &Provider,
     api_key: &str,
     client: &Client,
 ) -> Result<Vec<ProviderModel>> {
+    // If the user has overridden the model list, skip discovery entirely.
     if let Some(overrides) = &provider.model_overrides {
         if !overrides.is_empty() {
             return Ok(overrides.clone());
@@ -123,6 +180,21 @@ pub async fn fetch_models_for_provider(
     }
 }
 
+/// Fetches models from any OpenAI-compatible provider by querying the `/v1/models`
+/// endpoint and then attempting to GET per-model details for richer metadata.
+///
+/// The function first collects basic model info from the list endpoint, then for
+/// each model it tries to fetch detailed info (context window, pricing, output limits).
+/// Detail endpoint failures are silently ignored so partial data still flows through.
+///
+/// # Arguments
+/// * `provider` - Provider configuration with `base_url`.
+/// * `api_key` - Bearer token for the provider API.
+/// * `client` - Shared HTTP client.
+///
+/// # Errors
+/// Returns an error if the initial list endpoint returns a non-success status or
+/// the response body cannot be deserialized.
 async fn fetch_openai_compatible_models(
     provider: &Provider,
     api_key: &str,
@@ -155,16 +227,23 @@ async fn fetch_openai_compatible_models(
     for entry in models_list.data {
         let detail_url = format!("{base_url}/models/{}", entry.id);
 
+        // Context window is reported under different field names by different providers.
+        // Prefer the most specific field available, falling back through OpenRouter's
+        // top_provider.context_length and model_spec.availableContextTokens.
         let entry_ctx = entry.context_window
             .or(entry.context_length)
             .or_else(|| entry.top_provider.as_ref().and_then(|tp| tp.context_length))
             .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.available_context_tokens));
 
+        // Similarly for max output tokens, multiple field names are used.
         let entry_max_out = entry.max_output_tokens
             .or(entry.max_completion_tokens)
             .or_else(|| entry.top_provider.as_ref().and_then(|tp| tp.max_completion_tokens))
             .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.max_completion_tokens));
 
+        // Per-token costs from the list endpoint are multiplied by 1M to produce
+        // per-million-token costs. model_spec pricing is already expressed in USD
+        // per million tokens, so it is used as-is.
         let entry_input_cost = entry.input_cost_per_token.map(|c| c * 1_000_000.0)
             .or_else(|| entry.pricing.as_ref().and_then(|p| p.prompt).map(|c| c * 1_000_000.0))
             .or_else(|| entry.model_spec.as_ref()
@@ -189,10 +268,14 @@ async fn fetch_openai_compatible_models(
             protocol: None,
         };
 
+        // Attempt to fetch per-model detail for richer metadata. A failure here
+        // is non-fatal; we keep the basic data from the list endpoint.
         if let Ok(detail_resp) = client.get(&detail_url).header("Authorization", format!("Bearer {api_key}")).timeout(std::time::Duration::from_secs(30)).send().await {
             if detail_resp.status().is_success() {
                 if let Ok(text) = detail_resp.text().await {
                     if let Ok(detail) = parse_model_detail(&text) {
+                        // Detail endpoint data overrides list data for context and output limits
+                        // only when the detail endpoint actually provides those fields.
                         let detail_ctx = detail.context_window.or(detail.context_length);
                         if detail_ctx.is_some() {
                             model.context_window = detail_ctx;
@@ -203,6 +286,8 @@ async fn fetch_openai_compatible_models(
                             model.max_output_tokens = detail_max;
                         }
 
+                        // Detail endpoint pricing overrides list pricing when present.
+                        // PricingInfo fields are per-token costs, so they need the 1M multiplier.
                         if let Some(pricing) = detail.pricing {
                             if let Some(prompt) = pricing.prompt {
                                 model.input_cost_per_1m = Some(prompt * 1_000_000.0);
@@ -212,6 +297,8 @@ async fn fetch_openai_compatible_models(
                             }
                         }
 
+                        // Top-level per-token fields from the detail endpoint override
+                        // everything else, as they are the most authoritative source.
                         if let Some(cost) = detail.input_cost_per_token {
                             model.input_cost_per_1m = Some(cost * 1_000_000.0);
                         }
@@ -219,6 +306,8 @@ async fn fetch_openai_compatible_models(
                             model.output_cost_per_1m = Some(cost * 1_000_000.0);
                         }
                     } else if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                        // The detail endpoint returned valid JSON but it didn't match
+                        // OpenAiModelDetail — fall back to manual field extraction.
                         model = extract_from_raw_json(&value, model, &now);
                     }
                 }
@@ -231,6 +320,10 @@ async fn fetch_openai_compatible_models(
     Ok(result)
 }
 
+/// Attempts to parse a model detail response body into [`OpenAiModelDetail`].
+///
+/// Falls back to an all-`None` struct on deserialization failure so callers can
+/// still use partial data from the list response.
 fn parse_model_detail(text: &str) -> Result<OpenAiModelDetail> {
     let value: serde_json::Value = serde_json::from_str(text)?;
     let detail = serde_json::from_value::<OpenAiModelDetail>(value).unwrap_or(OpenAiModelDetail {
@@ -245,11 +338,25 @@ fn parse_model_detail(text: &str) -> Result<OpenAiModelDetail> {
     Ok(detail)
 }
 
+/// Extracts model metadata from an arbitrary JSON object when structured
+/// deserialization fails. Handles multiple provider-specific formats:
+///
+/// - OpenAI-style: `context_window`, `max_output_tokens`, `input_cost_per_token`
+/// - OpenRouter-style: `context_length`, `max_completion_tokens`, `pricing.prompt`/`completion`
+/// - OpenRouter `top_provider`: nested `context_length` and `max_completion_tokens`
+/// - OpenRouter `model_spec`: `availableContextTokens`, `maxCompletionTokens`, structured pricing
+///
+/// For context/token values, top-level keys take precedence; `model_spec` fields
+/// are used only as fallbacks (via `.or()`) so that explicit data is not overwritten.
+/// For pricing, per-token costs and PricingInfo are applied unconditionally since
+/// they represent the most authoritative source available at that extraction stage.
 fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, now: &str) -> ProviderModel {
     if let Some(obj) = value.as_object() {
+        // Top-level context fields: unconditional assignment overrides list data.
         if let Some(v) = obj.get("context_window").and_then(|v| v.as_u64()) {
             model.context_window = Some(v);
         }
+        // context_length is a fallback only if context_window hasn't been set.
         if let Some(v) = obj.get("context_length").and_then(|v| v.as_u64()) {
             model.context_window = model.context_window.or(Some(v));
         }
@@ -260,8 +367,10 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
             model.max_output_tokens = model.max_output_tokens.or(Some(v));
         }
 
+        // OpenRouter-style pricing object with per-token prompt/completion costs.
         if let Some(pricing) = obj.get("pricing").and_then(|v| v.as_object()) {
             if let Some(prompt) = pricing.get("prompt") {
+                // Pricing values may be numbers or quoted strings.
                 let parsed = prompt.as_f64().or_else(|| prompt.as_str().and_then(|s| s.parse::<f64>().ok()));
                 if let Some(p) = parsed {
                     model.input_cost_per_1m = Some(p * 1_000_000.0);
@@ -275,6 +384,7 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
             }
         }
 
+        // Top-level per-token cost fields override pricing-object values.
         if let Some(v) = obj.get("input_cost_per_token") {
             let parsed = v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()));
             if let Some(p) = parsed {
@@ -288,6 +398,7 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
             }
         }
 
+        // model_spec fields are used as fallback when top-level values are missing.
         if let Some(spec) = obj.get("model_spec").and_then(|v| v.as_object()) {
             if let Some(v) = spec.get("availableContextTokens").and_then(|v| v.as_u64()) {
                 model.context_window = model.context_window.or(Some(v));
@@ -296,6 +407,7 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
                 model.max_output_tokens = model.max_output_tokens.or(Some(v));
             }
             if let Some(spec_pricing) = spec.get("pricing").and_then(|v| v.as_object()) {
+                // model_spec pricing is in USD per million tokens, so no multiplier needed.
                 if let Some(usd) = spec_pricing.get("input").and_then(|v| v.as_object()).and_then(|o| o.get("usd")).and_then(|v| v.as_f64()) {
                     model.input_cost_per_1m = model.input_cost_per_1m.or(Some(usd));
                 }
@@ -310,6 +422,12 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
     model
 }
 
+/// Returns the hardcoded list of Anthropic models with their specifications.
+///
+/// Anthropic does not expose a public model discovery API, so the available
+/// models with their context windows, output limits, and per-million-token
+/// pricing are maintained here. If `model_overrides` are set on the provider
+/// config, those are returned instead (with updated `last_refreshed` timestamps).
 fn get_anthropic_models(provider: &Provider) -> Vec<ProviderModel> {
     let now = current_iso_timestamp();
 
@@ -330,6 +448,9 @@ fn get_anthropic_models(provider: &Provider) -> Vec<ProviderModel> {
     hardcoded
 }
 
+/// Known Anthropic model catalogue with context windows, output token limits,
+/// and pricing (USD per million tokens). Updated manually when Anthropic
+/// releases new models or changes pricing.
 fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
     vec![
         ProviderModel {
@@ -407,10 +528,16 @@ fn anthropic_hardcoded_models(now: &str) -> Vec<ProviderModel> {
     ]
 }
 
+/// Returns the current UTC timestamp in RFC 3339 / ISO 8601 format.
 fn current_iso_timestamp() -> String {
     Utc::now().to_rfc3339()
 }
 
+/// Determines whether a provider's model list should be refreshed based on age.
+///
+/// A provider needs refresh if its model list is empty, if no `last_refreshed`
+/// timestamp exists, if the timestamp cannot be parsed, or if more than
+/// `refresh_interval_hours` have elapsed since the last successful refresh.
 fn needs_refresh(provider: &Provider, refresh_interval_hours: u32) -> bool {
     if provider.models.is_empty() {
         return true;
@@ -432,6 +559,11 @@ fn needs_refresh(provider: &Provider, refresh_interval_hours: u32) -> bool {
     }
 }
 
+/// Refreshes model lists for all enabled providers that have stale data.
+///
+/// Loads the provider list and app config to determine the refresh interval,
+/// then spawns concurrent tasks for each provider that needs updating.
+/// Errors are logged but do not short-circuit other providers.
 pub async fn refresh_all_providers(client: &Client) {
     let providers = match load_providers() {
         Ok(p) => p,
@@ -476,6 +608,11 @@ pub async fn refresh_all_providers(client: &Client) {
     }
 }
 
+/// Refreshes a single provider's model list by fetching current data and
+/// persisting it via the lock-protected store update.
+///
+/// Credential lookup failures and API errors are logged; the provider is
+/// silently skipped rather than causing a panic.
 async fn refresh_single_provider(provider: &Provider, client: &Client) {
     let api_key = match get_credential(&provider.credential_key).await {
         Ok(key) => key,
@@ -516,6 +653,23 @@ async fn refresh_single_provider(provider: &Provider, client: &Client) {
     }
 }
 
+/// Refreshes model metadata for a specific provider by ID and returns the updated list.
+///
+/// Unlike [`refresh_all_providers`], this function is request-scoped: it validates
+/// the provider exists and is enabled, fetches the models, and writes back to the
+/// store. It uses `save_providers` rather than the lock-based update because it
+/// runs in a single-user context (the TUI).
+///
+/// # Arguments
+/// * `provider_id` - The unique identifier of the provider to refresh.
+/// * `client` - A reusable HTTP client for the API request.
+///
+/// # Returns
+/// The refreshed model list on success.
+///
+/// # Errors
+/// Returns an error if the provider is not found, disabled, credential lookup
+/// fails, the API call fails, or the store cannot be updated.
 pub async fn refresh_provider_models(provider_id: String, client: &Client) -> Result<Vec<ProviderModel>> {
     let providers = load_providers()?;
 

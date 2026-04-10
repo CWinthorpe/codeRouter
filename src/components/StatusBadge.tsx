@@ -1,4 +1,10 @@
+/**
+ * Badge component that displays a request status label with color-coded
+ * styling. Supports "success", "failover", "error", and "timeout" statuses;
+ * unknown statuses fall back to error styling.
+ */
 export function StatusBadge({ status }: { status: string }) {
+  // Map known statuses to semantic color classes; unknown values use error style
   const colors: Record<string, string> = {
     success: 'bg-green-500/20 text-green-400 border-green-500/30',
     failover: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/30',

@@ -1,3 +1,9 @@
+//! SSRF (Server-Side Request Forgery) protection.
+//!
+//! Validates upstream provider base URLs to ensure the proxy never sends
+//! requests to private, reserved, or loopback addresses. Also performs
+//! DNS resolution checks to guard against DNS rebinding attacks.
+
 use std::net::ToSocketAddrs;
 use url::Host;
 
@@ -59,6 +65,9 @@ pub fn validate_base_url(base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Resolves a hostname and checks that none of the resulting IP addresses
+/// fall into private/reserved ranges. Prevents DNS rebinding attacks where
+/// a public domain resolves to an internal address.
 fn check_dns_resolution(host: &str) -> Result<(), String> {
     let addr = format!("{}:0", host);
     match addr.to_socket_addrs() {
@@ -84,6 +93,14 @@ fn check_dns_resolution(host: &str) -> Result<(), String> {
     }
 }
 
+/// Returns `true` if the IPv4 address falls into any private, reserved, or
+/// special-use range that should never be an upstream target:
+///
+/// - Loopback (127.x.x.x)
+/// - Private (10.x, 172.16–31.x, 192.168.x)
+/// - Link-local (169.254.x)
+/// - Broadcast, documentation, 0.x, CGN, benchmarking, etc.
+/// - Multicast and experimental (≥ 224.x)
 fn is_private_or_reserved_v4(addr: &std::net::Ipv4Addr) -> bool {
     addr.is_loopback()
         || addr.is_private()
@@ -100,6 +117,8 @@ fn is_private_or_reserved_v4(addr: &std::net::Ipv4Addr) -> bool {
         || addr.octets()[0] >= 224
 }
 
+/// Returns `true` if the IPv6 address is loopback, unspecified,
+/// link-local, a unique-local address, or maps to a blocked IPv4 address.
 fn is_private_or_reserved_v6(addr: &std::net::Ipv6Addr) -> bool {
     addr.is_loopback()
         || addr.is_unspecified()

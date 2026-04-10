@@ -1,6 +1,18 @@
+//! Upstream HTTP request construction and dispatch.
+//!
+//! Builds `reqwest` requests for OpenAI and Anthropic providers, handles
+//! protocol-specific headers and body translation, and sends requests with
+//! an optional latency timeout.
+
 use reqwest::Client;
 use serde_json::Value;
 
+/// Builds a `reqwest::RequestBuilder` for a chat-completion request.
+///
+/// If `is_anthropic` is true, translates the OpenAI-format body to
+/// Anthropic `/messages` format and attaches Anthropic auth headers.
+/// Otherwise, injects the `upstream_model` into the JSON body and uses
+/// a standard `Bearer` token header.
 pub fn build_upstream_request(
     client: &Client,
     body: &Value,
@@ -29,6 +41,10 @@ pub fn build_upstream_request(
     req
 }
 
+/// Builds a `reqwest::RequestBuilder` for a legacy `/completions` request.
+///
+/// For Anthropic providers, converts the `prompt` field into a single-user
+/// `messages` array since Anthropic has no `/completions` endpoint.
 pub fn build_completion_request(
     client: &Client,
     body: &Value,
@@ -71,6 +87,12 @@ pub fn build_completion_request(
     req
 }
 
+/// Sends a request with an optional wall-clock latency timeout.
+///
+/// When `on_latency_timeout` is true, the request is wrapped in a
+/// `tokio::time::timeout` of `timeout_ms`. If the upstream does not
+/// respond within that window, [`UpstreamError::Timeout`] is returned so
+/// the caller can trigger failover.
 pub async fn send_with_timeout(
     req: reqwest::RequestBuilder,
     timeout_ms: u64,
@@ -91,14 +113,20 @@ pub async fn send_with_timeout(
     }
 }
 
+/// Errors that can occur when dispatching an upstream request.
 #[derive(Debug)]
 pub enum UpstreamError {
+    /// A network-level error (DNS, connection refused, TLS, etc.).
     Network(String),
+    /// The upstream did not respond within the configured latency timeout.
     Timeout,
 }
 
-// No total timeout: streaming responses can run for minutes (reasoning/thinking).
-// Per-layer timeouts handle each phase: connect (below), TTFB (send_with_timeout), inter-chunk (TimeoutStream).
+/// Creates a new `reqwest::Client` with a 30 s connect timeout.
+///
+/// No total timeout is configured because streaming responses can run for
+/// minutes (e.g., reasoning/thinking). Per-layer timeouts handle each
+/// phase: connect, TTFB, inter-chunk, and non-streaming body read.
 pub fn create_client(_timeout_secs: u64) -> Result<Client, reqwest::Error> {
     Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))

@@ -1,6 +1,14 @@
 import { useEffect, useRef } from 'react';
 import { useStore } from '../store';
 
+/**
+ * Hook that opens a Server-Sent Events (SSE) connection to the proxy's
+ * real-time metrics stream and pushes each incoming request row into the
+ * Zustand store.
+ *
+ * The connection is only established when the proxy is running; when the
+ * proxy stops the existing EventSource is closed to avoid dangling connections.
+ */
 export function useMetricsStream() {
   const appConfig = useStore((s) => s.appConfig);
   const addRecentRequest = useStore((s) => s.addRecentRequest);
@@ -8,6 +16,7 @@ export function useMetricsStream() {
   const esRef = useRef<EventSource | null>(null);
 
   useEffect(() => {
+    // Don't open a stream unless the proxy is confirmed running
     if (proxyStatus !== 'running') {
       if (esRef.current) {
         esRef.current.close();
@@ -26,6 +35,7 @@ export function useMetricsStream() {
     es.onmessage = (e) => {
       try {
         const raw = JSON.parse(e.data);
+        // Compute cost from per-million-token rates and actual token counts
         const inputCost = typeof raw.input_cost_per_1m === 'number' && typeof raw.prompt_tokens === 'number'
           ? (raw.prompt_tokens * raw.input_cost_per_1m) / 1_000_000
           : 0;
@@ -47,11 +57,12 @@ export function useMetricsStream() {
         };
         addRecentRequest(row);
       } catch {
-        // ignore parse errors
+        // Ignore malformed SSE messages — the stream may include non-JSON keep-alive frames
       }
     };
 
     es.onerror = () => {
+      // On error, close and null the ref so a fresh connection is created next effect run
       es.close();
       esRef.current = null;
     };

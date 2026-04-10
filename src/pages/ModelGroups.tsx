@@ -26,6 +26,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/u
 import { Progress } from '@/components/ui/progress';
 import type { Group, GroupEntry, FailoverConfig, Provider, EntryStatusResponse } from '../types';
 
+/** Default failover configuration applied to new groups. */
 const DEFAULT_FAILOVER: FailoverConfig = {
   on429: true,
   onQuotaExhausted: true,
@@ -37,11 +38,13 @@ const DEFAULT_FAILOVER: FailoverConfig = {
   consecutiveErrorCooldownMs: 600000,
 };
 
+/** Formats a number with locale-aware separators, or '—' for undefined. */
 function formatNumber(n?: number): string {
   if (n == null) return '—';
   return n.toLocaleString();
 }
 
+/** Formats an ISO timestamp for display, or '—' for falsy values. */
 function formatTimestamp(ts?: string): string {
   if (!ts) return '—';
   try {
@@ -51,6 +54,7 @@ function formatTimestamp(ts?: string): string {
   }
 }
 
+/** Returns a Tailwind color class pair for a given entry status. */
 function statusBadgeColor(status: string): string {
   switch (status) {
     case 'active':
@@ -66,6 +70,7 @@ function statusBadgeColor(status: string): string {
   }
 }
 
+/** Returns a Lucide icon component matching the entry status. */
 function statusIcon(status: string) {
   switch (status) {
     case 'active':
@@ -81,6 +86,7 @@ function statusIcon(status: string) {
   }
 }
 
+/** Returns a human-readable label for an entry status string. */
 function statusLabel(status: string): string {
   switch (status) {
     case 'active':
@@ -96,6 +102,11 @@ function statusLabel(status: string): string {
   }
 }
 
+/**
+ * Returns a human-readable countdown string (e.g., "2m 30s") from a
+ * cooldownUntil ISO timestamp. Returns 'Expiring…' when the timestamp
+ * is in the past. The _forceUpdateTick param forces re-renders.
+ */
 function cooldownCountdown(cooldownUntil?: string, _forceUpdateTick?: number): string {
   if (!cooldownUntil) return '';
   try {
@@ -109,6 +120,11 @@ function cooldownCountdown(cooldownUntil?: string, _forceUpdateTick?: number): s
   }
 }
 
+/**
+ * Model groups management page. Lists all groups as expandable cards
+ * with live status, and provides a modal form for creating/editing groups
+ * with drag-and-drop priority reordering and failover configuration.
+ */
 export default function ModelGroups() {
   const groups = useStore((s) => s.groups);
   const setGroups = useStore((s) => s.setGroups);
@@ -119,12 +135,17 @@ export default function ModelGroups() {
   const [expandedCards, setExpandedCards] = useState<Set<string>>(new Set());
   const toastCounterRef = useRef(0);
 
+  /**
+   * Enqueue a toast notification that auto-dismisses after 4 seconds.
+   * Uses a counter ref to guarantee unique IDs even for rapid calls.
+   */
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
     const id = Date.now() * 1000 + (++toastCounterRef.current);
     setToasts((prev) => [...prev, { id, type, message }]);
     setTimeout(() => setToasts((prev) => prev.filter((t) => t.id !== id)), 4000);
   }, []);
 
+  /** Refreshes the group list from the backend and updates the store. */
   const refreshGroups = useCallback(async () => {
     try {
       const data = await getGroups();
@@ -134,16 +155,22 @@ export default function ModelGroups() {
     }
   }, [setGroups]);
 
+  /** Opens the edit form pre-populated with the given group. */
   const handleEdit = useCallback((group: Group) => {
     setEditingGroup(group);
     setShowForm(true);
   }, []);
 
+  /** Opens the create form with a blank group. */
   const handleCreate = useCallback(() => {
     setEditingGroup(null);
     setShowForm(true);
   }, []);
 
+  /**
+   * Deletes a group after user confirmation. Checks whether the group
+   * is referenced in the OpenCode config and warns the user if so.
+   */
   const handleDelete = useCallback(
     async (group: Group) => {
       let openCodeRef = false;
@@ -170,6 +197,7 @@ export default function ModelGroups() {
     [refreshGroups, addToast],
   );
 
+  /** Toggles the expanded/collapsed state of a group card. */
   const toggleExpand = useCallback((id: string) => {
     setExpandedCards((prev) => {
       const next = new Set(prev);
@@ -246,6 +274,11 @@ export default function ModelGroups() {
   );
 }
 
+/**
+ * Renders a single model group as a card showing display name, alias,
+ * entry count, active entry info, health summary badges, and action buttons.
+ * When expanded, shows the {@link LiveStatusPanel}.
+ */
 function GroupCard({
   group,
   providers,
@@ -360,6 +393,7 @@ function GroupCard({
   );
 }
 
+/** Small badge displaying a count and label with a colored text class. Hidden when count is 0. */
 function HealthBadge({ label, count, color }: { label: string; count: number; color: string }) {
   if (count === 0) return null;
   return (
@@ -369,6 +403,11 @@ function HealthBadge({ label, count, color }: { label: string; count: number; co
   );
 }
 
+/**
+ * Displays live entry status information inside an expanded group card.
+ * Shows each entry's provider, model, status, cooldown countdown, quota
+ * progress bar, and an enable/disable toggle that calls the IPC layer.
+ */
 function LiveStatusPanel({
   groupId,
   entries,
@@ -382,17 +421,20 @@ function LiveStatusPanel({
   const [toggling, setToggling] = useState<string | null>(null);
   const [tick, setTick] = useState(0);
 
+  // Tick every second to refresh cooldown countdowns
   useEffect(() => {
     const interval = setInterval(() => setTick((t) => t + 1), 1000);
     return () => clearInterval(interval);
   }, []);
 
+  // Build a lookup map from entry index to its live status for O(1) access.
   const statusByIndex = useMemo(() => {
     const map = new Map<number, EntryStatusResponse>();
     statusData.entries.forEach((e) => map.set(e.entry_index, e));
     return map;
   }, [statusData.entries]);
 
+  /** Toggles the enabled/disabled state of an entry via IPC. */
   const handleToggle = useCallback(
     async (entryIndex: number, currentEnabled: boolean) => {
       const key = `${groupId}-${entryIndex}`;
@@ -490,6 +532,10 @@ function LiveStatusPanel({
   );
 }
 
+/**
+ * Reusable searchable dropdown component. Shows a text input that
+ * filters options on type, with click-outside-to-close behavior.
+ */
 function SearchableSelect({ options, value, onChange, placeholder, disabled }: {
   options: { value: string; label: string }[];
   value: string;
@@ -501,6 +547,7 @@ function SearchableSelect({ options, value, onChange, placeholder, disabled }: {
   const [search, setSearch] = useState('');
   const ref = useRef<HTMLDivElement>(null);
 
+  // Close the dropdown when clicking outside the component.
   useEffect(() => {
     if (!open) return;
     const handler = (e: MouseEvent) => {
@@ -539,6 +586,11 @@ function SearchableSelect({ options, value, onChange, placeholder, disabled }: {
   );
 }
 
+/**
+ * Modal form for creating or editing a model group. Supports drag-and-drop
+ * priority reordering of entries, per-entry quota overrides, enable/disable
+ * toggles, and a collapsible failover configuration panel.
+ */
 function GroupForm({
   group,
   providers,
@@ -565,10 +617,14 @@ function GroupForm({
   const [dragIdx, setDragIdx] = useState<number | null>(null);
   const dragOverThrottleRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const entryIdCounter = useRef(0);
+  // Track unique React keys for each entry row so that drag-and-drop
+  // reordering doesn't lose component state incorrectly.
   const [entryKeys, setEntryKeys] = useState<string[]>(
     group?.entries.map(() => `e-${++entryIdCounter.current}`) ?? []
   );
 
+  // Reset the failover panel when switching between groups.
+  // Reset the failover panel when switching between groups.
   useEffect(() => {
     setShowFailover(false);
   }, [group?.id]);
@@ -583,6 +639,7 @@ function GroupForm({
     [providers, addProviderId],
   );
 
+  /** Validates the group alias: must be non-empty and contain only lowercase alphanumerics and hyphens. */
   const validateAlias = useCallback((value: string) => {
     if (!value.trim()) {
       setAliasError('Alias is required.');
@@ -596,6 +653,7 @@ function GroupForm({
     return true;
   }, []);
 
+  /** Normalizes alias input by lowercasing and replacing spaces/special chars with hyphens. */
   const handleAliasChange = useCallback(
     (value: string) => {
       const normalized = value.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z0-9-]/g, '');
@@ -605,6 +663,7 @@ function GroupForm({
     [aliasError, validateAlias],
   );
 
+  /** Appends a new provider+model entry to the group with the next priority. */
   const handleAddEntry = useCallback(() => {
     if (!addProviderId || !addModelId) return;
     const newEntry: GroupEntry = {
@@ -623,17 +682,20 @@ function GroupForm({
     setShowAddEntry(false);
   }, [addProviderId, addModelId, addQuotaOverride, entries.length]);
 
+  /** Removes an entry by index and re-numbers priorities to stay contiguous. */
   const handleRemoveEntry = useCallback((idx: number) => {
     setEntries((prev) => prev.filter((_, i) => i !== idx).map((e, i) => ({ ...e, priority: i + 1 })));
     setEntryKeys((prev) => prev.filter((_, i) => i !== idx));
   }, []);
 
+  /** Toggles the enabled flag on a single entry. */
   const handleEntryToggle = useCallback((idx: number) => {
     setEntries((prev) =>
       prev.map((e, i) => (i === idx ? { ...e, enabled: !e.enabled } : e)),
     );
   }, []);
 
+  /** Updates the per-entry daily token quota override. */
   const handleQuotaChange = useCallback((idx: number, value: string) => {
     setEntries((prev) =>
       prev.map((e, i) =>
@@ -644,12 +706,18 @@ function GroupForm({
     );
   }, []);
 
-  const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
+  /** Initiates a drag: stores the source index in dataTransfer and state. */
+const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
     e.dataTransfer.effectAllowed = 'move';
     e.dataTransfer.setData('text/plain', String(idx));
     setDragIdx(idx);
   }, []);
 
+  /**
+   * Handles dragging over another entry. Throttled to 50ms to avoid
+   * excessive state updates. Swaps entries in the list and re-numbers
+   * all priorities to stay contiguous.
+   */
   const handleDragOver = useCallback((e: React.DragEvent, idx: number) => {
     e.preventDefault();
     if (dragIdx === null || dragIdx === idx) return;
@@ -672,15 +740,21 @@ function GroupForm({
     setDragIdx(idx);
   }, [dragIdx]);
 
+  /** Resets drag state when the drag operation ends. */
   const handleDragEnd = useCallback(() => {
     setDragIdx(null);
   }, []);
 
+  /** Prevents default browser behavior on drop to avoid navigation. */
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragIdx(null);
   }, []);
 
+  /**
+   * Validates alias, display name, and entries, then constructs a Group
+   * object with renumbered priorities and delegates to the parent's onSave.
+   */
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSaveError(null);
@@ -712,6 +786,7 @@ function GroupForm({
     }
   };
 
+  /** Resolves a provider ID to its display name. */
   const providerNameForId = useCallback(
     (id: string) => providers.find((p) => p.id === id)?.name ?? id,
     [providers],
@@ -1030,6 +1105,7 @@ function GroupForm({
   );
 }
 
+/** Simple toggle switch row used in the failover settings panel. */
 function ToggleRow({
   label,
   checked,

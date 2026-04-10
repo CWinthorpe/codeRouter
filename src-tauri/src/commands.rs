@@ -1,3 +1,10 @@
+//! Tauri IPC command handlers and shared application state.
+//!
+//! This module contains every `#[tauri::command]` function that the frontend
+//! can invoke, plus helper structs (`ProviderResponse`, `OpenCodeAgentMapping`,
+//! `AppState`, etc.) and sidecar lifecycle functions (`spawn_sidecar`,
+//! `kill_sidecar`).
+
 use coderouter_proxy::config::models::{AppConfig, Group, Provider};
 use coderouter_proxy::config::store;
 use coderouter_proxy::credentials::keychain;
@@ -14,8 +21,18 @@ use std::process::Child;
 use std::sync::Mutex;
 use tauri::menu::MenuItem;
 
+/// Global singleton SQLite connection for metrics queries.
+///
+/// Initialized once at startup via [`init_metrics_db`] and accessed through
+/// [`with_metrics_db`].
 static METRICS_DB: Mutex<Option<Connection>> = Mutex::new(None);
 
+/// Opens (or creates) the metrics database and stores the connection in the
+/// global [`METRICS_DB`] singleton.
+///
+/// # Errors
+/// Returns an error string if the database cannot be opened or if the global
+/// mutex is poisoned.
 pub fn init_metrics_db() -> Result<(), String> {
     let conn = db::init_db().map_err(|e| e.to_string())?;
     let mut guard = METRICS_DB.lock().map_err(|e| e.to_string())?;
@@ -23,12 +40,21 @@ pub fn init_metrics_db() -> Result<(), String> {
     Ok(())
 }
 
+/// Executes a closure with a reference to the global metrics database connection.
+///
+/// # Errors
+/// Returns an error string if the mutex is poisoned or if the database has not
+/// been initialized via [`init_metrics_db`].
 fn with_metrics_db<T, F: FnOnce(&Connection) -> Result<T, String>>(f: F) -> Result<T, String> {
     let guard = METRICS_DB.lock().map_err(|e| e.to_string())?;
     let conn = guard.as_ref().ok_or_else(|| "Metrics database not initialized".to_string())?;
     f(conn)
 }
 
+/// JSON-serializable provider representation for the frontend.
+///
+/// Mirrors [`Provider`] but flattens and renames fields for the API contract
+/// (e.g. `baseUrl`, `credentialKey`, `dailyTokenQuota`).
 #[derive(Serialize)]
 pub struct ProviderResponse {
     pub id: String,
@@ -52,6 +78,7 @@ pub struct ProviderResponse {
     pub models: Vec<ProviderModelResponse>,
 }
 
+/// JSON-serializable model metadata within a provider response.
 #[derive(Serialize)]
 pub struct ProviderModelResponse {
     pub id: String,
@@ -68,6 +95,7 @@ pub struct ProviderModelResponse {
     #[serde(default)]
     pub protocol: Option<String>,
 }
+
 impl From<&Provider> for ProviderResponse {
     fn from(p: &Provider) -> Self {
         ProviderResponse {
@@ -88,6 +116,8 @@ impl From<&Provider> for ProviderResponse {
                 last_refreshed: m.last_refreshed.clone(),
                 protocol: m.protocol.clone(),
             }).collect()).unwrap_or_default(),
+            // When no auto-discovered models exist, fall back to model overrides
+            // so the UI always has something to display.
             enabled: p.enabled,
             models: {
                 let auto: Vec<ProviderModelResponse> = p.models.iter().map(|m| ProviderModelResponse {
@@ -117,18 +147,29 @@ impl From<&Provider> for ProviderResponse {
     }
 }
 
+/// Returns all configured providers.
+///
+/// # Errors
+/// Returns an error string if the provider configuration file cannot be read.
 #[tauri::command]
 pub async fn get_providers() -> Result<Vec<ProviderResponse>, String> {
     let providers = store::load_providers().map_err(|e| e.to_string())?;
     Ok(providers.iter().map(|p| p.into()).collect())
 }
 
+/// Sends a config-reload signal to the running sidecar process.
+///
+/// Posts to the `/internal/config/reload` endpoint so the proxy picks up
+/// configuration changes without a full restart. Retries up to 3 times with
+/// a 500 ms delay between attempts because the sidecar may need a moment to
+/// become ready after a config write.
 async fn notify_sidecar_config_reload() {
     let config = store::load_app_config().unwrap_or_default();
     let url = format!("http://{}:{}/internal/config/reload", config.proxy_host, config.proxy_port);
     let client = Client::new();
 
     for attempt in 0..3 {
+        // Wait before retrying (skip delay on first attempt)
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -142,6 +183,20 @@ async fn notify_sidecar_config_reload() {
     eprintln!("[notify-sidecar] all retry attempts failed");
 }
 
+/// Creates or updates a provider and persists its API key in the keychain.
+///
+/// Validates that the protocol is either `"openai"` or `"anthropic"` and
+/// that the base URL passes SSRF checks. If a provider with the same id
+/// already exists it is replaced; otherwise a new entry is appended.
+///
+/// # Arguments
+/// * `provider` — The provider configuration to save.
+/// * `api_key`  — The API key to store in the system keychain. If empty,
+///   no keychain operation is performed.
+///
+/// # Errors
+/// Returns an error string if the protocol is invalid, the base URL fails
+/// SSRF validation, persisted storage fails, or keychain storage fails.
 #[tauri::command]
 pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), String> {
     if provider.protocol != "openai" && provider.protocol != "anthropic" {
@@ -166,6 +221,8 @@ pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), St
 
     store::save_providers(&providers).map_err(|e| e.to_string())?;
 
+    // Only store a credential when a non-empty key is provided so that
+    // updates to other fields don't erase an existing keychain entry.
     if !api_key.is_empty() {
         keychain::store_credential(&provider.id, &api_key)
             .await
@@ -177,6 +234,15 @@ pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), St
     Ok(())
 }
 
+/// Toggles a provider's enabled flag and persists the change.
+///
+/// # Arguments
+/// * `provider_id` — The id of the provider to toggle.
+/// * `enabled`      — The new enabled state.
+///
+/// # Errors
+/// Returns an error string if the provider list cannot be loaded or saved,
+/// or if the sidecar config reload fails.
 #[tauri::command]
 pub async fn toggle_provider_enabled(provider_id: String, enabled: bool) -> Result<(), String> {
     let mut providers = store::load_providers().map_err(|e| e.to_string())?;
@@ -188,12 +254,24 @@ pub async fn toggle_provider_enabled(provider_id: String, enabled: bool) -> Resu
     Ok(())
 }
 
+/// Deletes a provider and cleans up related data.
+///
+/// Removes the provider from the config, strips its entries from all groups
+/// (re-indexing priorities), and deletes the stored API key from the keychain.
+///
+/// # Arguments
+/// * `provider_id` — The id of the provider to delete.
+///
+/// # Errors
+/// Returns an error string if loading/saving providers or groups fails, or
+/// if keychain deletion fails.
 #[tauri::command]
 pub async fn delete_provider(provider_id: String) -> Result<(), String> {
     let mut providers = store::load_providers().map_err(|e| e.to_string())?;
     providers.retain(|p| p.id != provider_id);
     store::save_providers(&providers).map_err(|e| e.to_string())?;
 
+    // Remove entries referencing this provider and re-index priorities
     let mut groups = store::load_groups().map_err(|e| e.to_string())?;
     for group in &mut groups {
         group.entries.retain(|e| e.provider_id != provider_id);
@@ -211,11 +289,25 @@ pub async fn delete_provider(provider_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns all configured routing groups.
+///
+/// # Errors
+/// Returns an error string if the group configuration file cannot be read.
 #[tauri::command]
 pub async fn get_groups() -> Result<Vec<Group>, String> {
     store::load_groups().map_err(|e| e.to_string())
 }
 
+/// Creates or updates a routing group.
+///
+/// If a group with the same id already exists it is replaced; otherwise a new
+/// entry is appended.
+///
+/// # Arguments
+/// * `group` — The group configuration to save.
+///
+/// # Errors
+/// Returns an error string if loading or saving groups fails.
 #[tauri::command]
 pub async fn save_group(group: Group) -> Result<(), String> {
     let mut groups = match store::load_groups() {
@@ -237,6 +329,13 @@ pub async fn save_group(group: Group) -> Result<(), String> {
     Ok(())
 }
 
+/// Deletes a routing group by id.
+///
+/// # Arguments
+/// * `group_id` — The id of the group to delete.
+///
+/// # Errors
+/// Returns an error string if loading or saving groups fails.
 #[tauri::command]
 pub async fn delete_group(group_id: String) -> Result<(), String> {
     let mut groups = store::load_groups().map_err(|e| e.to_string())?;
@@ -246,11 +345,22 @@ pub async fn delete_group(group_id: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Returns the application configuration, falling back to defaults.
+///
+/// # Errors
+/// Never — missing config files produce the default [`AppConfig`].
 #[tauri::command]
 pub async fn get_app_config() -> Result<AppConfig, String> {
     store::load_app_config().or_else(|_| Ok(AppConfig::default()))
 }
 
+/// Persists the application configuration and notifies the sidecar.
+///
+/// # Arguments
+/// * `config` — The full application configuration to save.
+///
+/// # Errors
+/// Returns an error string if saving fails.
 #[tauri::command]
 pub async fn save_app_config(config: AppConfig) -> Result<(), String> {
     store::save_app_config(&config).map_err(|e| e.to_string())?;
@@ -258,6 +368,10 @@ pub async fn save_app_config(config: AppConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Marks the onboarding flow as dismissed so it will not reappear.
+///
+/// # Errors
+/// Returns an error string if the config cannot be saved.
 #[tauri::command]
 pub async fn dismiss_onboarding() -> Result<(), String> {
     let mut config = store::load_app_config().unwrap_or_default();
@@ -265,13 +379,30 @@ pub async fn dismiss_onboarding() -> Result<(), String> {
     store::save_app_config(&config).map_err(|e| e.to_string())
 }
 
+/// Result of a provider connection test returned to the frontend.
 #[derive(Serialize)]
 pub struct TestConnectionResult {
+    /// Whether the provider could be reached.
     pub success: bool,
+    /// HTTP status code received, if any.
     pub status_code: Option<u16>,
+    /// Human-readable description of the outcome.
     pub message: String,
 }
 
+/// Tests connectivity to a provider's API endpoint.
+///
+/// Attempts a GET to the provider's `/models` endpoint using the appropriate
+/// authentication header for the protocol (Bearer token for OpenAI, x-api-key
+/// for Anthropic). If `/models` returns 404, falls back to testing the base
+/// URL itself — some providers don't expose a models listing.
+///
+/// # Arguments
+/// * `provider_id` — The id of the provider to test.
+///
+/// # Errors
+/// Returns an error string if the provider is not found or the API key cannot
+/// be retrieved from the keychain.
 #[tauri::command]
 pub async fn test_provider_connection(provider_id: String) -> Result<TestConnectionResult, String> {
     let providers = store::load_providers().map_err(|e| e.to_string())?;
@@ -288,6 +419,7 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
     let base_url = provider.base_url.trim_end_matches('/');
     let models_url = format!("{base_url}/models");
 
+    // Build the request with protocol-appropriate authentication
     let request = match provider.protocol.as_str() {
         "anthropic" => client
             .get(&models_url)
@@ -308,6 +440,7 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
                     message: format!("Connection successful (HTTP {})", status),
                 })
             } else if status == 404 {
+                // /models not available — try the base URL as a connectivity check
                 let base_request = match provider.protocol.as_str() {
                     "anthropic" => client
                         .get(base_url)
@@ -346,6 +479,17 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
     }
 }
 
+/// Refreshes the list of models for a provider by fetching from its API.
+///
+/// Updates the provider's `models` field with the latest data and returns
+/// the full provider list so the frontend can refresh its state.
+///
+/// # Arguments
+/// * `provider_id` — The id of the provider whose models to refresh.
+///
+/// # Errors
+/// Returns an error string if the provider is not found, the API key cannot
+/// be retrieved, the model fetch fails, or persisting the update fails.
 #[tauri::command]
 pub async fn refresh_provider_models(provider_id: String) -> Result<Vec<ProviderResponse>, String> {
     let providers = store::load_providers().map_err(|e| e.to_string())?;
@@ -373,6 +517,14 @@ pub async fn refresh_provider_models(provider_id: String) -> Result<Vec<Provider
     Ok(all_providers.iter().map(|p| p.into()).collect())
 }
 
+/// Fetches the current router status from the running proxy.
+///
+/// Queries `/internal/router/status` on the proxy and deserializes the
+/// response into a [`router::RouterStatusResponse`].
+///
+/// # Errors
+/// Returns an error string if the proxy is unreachable or returns a
+/// non-success / malformed response.
 #[tauri::command]
 pub async fn get_router_status() -> Result<router::RouterStatusResponse, String> {
     let config = store::load_app_config().unwrap_or_default();
@@ -394,6 +546,18 @@ pub async fn get_router_status() -> Result<router::RouterStatusResponse, String>
     Ok(status)
 }
 
+/// Enables or disables a single routing entry inside a group via the proxy.
+///
+/// Posts the change to `/internal/router/entry` so the running proxy updates
+/// its routing table without a restart.
+///
+/// # Arguments
+/// * `group_id`    — The id of the group containing the entry.
+/// * `entry_index` — Zero-based index of the entry within the group.
+/// * `enabled`     — Desired enabled state.
+///
+/// # Errors
+/// Returns an error string if the proxy is unreachable or returns an error.
 #[tauri::command]
 pub async fn set_entry_enabled(group_id: String, entry_index: usize, enabled: bool) -> Result<(), String> {
     let config = store::load_app_config().unwrap_or_default();
@@ -413,6 +577,17 @@ pub async fn set_entry_enabled(group_id: String, entry_index: usize, enabled: bo
     Ok(())
 }
 
+/// Returns a daily usage summary for a specific provider and date.
+///
+/// Uses the provider's `quota_reset_utc_hour` to align the UTC day boundary.
+///
+/// # Arguments
+/// * `provider_id` — The provider to query.
+/// * `date`        — Date string in `YYYY-MM-DD` format.
+///
+/// # Errors
+/// Returns an error string if the date format is invalid or the metrics
+/// database query fails.
 #[tauri::command]
 pub fn get_daily_summary(provider_id: String, date: String) -> Result<queries::DailySummary, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
@@ -428,6 +603,13 @@ pub fn get_daily_summary(provider_id: String, date: String) -> Result<queries::D
     })
 }
 
+/// Returns the most recent request log entries.
+///
+/// # Arguments
+/// * `limit` — Maximum number of rows to return.
+///
+/// # Errors
+/// Returns an error string if the metrics database query fails.
 #[tauri::command]
 pub fn get_recent_requests(limit: usize) -> Result<Vec<queries::RequestRow>, String> {
     with_metrics_db(|conn| {
@@ -436,6 +618,16 @@ pub fn get_recent_requests(limit: usize) -> Result<Vec<queries::RequestRow>, Str
     })
 }
 
+/// Returns daily aggregated usage for a provider.
+///
+/// Uses the provider's `quota_reset_utc_hour` to align the UTC day boundary.
+///
+/// # Arguments
+/// * `provider_id` — The provider to query.
+/// * `days`        — Number of days to look back.
+///
+/// # Errors
+/// Returns an error string if the metrics database query fails.
 #[tauri::command]
 pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::DailyUsage>, String> {
     let providers = store::load_providers().unwrap_or_default();
@@ -449,6 +641,17 @@ pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::D
     })
 }
 
+/// Returns usage aggregated by routing group.
+///
+/// Uses the provider's `quota_reset_utc_hour` when a `provider_id` is given,
+/// otherwise defaults to hour 0.
+///
+/// # Arguments
+/// * `days`        — Number of days to look back.
+/// * `provider_id` — Optional provider filter and reset-hour source.
+///
+/// # Errors
+/// Returns an error string if the metrics database query fails.
 #[tauri::command]
 pub fn get_usage_by_group(days: u32, provider_id: Option<String>) -> Result<Vec<queries::GroupUsage>, String> {
     let reset_hour = provider_id.and_then(|pid| {
@@ -463,6 +666,10 @@ pub fn get_usage_by_group(days: u32, provider_id: Option<String>) -> Result<Vec<
     })
 }
 
+/// Frontend representation of an OpenCode agent-to-model mapping.
+///
+/// Each field corresponds to an agent role whose requests should be routed to
+/// a specific model. `None` means the mapping is not overridden.
 #[derive(Serialize, Deserialize)]
 pub struct OpenCodeAgentMapping {
     #[serde(default)]
@@ -513,6 +720,10 @@ impl From<AgentMapping> for OpenCodeAgentMapping {
     }
 }
 
+/// Fetches each routing entry's current status from the remote proxy.
+///
+/// Returns a map of `"provider_id:entry_index" → status` strings. Returns an
+/// empty map silently if the proxy is unreachable or returns malformed data.
 async fn build_entry_statuses() -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let config = store::load_app_config().unwrap_or_default();
@@ -544,6 +755,10 @@ async fn build_entry_statuses() -> std::collections::HashMap<String, String> {
     map
 }
 
+/// Returns the resolved file-system path of the OpenCode configuration file.
+///
+/// If the user has set a custom path in the app config, that path is used;
+/// otherwise the default location is resolved automatically.
 #[tauri::command]
 pub fn get_opencode_config_path() -> Option<String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -551,12 +766,31 @@ pub fn get_opencode_config_path() -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// Persists a custom OpenCode config file path.
+///
+/// # Arguments
+/// * `path` — Absolute or relative path to the OpenCode configuration file.
+///
+/// # Errors
+/// Returns an error string if the path cannot be saved.
 #[tauri::command]
 pub fn set_opencode_config_path(path: String) -> Result<(), String> {
     config_writer::save_opencode_config_path(&path)
         .map_err(|e| e.to_string())
 }
 
+/// Injects the CodeRouter provider into the OpenCode configuration file.
+///
+/// Reads the current groups and providers, fetches live entry statuses from
+/// the proxy, and writes the combined configuration so OpenCode routes its
+/// requests through CodeRouter.
+///
+/// # Arguments
+/// * `proxy_port` — The local port on which CodeRouter is listening.
+///
+/// # Errors
+/// Returns an error string if the config path cannot be resolved, the proxy
+/// is unreachable, or the config file cannot be written.
 #[tauri::command]
 pub async fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -571,6 +805,11 @@ pub async fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Removes the CodeRouter provider from the OpenCode configuration file.
+///
+/// # Errors
+/// Returns an error string if the config path cannot be resolved or the file
+/// cannot be modified.
 #[tauri::command]
 pub fn remove_opencode_provider() -> Result<(), String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -581,6 +820,14 @@ pub fn remove_opencode_provider() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Writes agent-specific model overrides into the OpenCode configuration.
+///
+/// # Arguments
+/// * `mapping` — The agent-to-model mapping to apply.
+///
+/// # Errors
+/// Returns an error string if the config path cannot be resolved or the file
+/// cannot be modified.
 #[tauri::command]
 pub fn set_opencode_agent_models(mapping: OpenCodeAgentMapping) -> Result<(), String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -591,6 +838,11 @@ pub fn set_opencode_agent_models(mapping: OpenCodeAgentMapping) -> Result<(), St
         .map_err(|e| e.to_string())
 }
 
+/// Removes all agent-specific model overrides from the OpenCode configuration.
+///
+/// # Errors
+/// Returns an error string if the config path cannot be resolved or the file
+/// cannot be modified.
 #[tauri::command]
 pub fn remove_opencode_agent_models() -> Result<(), String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -601,6 +853,11 @@ pub fn remove_opencode_agent_models() -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
+/// Reads the current agent-to-model mapping from the OpenCode configuration.
+///
+/// # Errors
+/// Returns an error string if the config path cannot be resolved or the file
+/// cannot be parsed.
 #[tauri::command]
 pub fn get_opencode_agent_models() -> Result<OpenCodeAgentMapping, String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -612,6 +869,16 @@ pub fn get_opencode_agent_models() -> Result<OpenCodeAgentMapping, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Generates a preview of what the OpenCode config would look like after injection.
+///
+/// Does **not** modify any files — purely for frontend display.
+///
+/// # Arguments
+/// * `proxy_port` — The local port on which CodeRouter is listening.
+/// * `mapping`     — Optional agent model overrides to include in the preview.
+///
+/// # Errors
+/// Returns an error string if the config cannot be generated.
 #[tauri::command]
 pub async fn preview_opencode_config(proxy_port: u16, mapping: Option<OpenCodeAgentMapping>) -> Result<String, String> {
     let groups = store::load_groups().unwrap_or_default();
@@ -624,11 +891,28 @@ pub async fn preview_opencode_config(proxy_port: u16, mapping: Option<OpenCodeAg
         .map_err(|e| e.to_string())
 }
 
+/// Checks whether a given group alias is referenced in the OpenCode config.
+///
+/// Used by the frontend to warn the user before deleting a group that is
+/// actively referenced.
+///
+/// # Arguments
+/// * `group_alias` — The alias to check.
 #[tauri::command]
 pub fn is_group_referenced_in_opencode(group_alias: String) -> bool {
     config_writer::is_group_alias_referenced(&group_alias)
 }
 
+/// Returns latency percentile statistics for a provider on a given date.
+///
+/// Uses the provider's `quota_reset_utc_hour` to align the UTC day boundary.
+///
+/// # Arguments
+/// * `provider_id` — The provider to query.
+/// * `date`        — Date string in `YYYY-MM-DD` format.
+///
+/// # Errors
+/// Returns an error string if the date format is invalid or the query fails.
 #[tauri::command]
 pub fn get_latency_percentiles(provider_id: String, date: String) -> Result<Option<queries::LatencyPercentiles>, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
@@ -644,6 +928,16 @@ pub fn get_latency_percentiles(provider_id: String, date: String) -> Result<Opti
     })
 }
 
+/// Returns the total estimated cost for a provider over a given number of days.
+///
+/// Uses the provider's `quota_reset_utc_hour` to align the UTC day boundary.
+///
+/// # Arguments
+/// * `provider_id` — The provider to query.
+/// * `days`        — Number of days to look back.
+///
+/// # Errors
+/// Returns an error string if the metrics database query fails.
 #[tauri::command]
 pub fn get_cost_summary(provider_id: String, days: u32) -> Result<f64, String> {
     let providers = store::load_providers().unwrap_or_default();
@@ -657,11 +951,20 @@ pub fn get_cost_summary(provider_id: String, days: u32) -> Result<f64, String> {
     })
 }
 
+/// Returns the application version as defined in `Cargo.toml`.
 #[tauri::command]
 pub fn get_app_version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
 }
 
+/// Removes all CodeRouter-related configuration from the OpenCode config.
+///
+/// This removes both the provider entry and any agent model overrides,
+/// restoring the OpenCode config to its pre-CodeRouter state.
+///
+/// # Errors
+/// Returns an error string if the config path cannot be resolved or the file
+/// cannot be modified.
 #[tauri::command]
 pub fn remove_coderouter_from_opencode() -> Result<(), String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
@@ -672,13 +975,24 @@ pub fn remove_coderouter_from_opencode() -> Result<(), String> {
     config_writer::remove_agent_models(&config_path).map_err(|e| e.to_string())
 }
 
+/// Result of a proxy health check returned to the frontend.
 #[derive(Serialize)]
 pub struct HealthCheckResult {
+    /// Whether the proxy process is responding to health checks.
     pub running: bool,
+    /// The `"status"` field from the health endpoint, if present.
     pub status: Option<String>,
+    /// Proxy uptime in seconds, if reported.
     pub uptime_seconds: Option<u64>,
 }
 
+/// Checks whether the proxy sidecar is healthy by querying its `/health` endpoint.
+///
+/// Times out after 3 seconds to avoid blocking the UI.
+///
+/// # Errors
+/// Never returns `Err` — an unreachable proxy is reported as
+/// `HealthCheckResult { running: false, … }`.
 #[tauri::command]
 pub async fn check_proxy_health() -> Result<HealthCheckResult, String> {
     let config = store::load_app_config().unwrap_or_default();
@@ -687,6 +1001,7 @@ pub async fn check_proxy_health() -> Result<HealthCheckResult, String> {
     let url = format!("http://{}:{}/health", host, port);
     let client = Client::new();
 
+    // Timeout prevents the UI from hanging when the proxy is unresponsive
     let controller = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         client.get(&url).send().await
     }).await;
@@ -708,30 +1023,54 @@ pub async fn check_proxy_health() -> Result<HealthCheckResult, String> {
     }
 }
 
+/// Deletes all metrics data from the database.
+///
+/// # Errors
+/// Returns an error string if the database operation fails.
 #[tauri::command]
 pub fn clear_metrics_data() -> Result<(), String> {
     db::clear_metrics().map_err(|e| e.to_string())
 }
 
+/// Resets all CodeRouter configuration (providers, groups, app config) to defaults.
+///
+/// # Errors
+/// Returns an error string if the configuration files cannot be written.
 #[tauri::command]
 pub fn reset_all_config() -> Result<(), String> {
     store::reset_all_config().map_err(|e| e.to_string())
 }
 
+/// Global application state managed by Tauri.
+///
+/// Holds references to the sidecar process, proxy running flag, and tray menu
+/// items so commands and tray event handlers can coordinate.
 pub struct AppState {
+    /// Handle to the Tauri application for emitting events and updating UI.
     pub app_handle: tauri::AppHandle,
+    /// The child process of the running proxy sidecar, if any.
     pub sidecar: Mutex<Option<Child>>,
+    /// Whether the proxy health endpoint is currently responding.
     pub proxy_running: Mutex<bool>,
+    /// Tray menu item showing "Proxy: Running" / "Proxy: Stopped".
     pub proxy_status_item: MenuItem<tauri::Wry>,
+    /// Tray menu item showing "Start Proxy" / "Stop Proxy".
     pub toggle_proxy_item: MenuItem<tauri::Wry>,
 }
 
+/// Sends SIGTERM to the sidecar process and waits up to 5 seconds for it to
+/// exit. Falls back to `kill()` if the process hasn't exited by then.
+///
+/// # Arguments
+/// * `child` — Mutable reference to the sidecar [`Child`] process.
 pub fn kill_sidecar(child: &mut Child) {
     let pid = child.id() as i32;
+    // Send SIGTERM for a graceful shutdown first
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
         nix::sys::signal::Signal::SIGTERM,
     );
+    // Wait up to 5 seconds for the process to exit gracefully
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
@@ -742,10 +1081,15 @@ pub fn kill_sidecar(child: &mut Child) {
             Err(_) => break,
         }
     }
+    // Force kill if it didn't exit gracefully
     let _ = child.kill();
     let _ = child.wait();
 }
 
+/// Builds the target-specific binary name for the proxy sidecar.
+///
+/// Produces a string like `coderouter-proxy-x86_64-apple-darwin` based on the
+/// current architecture and OS so the correct binary is located at runtime.
 fn sidecar_target_suffix() -> String {
     let arch = std::env::consts::ARCH;
     let triple = if cfg!(target_os = "macos") {
@@ -758,9 +1102,22 @@ fn sidecar_target_suffix() -> String {
     format!("coderouter-proxy-{triple}")
 }
 
+/// Locates and spawns the proxy sidecar process.
+///
+/// In debug builds, looks in `src-tauri/sidecar/` next to the manifest directory.
+/// In release builds, checks the AppImage `APPDIR` environment variable first
+/// (for Linux AppImage packaging), then falls back to a `sidecar/` directory
+/// next to the main binary, and finally tries the system `PATH`.
+///
+/// # Returns
+/// A [`Child`] handle to the spawned process on success.
+///
+/// # Errors
+/// Returns an error string if the sidecar binary cannot be found or spawned.
 pub fn spawn_sidecar() -> Result<Child, String> {
     let target_suffix = sidecar_target_suffix();
     let sidecar_path = if cfg!(debug_assertions) {
+        // Debug: look for the sidecar binary next to the crate manifest
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let dev_path = std::path::Path::new(manifest_dir)
             .join(format!("sidecar/{target_suffix}"));
@@ -776,6 +1133,7 @@ pub fn spawn_sidecar() -> Result<Child, String> {
             }
         }
     } else {
+        // Release: check AppImage layout first, then fall back
         if let Ok(appdir) = std::env::var("APPDIR") {
             let appimage_sidecar = std::path::Path::new(&appdir)
                 .join(format!("usr/bin/sidecar/{target_suffix}"));
@@ -794,6 +1152,10 @@ pub fn spawn_sidecar() -> Result<Child, String> {
         .map_err(|e| format!("Failed to spawn sidecar {}: {}", sidecar_path.display(), e))
 }
 
+/// Searches for the sidecar binary in common release directories.
+///
+/// Looks next to the running executable in a `sidecar/` subdirectory, then
+/// falls back to assuming `coderouter-proxy` is on the system `PATH`.
 fn find_sidecar_fallback() -> std::path::PathBuf {
     // Try release layout: sidecar/ next to the main binary
     if let Ok(exe) = std::env::current_exe() {
@@ -808,15 +1170,24 @@ fn find_sidecar_fallback() -> std::path::PathBuf {
     std::path::PathBuf::from("coderouter-proxy")
 }
 
+/// Restarts the proxy sidecar process.
+///
+/// Kills the existing sidecar (if any), spawns a new one, and updates the tray
+/// icon and labels to reflect the running state.
+///
+/// # Errors
+/// Returns an error string if the mutex is poisoned or spawning fails.
 #[tauri::command]
 pub fn restart_proxy(state: tauri::State<AppState>) -> Result<(), String> {
     let mut sidecar_guard = state.sidecar.lock().map_err(|e| e.to_string())?;
+    // Kill the existing sidecar process, if one is running
     if let Some(child) = sidecar_guard.as_mut() {
         kill_sidecar(child);
     }
     *sidecar_guard = None;
     *state.proxy_running.lock().map_err(|e| e.to_string())? = false;
 
+    // Spawn a fresh sidecar process
     let child = spawn_sidecar()?;
     *sidecar_guard = Some(child);
     *state.proxy_running.lock().map_err(|e| e.to_string())? = true;

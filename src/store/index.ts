@@ -2,26 +2,44 @@ import { create } from 'zustand';
 import type { Provider, Group, AppConfig, ProxyStatus, RequestRow } from '../types';
 import { getProviders, getGroups, getAppConfig } from '../lib/ipc';
 
+/** Health data reported by the proxy process. */
 export interface HealthData {
+  /** Current operational status string (e.g. "ok"). */
   status: string;
+  /** How long the proxy has been running, in seconds. */
   uptime_seconds: number;
 }
 
 interface AppState {
+  /** All configured LLM providers. */
   providers: Provider[];
+  /** All configured routing groups. */
   groups: Group[];
+  /** Application configuration, or null before initial load. */
   appConfig: AppConfig | null;
+  /** Runtime status of the proxy process. */
   proxyStatus: ProxyStatus;
+  /** Health data from the last proxy health check, or null if not running. */
   healthData: HealthData | null;
+  /** Error message if initial data loading partially failed, or null. */
   loadError: string | null;
+  /** Ring buffer of the most recent streaming request rows (max 50). */
   recentStreamRequests: RequestRow[];
+  /** Replace the entire providers list. */
   setProviders: (providers: Provider[]) => void;
+  /** Replace the entire groups list. */
   setGroups: (groups: Group[]) => void;
+  /** Replace the application configuration. */
   setAppConfig: (config: AppConfig) => void;
+  /** Update the proxy status indicator. */
   setProxyStatus: (status: ProxyStatus) => void;
+  /** Update the proxy health data. */
   setHealthData: (data: HealthData | null) => void;
+  /** Append a request row to the front of the recent-streams buffer (capped at 50). */
   addRecentRequest: (request: RequestRow) => void;
+  /** Reset all state back to initial defaults (used after app reset). */
   resetAll: () => void;
+  /** Fetch providers, groups, and app config in parallel and hydrate the store. */
   loadInitialData: () => Promise<void>;
 }
 
@@ -41,6 +59,7 @@ export const useStore = create<AppState>((set) => ({
   setHealthData: (healthData) => set({ healthData }),
 
   addRecentRequest: (request) =>
+    // Prepend the new request and keep only the 50 most recent entries
     set((state) => ({
       recentStreamRequests: [request, ...state.recentStreamRequests].slice(0, 50),
     })),
@@ -56,6 +75,7 @@ export const useStore = create<AppState>((set) => ({
   }),
 
   loadInitialData: async () => {
+    // Fetch all three data sources concurrently so a slow provider doesn't block groups/config
     const results = await Promise.allSettled([
       getProviders(),
       getGroups(),
@@ -83,6 +103,7 @@ export const useStore = create<AppState>((set) => ({
       errors.push(`appConfig: ${results[2].reason}`);
     }
 
+    // Partial failures are stored but don't prevent the successful data from loading
     if (errors.length > 0) {
       console.error('loadInitialData partial failures:', errors);
       set({ ...updates, loadError: errors.join('; ') });

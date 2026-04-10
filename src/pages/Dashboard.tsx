@@ -12,8 +12,13 @@ import { StatusBadge } from '@/components/StatusBadge';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 import { Progress } from '@/components/ui/progress';
 
+/** Interval in milliseconds for polling recent requests from the backend. */
 const POLL_INTERVAL_MS = 5000;
 
+/**
+ * Formats a duration in seconds into a human-readable uptime string
+ * (e.g., "2h 30m", "3d 4h").
+ */
 function formatUptime(seconds: number): string {
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
@@ -21,6 +26,7 @@ function formatUptime(seconds: number): string {
   return `${Math.floor(seconds / 86400)}d ${Math.floor((seconds % 86400) / 3600)}h`;
 }
 
+/** Formats a Unix timestamp into a relative time string (e.g., "5m ago", "2d ago"). */
 function formatRelativeTime(ts: number): string {
   const now = Math.floor(Date.now() / 1000);
   const diff = now - ts;
@@ -31,17 +37,23 @@ function formatRelativeTime(ts: number): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
+/** Formats a latency in milliseconds, converting to seconds when >= 1000ms. */
 function formatLatency(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
 }
 
+/** Formats a token count with K/M suffixes for large numbers. */
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return `${n}`;
 }
 
+/**
+ * Counts entry statuses for a given provider, returning how many entries
+ * are active, in cooldown, quota_exhausted, or manually_disabled.
+ */
 function getEntryStatusCounts(entries: EntryStatusResponse[], providerId: string): { active: number; cooldown: number; quotaExhausted: number; disabled: number } {
   const filtered = entries.filter((e) => e.provider_id === providerId);
   return {
@@ -52,6 +64,10 @@ function getEntryStatusCounts(entries: EntryStatusResponse[], providerId: string
   };
 }
 
+/**
+ * Determines the overall status label for a provider based on its enabled
+ * state and entry counts. Prioritizes the most severe status.
+ */
 function getProviderOverallStatus(
   provider: Provider,
   entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number },
@@ -62,6 +78,10 @@ function getProviderOverallStatus(
   return 'Active';
 }
 
+/**
+ * Returns a primary sort key (0 = degraded, 1 = healthy, 2 = disabled)
+ * so problematic providers appear first in the grid.
+ */
 function getProviderCardSortKey(
   provider: Provider,
   entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number },
@@ -71,6 +91,10 @@ function getProviderCardSortKey(
   return 1;
 }
 
+/**
+ * Returns a secondary sort key used to break ties within the same
+ * primary sort key (degraded providers sorted by severity).
+ */
 function getProviderCardSortSubKey(
   provider: Provider,
   entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number },
@@ -81,6 +105,10 @@ function getProviderCardSortSubKey(
   return 2;
 }
 
+/**
+ * Displays the current proxy status (running/stopped), listening address,
+ * uptime, and a link to the OpenCode setup page.
+ */
 function ProxyStatusCard() {
   const proxyStatus = useStore((s) => s.proxyStatus);
   const appConfig = useStore((s) => s.appConfig);
@@ -138,6 +166,10 @@ function ProxyStatusCard() {
   );
 }
 
+/**
+ * Renders a single provider's health card showing overall status,
+ * entry counts by state, daily token quota progress, and cost summaries.
+ */
 function ProviderHealthCard({
   provider,
   entryCounts,
@@ -247,6 +279,11 @@ function ProviderHealthCard({
   );
 }
 
+/**
+ * Fetches daily summaries and cost data (weekly/monthly) for each provider,
+ * then renders a sorted grid of {@link ProviderHealthCard} components.
+ * Providers with degraded status are sorted to the top.
+ */
 function ProviderHealthCards() {
   const providers = useStore((s) => s.providers);
   const entryStatusData = useGroupStatusPoll();
@@ -254,6 +291,11 @@ function ProviderHealthCards() {
   const [weeklyCosts, setWeeklyCosts] = useState<Record<string, number>>({});
   const [monthlyCosts, setMonthlyCosts] = useState<Record<string, number>>({});
 
+  /**
+   * Fetch today's daily summary plus 7-day and 30-day cost rollups
+   * for every provider in parallel, then batch-update state to minimize
+   * re-renders.
+   */
   const fetchSummaries = useCallback(async () => {
     const today = new Date().toISOString().slice(0, 10);
     const results: Record<string, DailySummary | null> = {};
@@ -282,12 +324,15 @@ function ProviderHealthCards() {
     setMonthlyCosts(monthly);
   }, [providers]);
 
+  // Refresh cost/token summaries every 60 seconds so the dashboard
+  // stays reasonably up-to-date without hammering the backend.
   useEffect(() => {
     fetchSummaries();
     const interval = setInterval(fetchSummaries, 60000);
     return () => clearInterval(interval);
   }, [fetchSummaries]);
 
+  // Sort providers so degraded/exhausted ones appear before healthy ones.
   const sortedProviders = [...providers].sort((a, b) => {
     const countsA = getEntryStatusCounts(entryStatusData.entries, a.id);
     const countsB = getEntryStatusCounts(entryStatusData.entries, b.id);
@@ -318,6 +363,11 @@ function ProviderHealthCards() {
   );
 }
 
+/**
+ * Displays a real-time table of recent proxy requests. Merges data from
+ * two sources: periodic polling of the backend and SSE-pushed live updates
+ * from the store. Shows expandable error details for failed requests.
+ */
 function RequestFeed() {
   const [requests, setRequests] = useState<RequestRow[]>([]);
   const [expandedId, setExpandedId] = useState<number | null>(null);
@@ -326,6 +376,8 @@ function RequestFeed() {
   const lastSseTimeRef = useRef(0);
   const [isLive, setIsLive] = useState(false);
 
+  // Track the most recent SSE arrival time so we can show a "Live" indicator
+  // when new requests have arrived within the last 5 seconds.
   useEffect(() => {
     if (recentStreamRequests.length > sseApplied) {
       lastSseTimeRef.current = Date.now();
@@ -339,6 +391,8 @@ function RequestFeed() {
     return () => clearInterval(interval);
   }, []);
 
+  // Poll the backend every POLL_INTERVAL_MS to keep the request list fresh
+  // even when SSE is not connected.
   useEffect(() => {
     const poll = async () => {
       try {
@@ -354,6 +408,9 @@ function RequestFeed() {
     return () => clearInterval(interval);
   }, []);
 
+  // Merge SSE-pushed requests into the list. We track how many SSE events
+  // we've already applied to avoid re-processing them. New items are
+  // deduplicated against existing IDs and capped at 50 rows.
   useEffect(() => {
     if (recentStreamRequests.length === sseApplied) return;
     const pending = recentStreamRequests.slice(0, recentStreamRequests.length - sseApplied);
@@ -457,6 +514,10 @@ function RequestFeed() {
   );
 }
 
+/**
+ * Displays real-time throughput (tokens/s) and active stream count
+ * based on SSE-pushed request data from the last 30 seconds.
+ */
 function LiveMetricsCard() {
   const recentStreamRequests = useStore((s) => s.recentStreamRequests);
   const [now, setNow] = useState(Date.now());
@@ -466,6 +527,9 @@ function LiveMetricsCard() {
     return () => clearInterval(interval);
   }, []);
 
+  // Token throughput is calculated over a sliding 30-second window.
+  // We compute the actual elapsed time between the oldest and newest
+  // requests in the window to get an accurate rate.
   const thirtySecondsAgo = (now / 1000) - 30;
   const fiveSecondsAgo = (now / 1000) - 5;
 
@@ -504,6 +568,10 @@ function LiveMetricsCard() {
   );
 }
 
+/**
+ * Main dashboard page. Assembles the proxy status card, provider health
+ * grid, live metrics strip, and the recent request feed.
+ */
 export default function Dashboard() {
   return (
     <div className="mx-auto max-w-7xl space-y-8">
