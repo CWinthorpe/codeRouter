@@ -478,6 +478,31 @@ Released as v0.1.9: https://github.com/CWinthorpe/codeRouter/releases/tag/v0.1.9
 
 ---
 
+## Full Codebase Documentation (2026-04-10)
+
+Added comprehensive `///` rustdoc and `/** */` JSDoc comments across all 53 source files:
+
+**Sidecar (Rust):**
+- `config/` — Provider, Group, FailoverConfig, AppConfig structs; atomic JSON store
+- `credentials/` — libsecret wrapper with file-based fallback
+- `proxy/` — Axum server, router/failover engine, OpenAI↔Anthropic translator, upstream dispatcher, SSRF validator
+- `metrics/` — SQLite DB, channel-based recorder, cost/date-range queries, recovery scheduler
+- `models/` — Multi-provider model discovery (Venice, OpenRouter, Anthropic, z.ai)
+- `opencode/` — Config detection, surgical JSON merge/patch, agent mapping
+
+**Tauri:**
+- `commands.rs` — All 30+ IPC command handlers
+- `main.rs` — Tray setup, sidecar lifecycle, health polling, invoke registration
+
+**Frontend (TypeScript/TSX):**
+- Pages: Dashboard, Providers, ModelGroups, OpenCodeSetup, UsageMetrics, Settings
+- Components: AppShell, ErrorBoundary, Onboarding, shared UI components, shadcn/ui wrappers
+- Core: Zustand store, IPC wrapper, polling hooks, SSE metrics stream, types
+
+53 files changed, 2309 insertions (comments only). 131 sidecar tests pass, TypeScript clean.
+
+---
+
 ## Future Work (from plan.md "Open Questions")
 
 - Request caching for identical requests
