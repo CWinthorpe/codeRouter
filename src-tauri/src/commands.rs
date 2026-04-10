@@ -645,6 +645,24 @@ pub fn get_latency_percentiles(provider_id: String, date: String) -> Result<Opti
 }
 
 #[tauri::command]
+pub fn get_cost_summary(provider_id: String, days: u32) -> Result<f64, String> {
+    let providers = store::load_providers().unwrap_or_default();
+    let reset_hour = providers.iter()
+        .find(|p| p.id == provider_id)
+        .map(|p| p.quota_reset_utc_hour)
+        .unwrap_or(0);
+    with_metrics_db(|conn| {
+        queries::get_cost_summary(conn, &provider_id, days, reset_hour)
+            .map_err(|e| e.to_string())
+    })
+}
+
+#[tauri::command]
+pub fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[tauri::command]
 pub fn remove_coderouter_from_opencode() -> Result<(), String> {
     let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())

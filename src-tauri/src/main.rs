@@ -274,6 +274,8 @@ fn main() {
             commands::is_group_referenced_in_opencode,
             commands::set_opencode_config_path,
             commands::get_latency_percentiles,
+            commands::get_cost_summary,
+            commands::get_app_version,
             commands::remove_coderouter_from_opencode,
             commands::dismiss_onboarding,
             commands::check_proxy_health,

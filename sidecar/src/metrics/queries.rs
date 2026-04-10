@@ -319,6 +319,31 @@ pub fn get_today_request_counts(
         .map_err(|e| anyhow::anyhow!("Failed to collect today's request counts: {}", e))
 }
 
+pub fn get_cost_summary(
+    conn: &Connection,
+    provider_id: &str,
+    days: u32,
+    reset_hour: u32,
+) -> Result<f64> {
+    let now = Utc::now();
+    let start_date = (now - chrono::Duration::days(days as i64)).date_naive();
+    let start_ts = start_date
+        .and_hms_opt(reset_hour, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+
+    let result: f64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(cost_usd), 0.0) FROM requests WHERE provider_id = ?1 AND ts >= ?2",
+            rusqlite::params![provider_id, start_ts.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap_or(0.0);
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,6 +483,38 @@ mod tests {
         });
         assert!(today_usage.is_some());
         assert_eq!(today_usage.unwrap().total_requests, 2);
+    }
+
+    #[test]
+    fn test_get_cost_summary() {
+        let mut conn = db::init_in_memory_db().expect("Failed to init DB");
+        insert_test_requests(&mut conn);
+
+        let cost = get_cost_summary(&conn, "provider-a", 7, 0).expect("Failed to get cost summary");
+        assert!(cost > 0.0);
+
+        let cost_today =
+            get_cost_summary(&conn, "provider-a", 0, 0).expect("Failed to get cost summary today");
+        assert!(cost_today > 0.0);
+        assert!(cost > cost_today);
+    }
+
+    #[test]
+    fn test_get_cost_summary_no_data() {
+        let conn = db::init_in_memory_db().expect("Failed to init DB");
+
+        let cost =
+            get_cost_summary(&conn, "nonexistent", 7, 0).expect("Failed to get cost summary");
+        assert_eq!(cost, 0.0);
+    }
+
+    #[test]
+    fn test_get_cost_summary_single_day() {
+        let mut conn = db::init_in_memory_db().expect("Failed to init DB");
+        insert_test_requests(&mut conn);
+
+        let cost = get_cost_summary(&conn, "provider-a", 1, 0).expect("Failed to get cost summary");
+        assert!(cost > 0.0);
     }
 
     #[test]
