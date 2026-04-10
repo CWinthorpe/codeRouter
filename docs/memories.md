@@ -37,7 +37,7 @@ CodeRouter is a Linux desktop app (Tauri 2.x, distributed as AppImage) that acts
 | `sidecar/src/metrics/mod.rs` | Module decl: db, recorder, queries, scheduler |
 | `sidecar/src/metrics/db.rs` | SQLite init at ~/.local/share/coderouter/metrics.db, migrations, in-memory test helper |
 | `sidecar/src/metrics/recorder.rs` | Non-blocking recorder via tokio::sync::mpsc channel, cost calculation |
-| `sidecar/src/metrics/queries.rs` | get_daily_summary, get_recent_requests, get_usage_by_day, get_usage_by_group |
+| `sidecar/src/metrics/queries.rs` | get_daily_summary, get_cost_summary, get_recent_requests, get_usage_by_day, get_usage_by_group |
 | `sidecar/src/metrics/scheduler.rs` | Background task: quota reset (60s tick), cooldown expiry (30s tick), probe-based re-enable, exponential backoff |
 | `sidecar/src/models/mod.rs` | Module decl: refresher |
 | `sidecar/src/models/refresher.rs` | Model discovery: OpenAI-compatible API fetch, hardcoded Anthropic list (8 Claude models), scheduling |
@@ -473,6 +473,8 @@ Added weekly (7d) and monthly (30d) cost summaries to Dashboard provider health 
 | `src/pages/Settings.tsx` | Displays `CodeRouter v{version}` at bottom of page |
 
 Test count: 131 sidecar tests passing (3 new), TypeScript clean.
+
+Released as v0.1.9: https://github.com/CWinthorpe/codeRouter/releases/tag/v0.1.9
 
 ---
 
