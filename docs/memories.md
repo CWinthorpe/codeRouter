@@ -503,6 +503,21 @@ Added comprehensive `///` rustdoc and `/** */` JSDoc comments across all 53 sour
 
 ---
 
+## Cooldown Reason Tracking (2026-04-10)
+
+Added `CooldownReason` enum to track WHY a provider entry was put in cooldown, displayed in both Dashboard and ModelGroups UI.
+
+| File | Change |
+|------|--------|
+| `sidecar/src/proxy/router.rs` | Added `CooldownReason` enum, `cooldown_reason` field on `EntryState` and `EntryStatusResponse`, set/cleared in record_429/record_consecutive_error/record_latency_timeout/record_quota_exhausted/select_entry/record_success |
+| `src/types/index.ts` | Added `cooldown_reason` optional field to `EntryStatusResponse` |
+| `src/pages/Dashboard.tsx` | ProviderHealthCard shows human-readable cooldown reason below status counts |
+| `src/pages/ModelGroups.tsx` | LiveStatusPanel shows cooldown reason text below status badge |
+
+Test count: 138 sidecar tests passing (7 new), TypeScript clean.
+
+---
+
 ## Future Work (from plan.md "Open Questions")
 
 - Request caching for identical requests
