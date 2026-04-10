@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useStore } from '../store';
-import { getDailySummary, getRecentRequests } from '../lib/ipc';
+import { getDailySummary, getRecentRequests, getCostSummary } from '../lib/ipc';
 import { useGroupStatusPoll } from '../hooks/useGroupStatusPoll';
 import type { DailySummary, RequestRow, Provider, EntryStatusResponse } from '../types';
 import { Server, Power, Terminal, ChevronDown, ChevronRight, AlertTriangle, CheckCircle, MinusCircle } from 'lucide-react';
@@ -142,10 +142,14 @@ function ProviderHealthCard({
   provider,
   entryCounts,
   summary,
+  weeklyCost,
+  monthlyCost,
 }: {
   provider: Provider;
   entryCounts: { active: number; cooldown: number; quotaExhausted: number; disabled: number };
   summary: DailySummary | null;
+  weeklyCost: number;
+  monthlyCost: number;
 }) {
   const overallStatus = getProviderOverallStatus(provider, entryCounts);
   const quota = provider.dailyTokenQuota ?? null;
@@ -222,6 +226,22 @@ function ProviderHealthCard({
             </span>
           </p>
         )}
+        {weeklyCost > 0 && (
+          <p className="mt-0.5 text-xs text-zinc-400">
+            This week:{' '}
+            <span className="text-zinc-200">
+              ${weeklyCost.toFixed(4)}
+            </span>
+          </p>
+        )}
+        {monthlyCost > 0 && (
+          <p className="mt-0.5 text-xs text-zinc-400">
+            This month:{' '}
+            <span className="text-zinc-200">
+              ${monthlyCost.toFixed(4)}
+            </span>
+          </p>
+        )}
       </CardContent>
     </Card>
   );
@@ -231,20 +251,35 @@ function ProviderHealthCards() {
   const providers = useStore((s) => s.providers);
   const entryStatusData = useGroupStatusPoll();
   const [summaries, setSummaries] = useState<Record<string, DailySummary | null>>({});
+  const [weeklyCosts, setWeeklyCosts] = useState<Record<string, number>>({});
+  const [monthlyCosts, setMonthlyCosts] = useState<Record<string, number>>({});
 
   const fetchSummaries = useCallback(async () => {
     const today = new Date().toISOString().slice(0, 10);
     const results: Record<string, DailySummary | null> = {};
+    const weekly: Record<string, number> = {};
+    const monthly: Record<string, number> = {};
     await Promise.all(
       providers.map(async (p) => {
         try {
-          results[p.id] = await getDailySummary(p.id, today);
+          const [daily, weekCost, monthCost] = await Promise.all([
+            getDailySummary(p.id, today),
+            getCostSummary(p.id, 7),
+            getCostSummary(p.id, 30),
+          ]);
+          results[p.id] = daily;
+          weekly[p.id] = weekCost;
+          monthly[p.id] = monthCost;
         } catch {
           results[p.id] = null;
+          weekly[p.id] = 0;
+          monthly[p.id] = 0;
         }
       }),
     );
     setSummaries(results);
+    setWeeklyCosts(weekly);
+    setMonthlyCosts(monthly);
   }, [providers]);
 
   useEffect(() => {
@@ -274,6 +309,8 @@ function ProviderHealthCards() {
             provider={provider}
             entryCounts={entryCounts}
             summary={summaries[provider.id] ?? null}
+            weeklyCost={weeklyCosts[provider.id] ?? 0}
+            monthlyCost={monthlyCosts[provider.id] ?? 0}
           />
         );
       })}

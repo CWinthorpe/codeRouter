@@ -148,4 +148,12 @@ export async function checkProxyHealth(): Promise<HealthCheckResult> {
   return invoke<HealthCheckResult>('check_proxy_health');
 }
 
+export async function getCostSummary(providerId: string, days: number): Promise<number> {
+  return invoke<number>('get_cost_summary', { providerId, days });
+}
+
+export async function getAppVersion(): Promise<string> {
+  return invoke<string>('get_app_version');
+}
+
 

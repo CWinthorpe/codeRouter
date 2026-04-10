@@ -459,6 +459,23 @@ Released as v0.1.8: https://github.com/CWinthorpe/codeRouter/releases/tag/v0.1.8
 
 ---
 
+## Dashboard Weekly/Monthly Costs + App Version (2026-04-10)
+
+Added weekly (7d) and monthly (30d) cost summaries to Dashboard provider health cards, and app version display on the Settings page.
+
+| File | Change |
+|------|--------|
+| `sidecar/src/metrics/queries.rs` | Added `get_cost_summary()` query function + 3 unit tests |
+| `src-tauri/src/commands.rs` | Added `get_cost_summary` and `get_app_version` Tauri commands |
+| `src-tauri/src/main.rs` | Registered both new commands in invoke handler |
+| `src/lib/ipc.ts` | Added `getCostSummary()` and `getAppVersion()` IPC functions |
+| `src/pages/Dashboard.tsx` | ProviderHealthCards fetches weekly/monthly costs; ProviderHealthCard displays them |
+| `src/pages/Settings.tsx` | Displays `CodeRouter v{version}` at bottom of page |
+
+Test count: 131 sidecar tests passing (3 new), TypeScript clean.
+
+---
+
 ## Future Work (from plan.md "Open Questions")
 
 - Request caching for identical requests

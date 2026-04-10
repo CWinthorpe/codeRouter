@@ -5,7 +5,7 @@ import { Toast } from '../components/Toast';
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
-import { getAppConfig, saveAppConfig, clearMetricsData, resetAllConfig, restartProxy } from '../lib/ipc';
+import { getAppConfig, saveAppConfig, clearMetricsData, resetAllConfig, restartProxy, getAppVersion } from '../lib/ipc';
 import type { AppConfig } from '../types';
 
 const REFRESH_INTERVAL_OPTIONS: { label: string; value: number }[] = [
@@ -28,6 +28,7 @@ export default function Settings() {
   const [toasts, setToasts] = useState<{ id: number; type: 'success' | 'error'; message: string }[]>([]);
   const toastCounterRef = useRef(0);
   const [loading, setLoading] = useState(true);
+  const [appVersion, setAppVersion] = useState<string>('');
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
     const id = Date.now() * 1000 + (++toastCounterRef.current);
@@ -47,6 +48,10 @@ export default function Settings() {
       } finally {
         setLoading(false);
       }
+      try {
+        const version = await getAppVersion();
+        setAppVersion(version);
+      } catch {}
     };
     load();
   }, [addToast]);
@@ -300,6 +305,12 @@ export default function Settings() {
           </CardContent>
         </Card>
       </form>
+
+      {appVersion && (
+        <p className="pt-4 text-center text-xs text-zinc-500">
+          CodeRouter v{appVersion}
+        </p>
+      )}
     </div>
   );
 }
