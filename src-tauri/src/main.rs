@@ -266,6 +266,7 @@ fn main() {
             commands::remove_opencode_provider,
             commands::set_opencode_agent_models,
             commands::remove_opencode_agent_models,
+            commands::get_opencode_agent_models,
             commands::preview_opencode_config,
             commands::clear_metrics_data,
             commands::reset_all_config,

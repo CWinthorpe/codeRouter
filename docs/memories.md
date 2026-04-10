@@ -445,6 +445,18 @@ Released as v0.1.7: https://github.com/CWinthorpe/codeRouter/releases/tag/v0.1.7
 
 ---
 
+## OpenCode Agent Assignments Read-Back (2026-04-10)
+
+The OpenCode Setup tab always blanked out agent model dropdowns when navigating away and back because agent assignments were write-only — no read path existed.
+
+Fix: Added `get_current_agent_mapping()` in `config_writer.rs` that reads `opencode.json` and extracts `coderouter/` prefixed values from `agent.*.model` and `small_model`. New `get_opencode_agent_models` Tauri command + IPC function + `useEffect` on mount in `OpenCodeSetup.tsx` populates dropdowns with current assignments.
+
+Files changed: config_writer.rs, commands.rs, main.rs, ipc.ts, OpenCodeSetup.tsx
+
+Test count: 128 sidecar tests passing (6 new tests added).
+
+---
+
 ## Future Work (from plan.md "Open Questions")
 
 - Request caching for identical requests

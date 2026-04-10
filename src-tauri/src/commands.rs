@@ -498,6 +498,21 @@ impl From<OpenCodeAgentMapping> for AgentMapping {
     }
 }
 
+impl From<AgentMapping> for OpenCodeAgentMapping {
+    fn from(m: AgentMapping) -> Self {
+        OpenCodeAgentMapping {
+            build: m.build,
+            plan: m.plan,
+            general: m.general,
+            explore: m.explore,
+            compaction: m.compaction,
+            title: m.title,
+            summary: m.summary,
+            small_model: m.small_model,
+        }
+    }
+}
+
 async fn build_entry_statuses() -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let config = store::load_app_config().unwrap_or_default();
@@ -583,6 +598,17 @@ pub fn remove_opencode_agent_models() -> Result<(), String> {
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
     config_writer::remove_agent_models(&config_path)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn get_opencode_agent_models() -> Result<OpenCodeAgentMapping, String> {
+    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
+        .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
+
+    config_writer::get_current_agent_mapping(&config_path)
+        .map(|m| m.into())
         .map_err(|e| e.to_string())
 }
 

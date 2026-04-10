@@ -102,6 +102,10 @@ export async function removeOpencodeAgentModels(): Promise<void> {
   return invoke<void>('remove_opencode_agent_models');
 }
 
+export async function getOpencodeAgentModels(): Promise<OpenCodeAgentMapping> {
+  return invoke<OpenCodeAgentMapping>('get_opencode_agent_models');
+}
+
 export async function previewOpencodeConfig(proxyPort: number, mapping: OpenCodeAgentMapping | null): Promise<string> {
   return invoke<string>('preview_opencode_config', { proxyPort, mapping });
 }

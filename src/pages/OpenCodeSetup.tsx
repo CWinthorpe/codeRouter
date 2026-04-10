@@ -21,6 +21,7 @@ import {
   removeOpencodeAgentModels,
   removeCoderouterFromOpencode,
   previewOpencodeConfig,
+  getOpencodeAgentModels,
   type OpenCodeAgentMapping,
 } from '../lib/ipc';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
@@ -141,6 +142,28 @@ export default function OpenCodeSetup() {
     };
     checkProviderStatus();
   }, [proxyPort]);
+
+  // Load current agent assignments on mount
+  useEffect(() => {
+    const loadAgentModels = async () => {
+      try {
+        const current = await getOpencodeAgentModels();
+        setMapping((prev) => ({
+          build: current.build ?? prev.build,
+          plan: current.plan ?? prev.plan,
+          general: current.general ?? prev.general,
+          explore: current.explore ?? prev.explore,
+          compaction: current.compaction ?? prev.compaction,
+          title: current.title ?? prev.title,
+          summary: current.summary ?? prev.summary,
+          small_model: current.small_model ?? prev.small_model,
+        }));
+      } catch {
+        // IPC may fail outside Tauri or config may not exist yet
+      }
+    };
+    loadAgentModels();
+  }, []);
 
   const handleToggleProvider = useCallback(async () => {
     setTogglingProvider(true);
