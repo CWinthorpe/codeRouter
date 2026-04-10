@@ -455,6 +455,8 @@ Files changed: config_writer.rs, commands.rs, main.rs, ipc.ts, OpenCodeSetup.tsx
 
 Test count: 128 sidecar tests passing (6 new tests added).
 
+Released as v0.1.8: https://github.com/CWinthorpe/codeRouter/releases/tag/v0.1.8
+
 ---
 
 ## Future Work (from plan.md "Open Questions")
