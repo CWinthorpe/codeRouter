@@ -75,6 +75,27 @@ pub struct Provider {
     pub model_overrides: Option<Vec<ProviderModel>>,
 }
 
+impl Provider {
+    pub fn resolve_model_meta(&self, model_id: &str) -> Option<(Option<u64>, Option<u64>)> {
+        let base = self.models.iter().find(|m| m.id == model_id);
+        let override_entry = self
+            .model_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.iter().find(|m| m.id == model_id));
+
+        match (base, override_entry) {
+            (Some(b), Some(o)) => {
+                let context = o.context_window.or(b.context_window);
+                let max_output = o.max_output_tokens.or(b.max_output_tokens);
+                Some((context, max_output))
+            }
+            (Some(b), None) => Some((b.context_window, b.max_output_tokens)),
+            (None, Some(o)) => Some((o.context_window, o.max_output_tokens)),
+            (None, None) => None,
+        }
+    }
+}
+
 fn default_quota_reset_hour() -> u32 {
     0
 }
