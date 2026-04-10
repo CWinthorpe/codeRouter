@@ -153,6 +153,8 @@ export interface EntryStatusResponse {
   daily_reset_at: string;
   /** Remaining cooldown duration in seconds, if applicable. */
   cooldown_duration_seconds?: number;
+  /** Reason for cooldown or quota exhaustion, if applicable. */
+  cooldown_reason?: 'rate_limited' | 'consecutive_errors' | 'latency_timeout' | 'quota_exhausted';
 }
 
 /** Full router status containing an array of all entry statuses. */
