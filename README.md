@@ -1,17 +1,47 @@
 # CodeRouter
 
-A Linux desktop application that acts as a local OpenAI-compatible proxy router. Sits between AI coding tools (like OpenCode) and multiple upstream LLM providers, providing intelligent failover, cost management, model grouping, and seamless OpenCode configuration integration.
+A Linux desktop application that acts as a local OpenAI-compatible proxy router. Sits between AI coding tools (like [OpenCode](https://opencode.ai)) and multiple upstream LLM providers, providing intelligent failover, cost management, model grouping, and seamless OpenCode configuration integration.
 
 Built with **Tauri 2.x** (Rust sidecar + React/TypeScript frontend) and distributed as an **AppImage**.
 
+## Why CodeRouter?
+
+If you use multiple LLM providers or multiple accounts with the same provider, CodeRouter lets you:
+
+- **Pool them together** behind a single local endpoint — your AI tools only need to know about one URL
+- **Set up automatic failover** — when one provider hits a rate limit or goes down, requests seamlessly fall over to the next provider in line
+- **Track costs and usage** — see exactly what each provider is costing you, with charts, daily quotas, and exportable reports
+- **Auto-configure OpenCode** — one-click setup to route OpenCode agents through CodeRouter with per-agent model mapping
+
 ## Features
 
-- **Multi-Provider Aggregation** — Add multiple OpenAI-compatible and Anthropic-compatible providers behind a single local endpoint (`localhost:4141`)
-- **Model Groups & Failover** — Group models across providers with priority ordering. Automatic failover on 429 errors, quota exhaustion, consecutive errors, or latency timeouts
-- **Protocol Translation** — Transparent Anthropic ↔ OpenAI translation. Clients always see an OpenAI-compatible API
-- **Usage Tracking** — SQLite-backed metrics: per-provider costs, token usage, latency, request logs with charts and CSV export
-- **OpenCode Integration** — Auto-configure OpenCode to use CodeRouter as a provider, with per-agent model mapping
-- **System Tray** — Status indicator, quick start/stop proxy, hide-to-tray on window close
+### Provider Management
+- **Multi-Provider Aggregation** — Add unlimited OpenAI-compatible and Anthropic-compatible providers behind a single local endpoint (`localhost:4141`)
+- **Model Discovery** — Automatically fetch available models and metadata (context windows, pricing) from provider APIs
+- **Per-Model Overrides** — Manually correct context sizes, pricing, or model names when provider APIs return incomplete data
+- **Secure Credential Storage** — API keys stored in the Linux Secret Service (libsecret), never in config files
+
+### Model Groups & Failover
+- **Priority-Based Routing** — Group multiple provider+model pairs under a single virtual model name with configurable priority ordering
+- **Automatic Failover** — Transparent failover on HTTP 429 rate limits, daily quota exhaustion, consecutive errors, or latency timeouts — all configurable per group
+- **Smart Recovery** — Exponential backoff with probe-based re-enable for rate-limited providers; quota-aware scheduling for daily resets
+- **Cooldown Tracking** — See exactly why each provider entry is in cooldown with human-readable reasons
+
+### Usage Tracking & Metrics
+- **SQLite-Backed Metrics** — Per-provider costs, token usage, latency percentiles, and request logs
+- **Live Dashboard** — Real-time token throughput, provider health cards, and recent request feed
+- **Historical Charts** — Cost and token usage by provider, request volume by group, with date range filtering
+- **CSV Export** — Download your usage data for analysis
+
+### OpenCode Integration
+- **One-Click Setup** — Auto-configure OpenCode to use CodeRouter as a provider
+- **Agent Mapping** — Assign different model groups to OpenCode agents (build, plan, general, explore)
+- **Surgical JSON Patching** — Only updates the relevant sections of OpenCode config, preserving all other settings
+
+### Desktop Experience
+- **System Tray** — Green/red status indicator, quick start/stop proxy, hide-to-tray on window close
+- **Dark Theme UI** — Built with shadcn/ui + Tailwind CSS
+- **AppImage Distribution** — Self-contained Linux binary, no installation required
 
 ## Tech Stack
 
@@ -27,11 +57,22 @@ Built with **Tauri 2.x** (Rust sidecar + React/TypeScript frontend) and distribu
 
 ## System Requirements
 
-- Linux (tested on Linux)
+- Linux (tested on Linux) — other desktop distros should work
 - GTK3, WebKit2GTK (standard on most desktop distros)
 - `libayatana-appindicator3-1` (system tray support)
 
 ## Quick Start
+
+### Download the Latest Release
+
+Grab the latest AppImage from [Releases](https://github.com/CWinthorpe/codeRouter/releases):
+
+```bash
+chmod +x CodeRouter_0.1.12_amd64.AppImage
+./CodeRouter_0.1.12_amd64.AppImage
+```
+
+On first launch, CodeRouter creates `~/.config/coderouter/` and `~/.local/share/coderouter/`.
 
 ### Running from Source
 
@@ -51,16 +92,7 @@ make dev
 make build
 ```
 
-The AppImage will be produced at `target/release/bundle/appimage/CodeRouter_0.1.0_amd64.AppImage`.
-
-### Using the AppImage
-
-```bash
-chmod +x CodeRouter_0.1.0_amd64.AppImage
-./CodeRouter_0.1.0_amd64.AppImage
-```
-
-On first launch, CodeRouter creates `~/.config/coderouter/` and `~/.local/share/coderouter/`.
+The AppImage will be produced at `target/release/bundle/appimage/CodeRouter_0.1.12_amd64.AppImage`.
 
 ## Proxy API
 
@@ -94,6 +126,27 @@ curl http://localhost:4141/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "glm-5-router", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
 ```
+
+### Using with OpenCode
+
+Add CodeRouter as a provider in your OpenCode config:
+
+```json
+{
+  "provider": {
+    "coderouter": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "CodeRouter",
+      "options": {
+        "baseURL": "http://localhost:4141/v1",
+        "apiKey": "coderouter"
+      }
+    }
+  }
+}
+```
+
+Or use the OpenCode Setup tab in the CodeRouter UI for automatic configuration with agent mapping.
 
 ## Configuration
 
