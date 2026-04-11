@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { AlertTriangle, RotateCcw, Trash2, Eye, RotateCw } from 'lucide-react';
+import { AlertTriangle, RotateCcw, Trash2, Eye, RotateCw, Download, RefreshCw } from 'lucide-react';
 import { useStore } from '../store';
 import { Toast } from '../components/Toast';
 import { Card, CardHeader, CardTitle, CardContent, CardDescription } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Select, SelectTrigger, SelectValue, SelectContent, SelectItem } from '@/components/ui/select';
-import { getAppConfig, saveAppConfig, clearMetricsData, resetAllConfig, restartProxy, getAppVersion } from '../lib/ipc';
-import type { AppConfig } from '../types';
+import { getAppConfig, saveAppConfig, clearMetricsData, resetAllConfig, restartProxy, getAppVersion, checkForUpdates, installUpdate } from '../lib/ipc';
+import type { AppConfig, UpdateStatus } from '../types';
 
 /** Options for the automatic model refresh interval dropdown. */
 const REFRESH_INTERVAL_OPTIONS: { label: string; value: number }[] = [
@@ -37,6 +37,10 @@ export default function Settings() {
   const toastCounterRef = useRef(0);
   const [loading, setLoading] = useState(true);
   const [appVersion, setAppVersion] = useState<string>('');
+  const [updateStatus, setUpdateStatus] = useState<UpdateStatus | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateError, setUpdateError] = useState<string | null>(null);
 
   const addToast = useCallback((type: 'success' | 'error', message: string) => {
     const id = Date.now() * 1000 + (++toastCounterRef.current);
@@ -171,6 +175,29 @@ export default function Settings() {
     }
   };
 
+  const handleCheckForUpdates = async () => {
+    setCheckingUpdate(true);
+    setUpdateError(null);
+    try {
+      const status = await checkForUpdates();
+      setUpdateStatus(status);
+    } catch (e) {
+      setUpdateError(e instanceof Error ? e.message : 'Failed to check for updates');
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    setInstallingUpdate(true);
+    try {
+      await installUpdate();
+    } catch (e) {
+      setUpdateError(e instanceof Error ? e.message : 'Failed to install update');
+      setInstallingUpdate(false);
+    }
+  };
+
   if (loading || !form) {
     return (
       <div className="mx-auto max-w-3xl">
@@ -289,6 +316,56 @@ export default function Settings() {
               <Eye className="h-4 w-4" />
               View Logs
             </Button>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Updates</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-sm font-medium text-zinc-200">
+                  Current version: v{appVersion || '...'}
+                </p>
+              </div>
+              <Button variant="outline" onClick={handleCheckForUpdates} disabled={checkingUpdate}>
+                <RefreshCw className={`h-4 w-4 ${checkingUpdate ? 'animate-spin' : ''}`} />
+                {checkingUpdate ? 'Checking...' : 'Check for Updates'}
+              </Button>
+            </div>
+
+            {updateError && (
+              <div className="rounded-md border border-red-800/50 bg-red-900/20 px-4 py-3 text-sm text-red-300">
+                {updateError}
+              </div>
+            )}
+
+            {updateStatus && !updateStatus.available && !updateError && (
+              <div className="rounded-md border border-green-800/50 bg-green-900/20 px-4 py-3 text-sm text-green-300">
+                You're up to date! Running the latest version.
+              </div>
+            )}
+
+            {updateStatus && updateStatus.available && (
+              <div className="rounded-md border border-blue-800/50 bg-blue-900/20 px-4 py-3 space-y-3">
+                <div>
+                  <p className="text-sm font-medium text-blue-200">
+                    Update available: v{updateStatus.currentVersion} → v{updateStatus.latestVersion}
+                  </p>
+                  {updateStatus.releaseNotes && (
+                    <p className="mt-1 text-xs text-blue-300 whitespace-pre-wrap">
+                      {updateStatus.releaseNotes}
+                    </p>
+                  )}
+                </div>
+                <Button onClick={handleInstallUpdate} disabled={installingUpdate}>
+                  <Download className="h-4 w-4" />
+                  {installingUpdate ? 'Installing...' : 'Install Update & Restart'}
+                </Button>
+              </div>
+            )}
           </CardContent>
         </Card>
 

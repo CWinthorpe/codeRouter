@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow, GroupUsage } from '../types';
+import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow, GroupUsage, UpdateStatus } from '../types';
 
 /** Result of a provider connection test. */
 export interface TestConnectionResult {
@@ -205,4 +205,14 @@ export async function getCostSummary(providerId: string, days: number): Promise<
 /** Get the application version string. */
 export async function getAppVersion(): Promise<string> {
   return invoke<string>('get_app_version');
+}
+
+/** Check for available application updates. */
+export async function checkForUpdates(): Promise<UpdateStatus> {
+  return invoke<UpdateStatus>('check_for_updates');
+}
+
+/** Download and install the latest update, then restart the app. */
+export async function installUpdate(): Promise<void> {
+  return invoke<void>('install_update');
 }

@@ -1,11 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useLocation, Link } from 'react-router-dom';
-import { LayoutDashboard, Server, Layers, Terminal, BarChart3, Settings } from 'lucide-react';
+import { LayoutDashboard, Server, Layers, Terminal, BarChart3, Settings, ArrowUpCircle } from 'lucide-react';
 import { useStore } from '../store';
 import { useProxyStatusPoll } from '../hooks/useProxyStatusPoll';
 import { useMetricsStream } from '../hooks/useMetricsStream';
 import { Onboarding } from './Onboarding';
-import { dismissOnboarding } from '../lib/ipc';
+import { dismissOnboarding, checkForUpdates } from '../lib/ipc';
 
 /**
  * Top-level layout shell for the application.
@@ -21,6 +21,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   // Track whether to show the onboarding dialog separately so dismissal persists
   const [showOnboarding, setShowOnboarding] = useState(false);
+  const [updateAvailable, setUpdateAvailable] = useState(false);
 
   // Kick off periodic proxy health checks and live metrics via SSE
   useProxyStatusPoll();
@@ -29,6 +30,12 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     loadInitialData();
   }, [loadInitialData]);
+
+  useEffect(() => {
+    checkForUpdates()
+      .then((status) => setUpdateAvailable(status.available))
+      .catch(() => {});
+  }, []);
 
   // Show onboarding when first-run conditions are met: config loaded but
   // onboarding not yet dismissed AND no providers/groups exist yet
@@ -50,7 +57,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 
   return (
     <div className="flex h-screen w-screen bg-zinc-950 text-zinc-100">
-      <Sidebar />
+      <Sidebar updateAvailable={updateAvailable} />
       <main className="flex-1 overflow-auto p-8">{children}</main>
       {showOnboarding && (
         <Onboarding
@@ -64,7 +71,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
 }
 
 /** Application sidebar with navigation links organized by feature area. */
-function Sidebar() {
+function Sidebar({ updateAvailable }: { updateAvailable: boolean }) {
   return (
     <aside className="flex w-56 flex-col border-r border-zinc-800 bg-zinc-900 p-3">
       <div className="mb-4 flex items-center gap-2 px-2 py-2">
@@ -77,7 +84,7 @@ function Sidebar() {
         <SidebarItem to="/groups" icon={Layers} label="Model Groups" />
         <SidebarItem to="/opencode" icon={Terminal} label="OpenCode Setup" />
         <SidebarItem to="/metrics" icon={BarChart3} label="Usage & Metrics" />
-        <SidebarItem to="/settings" icon={Settings} label="Settings" />
+        <SidebarItem to="/settings" icon={Settings} label="Settings" badge={updateAvailable} />
       </nav>
     </aside>
   );
@@ -99,10 +106,12 @@ function SidebarItem({
   to,
   icon: Icon,
   label,
+  badge,
 }: {
   to: string;
   icon: React.FC<React.SVGProps<SVGSVGElement>>;
   label: string;
+  badge?: boolean;
 }) {
   const location = useLocation();
   const isActive = location.pathname === to;
@@ -116,6 +125,9 @@ function SidebarItem({
     >
       <Icon className="h-4 w-4 shrink-0" />
       <span>{label}</span>
+      {badge && (
+        <ArrowUpCircle className="ml-auto h-4 w-4 shrink-0 text-blue-400" />
+      )}
     </Link>
   );
 }

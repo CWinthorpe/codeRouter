@@ -35,6 +35,9 @@ src-tauri/sidecar/
 *.msi
 *.exe
 
+# ── Signing keys ────────────────────────────────────────────────────────────────
+src-tauri/update.key
+
 # ── Environment / secrets ──────────────────────────────────────────────────────
 .env
 .env.*

@@ -181,6 +181,7 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -337,6 +338,8 @@ fn main() {
             commands::remove_coderouter_from_opencode,
             commands::dismiss_onboarding,
             commands::check_proxy_health,
+            commands::check_for_updates,
+            commands::install_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

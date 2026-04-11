@@ -203,6 +203,14 @@ export interface RequestRow {
   error_type: string | null;
 }
 
+/** Result of checking for application updates. */
+export interface UpdateStatus {
+  available: boolean;
+  currentVersion: string;
+  latestVersion: string | null;
+  releaseNotes: string | null;
+}
+
 /** Aggregated usage metrics for a single group over a time range. */
 export interface GroupUsage {
   /** Group alias. */

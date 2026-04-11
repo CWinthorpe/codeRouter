@@ -51,6 +51,22 @@ fi
 npm run tauri build
 
 echo ""
+echo "=== Step 4: Signing AppImage ==="
+if [ -f "$TAURI_DIR/update.key" ]; then
+  export TAURI_SIGNING_PRIVATE_KEY_PATH="$TAURI_DIR/update.key"
+  APPIMAGE="$(find "$PROJECT_ROOT/target/release/bundle/appimage/" -name "*.AppImage" 2>/dev/null | head -1)"
+  if [ -n "$APPIMAGE" ]; then
+    echo "Signing $APPIMAGE..."
+    cargo tauri signer sign "$APPIMAGE"
+    echo "Signing complete."
+  else
+    echo "Warning: No AppImage found to sign."
+  fi
+else
+  echo "Warning: No update.key found — skipping signing. Generate one with: cargo tauri signer generate -w ./update.key -p ''"
+fi
+
+echo ""
 echo "=== Build complete ==="
 echo "AppImage output:"
 find "$PROJECT_ROOT/target/release/bundle/appimage/" -name "*.AppImage" 2>/dev/null || echo "No AppImage found — check build logs above."

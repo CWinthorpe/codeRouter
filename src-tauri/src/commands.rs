@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use std::process::Child;
 use std::sync::Mutex;
 use tauri::menu::MenuItem;
+use tauri_plugin_updater::UpdaterExt;
 
 /// Global singleton SQLite connection for metrics queries.
 ///
@@ -1039,6 +1040,49 @@ pub fn clear_metrics_data() -> Result<(), String> {
 #[tauri::command]
 pub fn reset_all_config() -> Result<(), String> {
     store::reset_all_config().map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+pub struct UpdateStatus {
+    pub available: bool,
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub release_notes: Option<String>,
+}
+
+#[tauri::command]
+pub async fn check_for_updates(app: tauri::AppHandle) -> Result<UpdateStatus, String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?;
+    match update {
+        Some(update) => Ok(UpdateStatus {
+            available: true,
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: Some(update.version.clone()),
+            release_notes: update.body.clone(),
+        }),
+        None => Ok(UpdateStatus {
+            available: false,
+            current_version: env!("CARGO_PKG_VERSION").to_string(),
+            latest_version: None,
+            release_notes: None,
+        }),
+    }
+}
+
+#[tauri::command]
+pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    let update = updater.check().await.map_err(|e| e.to_string())?;
+    match update {
+        Some(update) => {
+            update.download_and_install(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+            app.restart();
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+        None => Err("No update available".to_string()),
+    }
 }
 
 /// Global application state managed by Tauri.
