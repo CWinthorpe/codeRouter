@@ -1,9 +1,7 @@
 # ── Workflow / AI files ────────────────────────────────────────────────────────
 ai-prompts/
 implementation-notes/
-docs/rules.md
-docs/memories.md
-docs/build-order.md
+docs/
 
 # ── Rust / Cargo ───────────────────────────────────────────────────────────────
 target/
@@ -23,6 +21,9 @@ dist-ssr/
 .vite/
 *.local
 tsconfig.tsbuildinfo
+tsconfig.node.tsbuildinfo
+*.d.ts
+vite.config.js
 
 # ── Tauri build artifacts ──────────────────────────────────────────────────────
 src-tauri/gen/
