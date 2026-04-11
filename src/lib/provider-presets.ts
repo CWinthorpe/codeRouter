@@ -77,6 +77,18 @@ export const providerPresets: ProviderPreset[] = [
     baseUrl: 'https://api.anthropic.com',
     protocol: 'anthropic',
     description: 'Claude models directly from Anthropic',
+    modelOverrides: [
+      { id: 'claude-opus-4-6', context_window: 1000000, max_output_tokens: 128000, input_cost_per_1m: 5.0, output_cost_per_1m: 25.0 },
+      { id: 'claude-opus-4-5', context_window: 200000, max_output_tokens: 64000, input_cost_per_1m: 5.0, output_cost_per_1m: 25.0 },
+      { id: 'claude-opus-4-1', context_window: 200000, max_output_tokens: 32000, input_cost_per_1m: 15.0, output_cost_per_1m: 75.0 },
+      { id: 'claude-sonnet-4-6', context_window: 1000000, max_output_tokens: 128000, input_cost_per_1m: 3.0, output_cost_per_1m: 15.0 },
+      { id: 'claude-sonnet-4-5', context_window: 1000000, max_output_tokens: 64000, input_cost_per_1m: 3.0, output_cost_per_1m: 15.0 },
+      { id: 'claude-sonnet-4', context_window: 1000000, max_output_tokens: 64000, input_cost_per_1m: 3.0, output_cost_per_1m: 15.0 },
+      { id: 'claude-haiku-4-5', context_window: 200000, max_output_tokens: 64000, input_cost_per_1m: 1.0, output_cost_per_1m: 5.0 },
+      { id: 'claude-3-5-haiku', context_window: 200000, max_output_tokens: 8192, input_cost_per_1m: 0.8, output_cost_per_1m: 4.0 },
+      { id: 'claude-3-haiku', context_window: 200000, max_output_tokens: 4096, input_cost_per_1m: 0.25, output_cost_per_1m: 1.25 },
+      { id: 'claude-3.7-sonnet', context_window: 200000, max_output_tokens: 128000, input_cost_per_1m: 3.0, output_cost_per_1m: 15.0 },
+    ],
   },
   {
     id: 'google-ai',
