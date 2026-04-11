@@ -80,6 +80,13 @@ export const providerPresets: ProviderPreset[] = [
     ],
   },
   {
+    id: 'venice',
+    name: 'Venice AI',
+    baseUrl: 'https://api.venice.ai/api/v1',
+    protocol: 'openai',
+    description: 'Privacy-focused AI with no data logging',
+  },
+  {
     id: 'openrouter',
     name: 'OpenRouter',
     baseUrl: 'https://openrouter.ai/api/v1',
