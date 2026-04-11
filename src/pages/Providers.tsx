@@ -28,6 +28,7 @@ import {
 } from '../lib/ipc';
 import type { Provider, ProviderModel, Group, GroupEntry } from '../types';
 import type { TestConnectionResult } from '../lib/ipc';
+import { providerPresets, type ProviderPreset } from '../lib/provider-presets';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -560,6 +561,7 @@ function ProviderModal({
   onClose: () => void;
 }) {
   const isEditing = provider !== null;
+  const [selectedPreset, setSelectedPreset] = useState<ProviderPreset | null>(null);
   const [name, setName] = useState(provider?.name ?? '');
   const [baseUrl, setBaseUrl] = useState(provider?.baseUrl ?? '');
   const [protocol, setProtocol] = useState(provider?.protocol ?? 'openai');
@@ -681,6 +683,35 @@ function ProviderModal({
         </DialogHeader>
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+          {!isEditing && (
+            <div>
+              <p className="mb-2 text-sm font-medium text-zinc-300">Quick Add</p>
+              <div className="grid grid-cols-2 gap-2">
+                {providerPresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => {
+                      setSelectedPreset(preset);
+                      setName(preset.name);
+                      setBaseUrl(preset.baseUrl);
+                      setProtocol(preset.protocol);
+                      setModelOverrides(preset.modelOverrides ?? []);
+                      setShowOverrides((preset.modelOverrides?.length ?? 0) > 0);
+                    }}
+                    className={`rounded-md border px-3 py-2 text-left transition-colors ${
+                      selectedPreset?.id === preset.id
+                        ? 'border-emerald-500 bg-emerald-600/10'
+                        : 'border-zinc-700 bg-zinc-800/50 hover:border-zinc-600 hover:bg-zinc-800'
+                    }`}
+                  >
+                    <span className="block text-sm font-medium text-zinc-100">{preset.name}</span>
+                    <span className="block text-xs text-zinc-500">{preset.description}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div>
             <label className="mb-1 block text-sm font-medium text-zinc-300">Name</label>
             <input
