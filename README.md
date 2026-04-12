@@ -10,22 +10,6 @@ Built with **Tauri 2.x** (Rust sidecar + React/TypeScript frontend) and distribu
 
 ![Dashboard](screenshot-dashboard.png)
 
-### Providers
-
-![Providers](screenshot-providers.png)
-
-### Model Groups
-
-![Model Groups](screenshot-groups.png)
-
-### OpenCode Setup
-
-![OpenCode Setup](screenshot-opencode.png)
-
-### Usage & Metrics
-
-![Usage & Metrics](screenshot-usage.png)
-
 ## Why CodeRouter?
 
 If you use multiple LLM providers or multiple accounts with the same provider, CodeRouter lets you:
