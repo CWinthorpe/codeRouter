@@ -327,6 +327,7 @@ pub async fn save_group(group: Group) -> Result<(), String> {
 
     store::save_groups(&groups).map_err(|e| e.to_string())?;
     notify_sidecar_config_reload().await;
+    reinject_opencode_provider_if_enabled().await;
     Ok(())
 }
 
@@ -343,6 +344,7 @@ pub async fn delete_group(group_id: String) -> Result<(), String> {
     groups.retain(|g| g.id != group_id);
     store::save_groups(&groups).map_err(|e| e.to_string())?;
     notify_sidecar_config_reload().await;
+    reinject_opencode_provider_if_enabled().await;
     Ok(())
 }
 
@@ -985,6 +987,44 @@ pub struct HealthCheckResult {
     pub status: Option<String>,
     /// Proxy uptime in seconds, if reported.
     pub uptime_seconds: Option<u64>,
+}
+
+async fn reinject_opencode_provider_if_enabled() {
+    let stored = match store::load_app_config() {
+        Ok(c) => c.opencode_config_path,
+        Err(_) => return,
+    };
+    let config_path = match config_writer::resolve_opencode_config_path(stored.as_deref()) {
+        Some(p) => p,
+        None => return,
+    };
+
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let config: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let has_coderouter = config
+        .get("provider")
+        .and_then(|p| p.get("coderouter"))
+        .is_some();
+
+    if !has_coderouter {
+        return;
+    }
+
+    let groups = store::load_groups().unwrap_or_default();
+    let providers = store::load_providers().unwrap_or_default();
+    let app_config = store::load_app_config().ok().unwrap_or_default();
+    let entry_statuses = build_entry_statuses().await;
+
+    let _ = config_writer::inject_provider(
+        &config_path, &groups, &providers, app_config.proxy_port, &entry_statuses,
+    );
 }
 
 /// Checks whether the proxy sidecar is healthy by querying its `/health` endpoint.
