@@ -4,6 +4,28 @@ A Linux desktop application that acts as a local OpenAI-compatible proxy router.
 
 Built with **Tauri 2.x** (Rust sidecar + React/TypeScript frontend) and distributed as an **AppImage**.
 
+## Screenshots
+
+### Dashboard
+
+![Dashboard](screenshot-dashboard.png)
+
+### Providers
+
+![Providers](screenshot-providers.png)
+
+### Model Groups
+
+![Model Groups](screenshot-groups.png)
+
+### OpenCode Setup
+
+![OpenCode Setup](screenshot-opencode.png)
+
+### Usage & Metrics
+
+![Usage & Metrics](screenshot-usage.png)
+
 ## Why CodeRouter?
 
 If you use multiple LLM providers or multiple accounts with the same provider, CodeRouter lets you:
@@ -68,8 +90,8 @@ If you use multiple LLM providers or multiple accounts with the same provider, C
 Grab the latest AppImage from [Releases](https://github.com/CWinthorpe/codeRouter/releases):
 
 ```bash
-chmod +x CodeRouter_0.1.12_amd64.AppImage
-./CodeRouter_0.1.12_amd64.AppImage
+chmod +x CodeRouter_0.1.16_amd64.AppImage
+./CodeRouter_0.1.16_amd64.AppImage
 ```
 
 On first launch, CodeRouter creates `~/.config/coderouter/` and `~/.local/share/coderouter/`.
@@ -92,7 +114,7 @@ make dev
 make build
 ```
 
-The AppImage will be produced at `target/release/bundle/appimage/CodeRouter_0.1.12_amd64.AppImage`.
+The AppImage will be produced at `target/release/bundle/appimage/CodeRouter_0.1.16_amd64.AppImage`.
 
 ## Proxy API
 
