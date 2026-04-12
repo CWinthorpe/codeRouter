@@ -93,6 +93,7 @@ fn run_migrations(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider_id, ts);
         CREATE INDEX IF NOT EXISTS idx_requests_group ON requests(group_alias, ts);
+        CREATE INDEX IF NOT EXISTS idx_requests_model ON requests(model_id, ts);
         ",
     )
     .context("Failed to run database migrations")?;
@@ -152,7 +153,7 @@ mod tests {
                 |r| r.get(0),
             )
             .expect("Failed to count indexes");
-        assert_eq!(count, 3);
+        assert_eq!(count, 4);
     }
 
     #[test]

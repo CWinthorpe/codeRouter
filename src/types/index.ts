@@ -224,3 +224,29 @@ export interface GroupUsage {
   /** Total cost in USD. */
   total_cost: number;
 }
+
+/** Per-model usage aggregation over a time range. */
+export interface ModelUsage {
+  /** Model identifier. */
+  model_id: string;
+  /** Total number of requests. */
+  total_requests: number;
+  /** Total cost in USD. */
+  total_cost_usd: number;
+  /** Total prompt tokens consumed. */
+  total_prompt_tokens: number;
+  /** Total output tokens produced. */
+  total_output_tokens: number;
+  /** Average latency in milliseconds. */
+  avg_latency_ms: number;
+}
+
+/** Daily cost breakdown per model for chart rendering. */
+export interface DailyModelUsage {
+  /** Date string in YYYY-MM-DD format. */
+  day: string;
+  /** Model identifier. */
+  model_id: string;
+  /** Total cost in USD for this model on this day. */
+  total_cost_usd: number;
+}

@@ -669,6 +669,39 @@ pub fn get_usage_by_group(days: u32, provider_id: Option<String>) -> Result<Vec<
     })
 }
 
+/// Returns per-model usage aggregation over a given number of days.
+///
+/// Uses the app config's `quota_reset_utc_hour` to align the time window,
+/// defaulting to hour 0 if no config is available.
+///
+/// # Arguments
+/// * `days` — Number of days to look back.
+///
+/// # Errors
+/// Returns an error string if the metrics database query fails.
+#[tauri::command]
+pub fn get_usage_by_model(days: u32) -> Result<Vec<queries::ModelUsage>, String> {
+    with_metrics_db(|conn| {
+        queries::get_usage_by_model(conn, days, 0)
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// Returns daily cost breakdown per model for chart rendering.
+///
+/// # Arguments
+/// * `days` — Number of days to look back.
+///
+/// # Errors
+/// Returns an error string if the metrics database query fails.
+#[tauri::command]
+pub fn get_daily_usage_by_model(days: u32) -> Result<Vec<queries::DailyModelUsage>, String> {
+    with_metrics_db(|conn| {
+        queries::get_daily_usage_by_model(conn, days, 0)
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Frontend representation of an OpenCode agent-to-model mapping.
 ///
 /// Each field corresponds to an agent role whose requests should be routed to

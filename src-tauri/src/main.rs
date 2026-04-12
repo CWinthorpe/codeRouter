@@ -320,6 +320,8 @@ fn main() {
             commands::get_recent_requests,
             commands::get_usage_by_day,
             commands::get_usage_by_group,
+            commands::get_usage_by_model,
+            commands::get_daily_usage_by_model,
             commands::get_opencode_config_path,
             commands::inject_opencode_provider,
             commands::remove_opencode_provider,

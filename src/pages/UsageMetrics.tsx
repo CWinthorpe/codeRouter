@@ -12,8 +12,8 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import { Calendar, Download, ChevronLeft, ChevronRight, Filter } from 'lucide-react';
-import { getRecentRequests } from '../lib/ipc';
-import type { RequestRow } from '../types';
+import { getRecentRequests, getUsageByModel, getDailyUsageByModel } from '../lib/ipc';
+import type { RequestRow, ModelUsage, DailyModelUsage } from '../types';
 import { StatusBadge } from '@/components/StatusBadge';
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table';
 
@@ -209,6 +209,9 @@ export default function UsageMetrics() {
   const [showFilterGroups, setShowFilterGroups] = useState(false);
   const [showFilterStatuses, setShowFilterStatuses] = useState(false);
 
+  const [modelUsageData, setModelUsageData] = useState<ModelUsage[]>([]);
+  const [dailyModelUsageData, setDailyModelUsageData] = useState<DailyModelUsage[]>([]);
+
   // Compute the effective date range from the selected preset or custom dates.
   const dateRange: DateRange = useMemo(() => {
     const now = new Date();
@@ -243,6 +246,25 @@ export default function UsageMetrics() {
     const interval = setInterval(loadData, 30000);
     return () => clearInterval(interval);
   }, [preset, customStart, customEnd]);
+
+  const daysForQuery = useMemo(() => {
+    const diffMs = dateRange.end.getTime() - dateRange.start.getTime();
+    return Math.max(1, Math.ceil(diffMs / 86400000));
+  }, [dateRange]);
+
+  useEffect(() => {
+    const loadModelData = async () => {
+      try {
+        const [modelUsage, dailyModelUsage] = await Promise.all([
+          getUsageByModel(daysForQuery),
+          getDailyUsageByModel(daysForQuery),
+        ]);
+        setModelUsageData(modelUsage);
+        setDailyModelUsageData(dailyModelUsage);
+      } catch {}
+    };
+    loadModelData();
+  }, [daysForQuery]);
 
   // Filter requests by date range, provider, group, and status.
   const filteredRequests = useMemo(() => {
@@ -366,6 +388,34 @@ export default function UsageMetrics() {
 
     return { costChartData, tokensChartData, volumeChartData, providerNames, groupNames, providerColors, groupColors };
   }, [filteredRequests, allRequests, dateRange]);
+
+  const modelChartData = useMemo(() => {
+    const modelNames = [...new Set(dailyModelUsageData.map((d) => d.model_id))];
+    const modelColors: Record<string, string> = {};
+    modelNames.forEach((name, i) => { modelColors[name] = generateColors(modelNames.length)[i]; });
+
+    const days = getDaysInRange(dateRange.start, dateRange.end);
+    const costByDayModel: Record<string, Record<string, number>> = {};
+    for (const day of days) {
+      costByDayModel[day] = {};
+      for (const m of modelNames) {
+        costByDayModel[day][m] = 0;
+      }
+    }
+    for (const r of dailyModelUsageData) {
+      if (costByDayModel[r.day]) {
+        costByDayModel[r.day][r.model_id] = (costByDayModel[r.day][r.model_id] || 0) + r.total_cost_usd;
+      }
+    }
+    const dailyModelChartData = days.map((day) => ({ day, ...costByDayModel[day] }));
+
+    return { dailyModelChartData, modelNames, modelColors };
+  }, [dailyModelUsageData, dateRange]);
+
+  const topModel = useMemo(() => {
+    if (modelUsageData.length === 0) return null;
+    return modelUsageData[0];
+  }, [modelUsageData]);
 
   /** Exports the currently filtered requests as a CSV file download. */
   const exportCSV = useCallback(() => {
@@ -539,6 +589,61 @@ export default function UsageMetrics() {
           )}
         </ChartCard>
       </div>
+
+      {/* Model Cost Charts */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+        <ChartCard title="Cost by Model">
+          {modelChartData.dailyModelChartData.length > 0 && modelChartData.modelNames.length > 0 ? (
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={modelChartData.dailyModelChartData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                <XAxis dataKey="day" tick={{ fill: '#71717a', fontSize: 11 }} tickFormatter={(v: string) => v.slice(5)} />
+                <YAxis tick={{ fill: '#71717a', fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(2)}`} />
+                <Tooltip
+                  contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '6px' }}
+                  labelStyle={{ color: '#a1a1aa' }}
+                  formatter={(value: unknown) => [`$${Number(value).toFixed(4)}`, '']}
+                />
+                <Legend wrapperStyle={{ fontSize: '12px' }} />
+                {modelChartData.modelNames.map((name) => (
+                  <Bar key={name} dataKey={name} stackId="a" fill={modelChartData.modelColors[name]} name={name} />
+                ))}
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <EmptyChart />
+          )}
+        </ChartCard>
+
+        <ChartCard title="Aggregated Cost by Model">
+          {modelUsageData.length > 0 ? (
+            <ResponsiveContainer width="100%" height={280}>
+              <BarChart data={modelUsageData} layout="vertical">
+                <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                <XAxis type="number" tick={{ fill: '#71717a', fontSize: 11 }} tickFormatter={(v: number) => `$${v.toFixed(2)}`} />
+                <YAxis dataKey="model_id" type="category" tick={{ fill: '#a1a1aa', fontSize: 11 }} width={140} />
+                <Tooltip
+                  contentStyle={{ backgroundColor: '#18181b', border: '1px solid #27272a', borderRadius: '6px' }}
+                  labelStyle={{ color: '#a1a1aa' }}
+                  formatter={(value: unknown) => [`$${Number(value).toFixed(4)}`, 'Cost']}
+                />
+                <Bar dataKey="total_cost_usd" fill="#8b5cf6" name="Cost" />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <EmptyChart />
+          )}
+        </ChartCard>
+      </div>
+
+      {topModel && (
+        <div className="grid grid-cols-2 gap-4 md:grid-cols-4">
+          <SummaryCard label="Top Model by Cost" value={topModel.model_id} />
+          <SummaryCard label="Top Model Cost" value={`$${topModel.total_cost_usd.toFixed(4)}`} />
+          <SummaryCard label="Top Model Requests" value={topModel.total_requests.toLocaleString()} />
+          <SummaryCard label="Top Model Avg Latency" value={`${Math.round(topModel.avg_latency_ms)}ms`} />
+        </div>
+      )}
 
       {/* Request Log Table */}
       <div className="rounded-lg border border-zinc-800 bg-zinc-900">

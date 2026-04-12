@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow, GroupUsage, UpdateStatus } from '../types';
+import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow, GroupUsage, UpdateStatus, ModelUsage, DailyModelUsage } from '../types';
 
 /** Result of a provider connection test. */
 export interface TestConnectionResult {
@@ -180,6 +180,16 @@ export async function dismissOnboarding(): Promise<void> {
 export async function getUsageByGroup(days: number, providerId?: string): Promise<GroupUsage[]> {
   // Send null when providerId is undefined so the backend returns unfiltered data
   return invoke<GroupUsage[]>('get_usage_by_group', { days, providerId: providerId ?? null });
+}
+
+/** Fetch usage metrics aggregated by model over a number of days. */
+export async function getUsageByModel(days: number): Promise<ModelUsage[]> {
+  return invoke<ModelUsage[]>('get_usage_by_model', { days });
+}
+
+/** Fetch daily cost breakdown per model over a number of days. */
+export async function getDailyUsageByModel(days: number): Promise<DailyModelUsage[]> {
+  return invoke<DailyModelUsage[]>('get_daily_usage_by_model', { days });
 }
 
 /** Result of a proxy health check, indicating whether it is running and for how long. */

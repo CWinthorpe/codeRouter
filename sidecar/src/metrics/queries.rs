@@ -344,6 +344,120 @@ pub fn get_latency_percentiles(
     }))
 }
 
+/// Per-model usage aggregation over a time range.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelUsage {
+    pub model_id: String,
+    pub total_requests: i64,
+    pub total_cost_usd: f64,
+    pub total_prompt_tokens: i64,
+    pub total_output_tokens: i64,
+    pub avg_latency_ms: f64,
+}
+
+/// Daily per-model cost breakdown for chart data.
+#[derive(Debug, Clone, Serialize)]
+pub struct DailyModelUsage {
+    pub day: String,
+    pub model_id: String,
+    pub total_cost_usd: f64,
+}
+
+/// Returns per-model aggregated usage over the last `days` days, ordered by
+/// total cost descending.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `days` — How many days back to include.
+/// - `reset_hour` — UTC hour at which the daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
+pub fn get_usage_by_model(
+    conn: &Connection,
+    days: u32,
+    reset_hour: u32,
+) -> Result<Vec<ModelUsage>> {
+    let now = Utc::now();
+    let start_date = (now - chrono::Duration::days(days as i64)).date_naive();
+    let start_ts = start_date
+        .and_hms_opt(reset_hour, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+
+    let mut stmt = conn.prepare(
+        "SELECT model_id,
+                COUNT(*) as total_requests,
+                COALESCE(SUM(cost_usd), 0.0) as total_cost_usd,
+                COALESCE(SUM(prompt_tokens), 0) as total_prompt_tokens,
+                COALESCE(SUM(output_tokens), 0) as total_output_tokens,
+                AVG(latency_ms) as avg_latency_ms
+         FROM requests
+         WHERE ts >= ?1
+         GROUP BY model_id
+         ORDER BY total_cost_usd DESC",
+    )?;
+    let rows = stmt.query_map([&start_ts.to_string()], |row| {
+        Ok(ModelUsage {
+            model_id: row.get(0)?,
+            total_requests: row.get(1)?,
+            total_cost_usd: row.get(2)?,
+            total_prompt_tokens: row.get(3)?,
+            total_output_tokens: row.get(4)?,
+            avg_latency_ms: row.get(5)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to collect model usage: {}", e))
+}
+
+/// Returns daily cost breakdown per model for chart rendering.
+///
+/// # Arguments
+///
+/// - `conn` — SQLite connection to query.
+/// - `days` — How many days back to include.
+/// - `reset_hour` — UTC hour at which the daily quota resets.
+///
+/// # Errors
+///
+/// Returns an error if the query or row-mapping fails.
+pub fn get_daily_usage_by_model(
+    conn: &Connection,
+    days: u32,
+    reset_hour: u32,
+) -> Result<Vec<DailyModelUsage>> {
+    let now = Utc::now();
+    let start_date = (now - chrono::Duration::days(days as i64)).date_naive();
+    let start_ts = start_date
+        .and_hms_opt(reset_hour, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp();
+
+    let mut stmt = conn.prepare(
+        "SELECT strftime('%Y-%m-%d', ts, 'unixepoch') as day,
+                model_id,
+                COALESCE(SUM(cost_usd), 0.0) as total_cost_usd
+         FROM requests
+         WHERE ts >= ?1
+         GROUP BY day, model_id
+         ORDER BY day ASC, total_cost_usd DESC",
+    )?;
+    let rows = stmt.query_map([&start_ts.to_string()], |row| {
+        Ok(DailyModelUsage {
+            day: row.get(0)?,
+            model_id: row.get(1)?,
+            total_cost_usd: row.get(2)?,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to collect daily model usage: {}", e))
+}
+
 /// Returns total token usage (prompt + output) per provider for the current
 /// quota period, starting at the given `quota_reset_utc_hour`.
 ///
