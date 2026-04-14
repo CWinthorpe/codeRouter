@@ -250,3 +250,68 @@ export interface DailyModelUsage {
   /** Total cost in USD for this model on this day. */
   total_cost_usd: number;
 }
+
+/** Permission level for a specific tool or command pattern. */
+export type PermissionLevel = 'allow' | 'deny' | 'ask';
+
+/** Bash permission config: either a simple level or a map of command patterns to levels. */
+export type BashPermission = PermissionLevel | Record<string, PermissionLevel>;
+
+/** Configurable permissions for a custom agent's tool access. */
+export interface AgentPermissions {
+  /** File edit permission. */
+  edit?: PermissionLevel;
+  /** Bash command permission (simple level or command-pattern map). */
+  bash?: BashPermission;
+  /** Web fetch permission. */
+  webfetch?: PermissionLevel;
+  /** Task/subagent invocation permissions (agent-name pattern to level). */
+  task?: Record<string, PermissionLevel>;
+}
+
+/** Agent mode determining how the agent can be invoked. */
+export type AgentMode = 'primary' | 'subagent' | 'all';
+
+/** A custom OpenCode agent defined via markdown file. */
+export interface CustomAgent {
+  /** Agent identifier (derived from filename, without .md extension). */
+  name: string;
+  /** Brief description of what the agent does (required in frontmatter). */
+  description: string;
+  /** How the agent can be used: primary, subagent, or both. */
+  mode: AgentMode;
+  /** CodeRouter model group alias (written as coderouter/<alias> in the file). */
+  model: string | undefined;
+  /** System prompt / instructions (markdown body, after frontmatter). */
+  prompt: string;
+  /** Temperature for response generation (0.0–1.0). */
+  temperature?: number;
+  /** Maximum number of agentic iterations before forced text-only response. */
+  steps?: number;
+  /** Whether the agent is disabled. */
+  disable?: boolean;
+  /** Hide subagent from @ autocomplete menu. */
+  hidden?: boolean;
+  /** Visual color for the agent in the UI (hex or theme color name). */
+  color?: string;
+  /** Top P for response diversity (0.0–1.0). */
+  topP?: number;
+  /** Tool access permissions. */
+  permissions?: AgentPermissions;
+  /** Additional provider-specific options passed through as-is. */
+  additional?: Record<string, unknown>;
+}
+
+/** Built-in template for creating a new custom agent. */
+export interface AgentTemplate {
+  /** Unique template identifier. */
+  id: string;
+  /** Display name shown in the template picker. */
+  name: string;
+  /** Short description of the template's purpose. */
+  description: string;
+  /** Icon emoji or lucide icon name for the template card. */
+  icon: string;
+  /** Pre-filled agent configuration. */
+  agent: Omit<CustomAgent, 'name'>;
+}

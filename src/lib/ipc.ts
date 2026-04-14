@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow, GroupUsage, UpdateStatus, ModelUsage, DailyModelUsage } from '../types';
+import type { Provider, Group, AppConfig, RouterStatusResponse, DailySummary, RequestRow, GroupUsage, UpdateStatus, ModelUsage, DailyModelUsage, CustomAgent, AgentTemplate } from '../types';
 
 /** Result of a provider connection test. */
 export interface TestConnectionResult {
@@ -225,4 +225,46 @@ export async function checkForUpdates(): Promise<UpdateStatus> {
 /** Download and install the latest update, then restart the app. */
 export async function installUpdate(): Promise<void> {
   return invoke<void>('install_update');
+}
+
+/** List all custom agents stored as markdown files. */
+export async function listCustomAgents(): Promise<CustomAgent[]> {
+  return invoke<CustomAgent[]>('list_custom_agents');
+}
+
+/** Create a new custom agent from the given configuration. */
+export async function createCustomAgent(agent: CustomAgent): Promise<CustomAgent> {
+  return invoke<CustomAgent>('create_custom_agent', { agent });
+}
+
+/** Update an existing custom agent by name. */
+export async function updateCustomAgent(name: string, agent: CustomAgent): Promise<CustomAgent> {
+  return invoke<CustomAgent>('update_custom_agent', { name, agent });
+}
+
+/** Delete a custom agent by name. */
+export async function deleteCustomAgent(name: string): Promise<void> {
+  return invoke<void>('delete_custom_agent', { name });
+}
+
+/** Get the built-in agent templates available for selection. */
+export async function getAgentTemplates(): Promise<AgentTemplate[]> {
+  return invoke<AgentTemplate[]>('get_agent_templates');
+}
+
+/** Request body for AI enhancement. */
+export interface AgentEnhanceRequest {
+  text: string;
+  enhanceType: 'description' | 'prompt' | 'suggestions';
+  modelGroup: string;
+}
+
+/** Result of an AI enhancement request. */
+export interface AgentEnhanceResponse {
+  result: string;
+}
+
+/** Use the proxy's chat completion to enhance agent text or suggest settings. */
+export async function enhanceAgentText(request: AgentEnhanceRequest): Promise<AgentEnhanceResponse> {
+  return invoke<AgentEnhanceResponse>('enhance_agent_text', { request });
 }

@@ -17,6 +17,7 @@ use chrono::NaiveDate;
 use reqwest::Client;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::process::Child;
 use std::sync::Mutex;
 use tauri::menu::MenuItem;
@@ -1313,6 +1314,422 @@ pub fn restart_proxy(state: tauri::State<AppState>) -> Result<(), String> {
     crate::update_menu_labels(&state, true);
 
     Ok(())
+}
+
+// ─── Custom Agent Management ───────────────────────────────────────────────
+
+use coderouter_proxy::opencode::custom_agents::{
+    self, AgentMode, AgentPermissions, BashPermission, CustomAgent, PermissionLevel,
+};
+
+/// JSON-serializable permission level.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionLevelResponse {
+    Allow,
+    Deny,
+    Ask,
+}
+
+impl From<PermissionLevel> for PermissionLevelResponse {
+    fn from(p: PermissionLevel) -> Self {
+        match p {
+            PermissionLevel::Allow => PermissionLevelResponse::Allow,
+            PermissionLevel::Deny => PermissionLevelResponse::Deny,
+            PermissionLevel::Ask => PermissionLevelResponse::Ask,
+        }
+    }
+}
+
+impl From<PermissionLevelResponse> for PermissionLevel {
+    fn from(p: PermissionLevelResponse) -> Self {
+        match p {
+            PermissionLevelResponse::Allow => PermissionLevel::Allow,
+            PermissionLevelResponse::Deny => PermissionLevel::Deny,
+            PermissionLevelResponse::Ask => PermissionLevel::Ask,
+        }
+    }
+}
+
+/// JSON-serializable bash permission.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum BashPermissionResponse {
+    Simple(PermissionLevelResponse),
+    Commands(HashMap<String, PermissionLevelResponse>),
+}
+
+impl From<BashPermission> for BashPermissionResponse {
+    fn from(p: BashPermission) -> Self {
+        match p {
+            BashPermission::Simple(level) => BashPermissionResponse::Simple(level.into()),
+            BashPermission::Commands(map) => {
+                BashPermissionResponse::Commands(map.into_iter().map(|(k, v)| (k, v.into())).collect())
+            }
+        }
+    }
+}
+
+impl From<BashPermissionResponse> for BashPermission {
+    fn from(p: BashPermissionResponse) -> Self {
+        match p {
+            BashPermissionResponse::Simple(level) => BashPermission::Simple(level.into()),
+            BashPermissionResponse::Commands(map) => {
+                BashPermission::Commands(map.into_iter().map(|(k, v)| (k, v.into())).collect())
+            }
+        }
+    }
+}
+
+/// JSON-serializable agent permissions.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct AgentPermissionsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub edit: Option<PermissionLevelResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bash: Option<BashPermissionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub webfetch: Option<PermissionLevelResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<HashMap<String, PermissionLevelResponse>>,
+}
+
+impl From<AgentPermissions> for AgentPermissionsResponse {
+    fn from(p: AgentPermissions) -> Self {
+        AgentPermissionsResponse {
+            edit: p.edit.map(|l| l.into()),
+            bash: p.bash.map(|b| b.into()),
+            webfetch: p.webfetch.map(|l| l.into()),
+            task: p.task.map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
+        }
+    }
+}
+
+impl From<AgentPermissionsResponse> for AgentPermissions {
+    fn from(p: AgentPermissionsResponse) -> Self {
+        AgentPermissions {
+            edit: p.edit.map(|l| l.into()),
+            bash: p.bash.map(|b| b.into()),
+            webfetch: p.webfetch.map(|l| l.into()),
+            task: p.task.map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
+        }
+    }
+}
+
+/// JSON-serializable agent mode.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentModeResponse {
+    Primary,
+    #[default]
+    Subagent,
+    All,
+}
+
+impl From<AgentMode> for AgentModeResponse {
+    fn from(m: AgentMode) -> Self {
+        match m {
+            AgentMode::Primary => AgentModeResponse::Primary,
+            AgentMode::Subagent => AgentModeResponse::Subagent,
+            AgentMode::All => AgentModeResponse::All,
+        }
+    }
+}
+
+impl From<AgentModeResponse> for AgentMode {
+    fn from(m: AgentModeResponse) -> Self {
+        match m {
+            AgentModeResponse::Primary => AgentMode::Primary,
+            AgentModeResponse::Subagent => AgentMode::Subagent,
+            AgentModeResponse::All => AgentMode::All,
+        }
+    }
+}
+
+/// JSON-serializable custom agent returned to the frontend.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct CustomAgentResponse {
+    pub name: String,
+    pub description: String,
+    pub mode: AgentModeResponse,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, rename = "topP", skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, rename = "permissions", skip_serializing_if = "Option::is_none")]
+    pub permission: Option<AgentPermissionsResponse>,
+    #[serde(default)]
+    pub additional: HashMap<String, serde_json::Value>,
+}
+
+impl From<CustomAgent> for CustomAgentResponse {
+    fn from(a: CustomAgent) -> Self {
+        CustomAgentResponse {
+            name: a.name,
+            description: a.description,
+            mode: a.mode.into(),
+            model: a.model,
+            prompt: a.prompt,
+            temperature: a.temperature,
+            steps: a.steps,
+            disable: a.disable,
+            hidden: a.hidden,
+            color: a.color,
+            top_p: a.top_p,
+            permission: a.permission.map(|p| p.into()),
+            additional: a.additional,
+        }
+    }
+}
+
+impl From<CustomAgentResponse> for CustomAgent {
+    fn from(a: CustomAgentResponse) -> Self {
+        CustomAgent {
+            name: a.name,
+            description: a.description,
+            mode: a.mode.into(),
+            model: a.model,
+            prompt: a.prompt,
+            temperature: a.temperature,
+            steps: a.steps,
+            disable: a.disable,
+            hidden: a.hidden,
+            color: a.color,
+            top_p: a.top_p,
+            permission: a.permission.map(|p| p.into()),
+            additional: a.additional,
+        }
+    }
+}
+
+/// JSON-serializable template agent (pre-filled config without name).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct TemplateAgentResponse {
+    pub description: String,
+    pub mode: AgentModeResponse,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steps: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, rename = "topP", skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+    #[serde(default, rename = "permissions", skip_serializing_if = "Option::is_none")]
+    pub permission: Option<AgentPermissionsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disable: Option<bool>,
+    #[serde(default)]
+    pub additional: HashMap<String, serde_json::Value>,
+}
+
+/// JSON-serializable agent template.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AgentTemplateResponse {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub icon: String,
+    pub agent: TemplateAgentResponse,
+}
+
+impl From<custom_agents::AgentTemplate> for AgentTemplateResponse {
+    fn from(t: custom_agents::AgentTemplate) -> Self {
+        AgentTemplateResponse {
+            id: t.id,
+            name: t.name,
+            description: t.description,
+            icon: t.icon,
+            agent: TemplateAgentResponse {
+                description: t.agent.description,
+                mode: t.agent.mode.into(),
+                prompt: t.agent.prompt,
+                temperature: t.agent.temperature,
+                steps: t.agent.steps,
+                hidden: t.agent.hidden,
+                color: t.agent.color,
+                top_p: t.agent.top_p,
+                permission: t.agent.permission.map(|p| p.into()),
+                model: t.agent.model,
+                disable: t.agent.disable,
+                additional: t.agent.additional,
+            },
+        }
+    }
+}
+
+/// Lists all custom agents stored as markdown files.
+#[tauri::command]
+pub async fn list_custom_agents() -> Result<Vec<CustomAgentResponse>, String> {
+    tokio::task::spawn_blocking(|| {
+        custom_agents::list_agents()
+            .map(|agents| agents.into_iter().map(|a| a.into()).collect())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Creates a new custom agent from the given configuration.
+#[tauri::command]
+pub async fn create_custom_agent(agent: CustomAgentResponse) -> Result<CustomAgentResponse, String> {
+    tokio::task::spawn_blocking(move || {
+        let agent: CustomAgent = agent.into();
+        let path = custom_agents::create_agent(&agent).map_err(|e| e.to_string())?;
+        custom_agents::parse_agent_file(&path)
+            .map(|a| a.into())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Updates an existing custom agent by name.
+#[tauri::command]
+pub async fn update_custom_agent(name: String, agent: CustomAgentResponse) -> Result<CustomAgentResponse, String> {
+    tokio::task::spawn_blocking(move || {
+        let agent: CustomAgent = agent.into();
+        let path = custom_agents::update_agent(&name, &agent).map_err(|e| e.to_string())?;
+        custom_agents::parse_agent_file(&path)
+            .map(|a| a.into())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Deletes a custom agent by name.
+#[tauri::command]
+pub async fn delete_custom_agent(name: String) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || {
+        custom_agents::delete_agent(&name).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Returns the built-in agent templates available for selection.
+#[tauri::command]
+pub fn get_agent_templates() -> Result<Vec<AgentTemplateResponse>, String> {
+    Ok(custom_agents::get_templates().into_iter().map(|t| t.into()).collect())
+}
+
+/// Request body for AI enhancement.
+#[derive(Deserialize)]
+pub struct AgentEnhanceRequest {
+    /// The text to enhance (description or prompt).
+    pub text: String,
+    #[serde(rename = "enhanceType")]
+    pub enhance_type: String,
+    #[serde(rename = "modelGroup")]
+    pub model_group: String,
+}
+
+/// Result of an AI enhancement request.
+#[derive(Serialize)]
+pub struct AgentEnhanceResponse {
+    /// The enhanced text or suggestion JSON string.
+    pub result: String,
+}
+
+/// Uses the proxy's chat completion endpoint to enhance agent text or suggest settings.
+///
+/// Sends a system prompt to the proxy asking it to improve the given text
+/// or provide configuration suggestions.
+#[tauri::command]
+pub async fn enhance_agent_text(request: AgentEnhanceRequest) -> Result<AgentEnhanceResponse, String> {
+    if request.model_group.trim().is_empty() {
+        return Err("model_group must not be empty".to_string());
+    }
+
+    let app_config = store::load_app_config().unwrap_or_default();
+    let proxy_url = format!(
+        "http://{}:{}/v1/chat/completions",
+        app_config.proxy_host, app_config.proxy_port
+    );
+
+    let system_prompt = match request.enhance_type.as_str() {
+        "description" => {
+            r#"You are an expert at writing clear, concise descriptions for AI coding agents.
+Improve the given description to be more specific about what the agent does and when to use it.
+Keep it to 1-2 sentences. Return ONLY the improved description text, no explanations."#
+        }
+        "prompt" => {
+            r#"You are an expert at writing effective system prompts for AI coding agents.
+Improve the given prompt to be more structured, specific, and actionable.
+Use clear sections and bullet points where appropriate.
+Return ONLY the improved prompt text, no explanations."#
+        }
+        "suggestions" => {
+            r#"You are an expert at configuring AI coding agents.
+Based on the following agent configuration, suggest optimal settings.
+Return a JSON object with these optional keys: "temperature" (0.0-1.0), "edit_permission" ("allow"/"deny"/"ask"), "bash_permission" ("allow"/"deny"/"ask"), "webfetch_permission" ("allow"/"deny"/"ask").
+Only include keys where you have a specific recommendation.
+Return ONLY the JSON object, no explanations."#
+        }
+        _ => return Err(format!("Unknown enhance_type: {}", request.enhance_type)),
+    };
+
+    let user_content = request.text;
+
+    let body = serde_json::json!({
+        "model": format!("coderouter/{}", request.model_group),
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        "temperature": 0.3,
+        "max_tokens": 2000
+    });
+
+    let client = Client::new();
+    let resp = client
+        .post(&proxy_url)
+        .json(&body)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("Failed to call proxy: {}", e))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let err_text = resp.text().await.unwrap_or_default();
+        return Err(format!("Proxy returned {}: {}", status, err_text.chars().take(200).collect::<String>()));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse proxy response: {}", e))?;
+
+    let content = json
+        .get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or("No response content")
+        .to_string();
+
+    Ok(AgentEnhanceResponse { result: content })
 }
 
 #[cfg(test)]

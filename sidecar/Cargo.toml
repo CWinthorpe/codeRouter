@@ -1,6 +1,6 @@
 [package]
 name = "coderouter-proxy"
-version = "0.1.18"
+version = "0.1.19"
 edition = "2021"
 
 [[bin]]
@@ -26,6 +26,7 @@ chrono = { workspace = true }
 url = "2"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
+serde_yaml = "0.9"
 
 [lib]
 name = "coderouter_proxy"

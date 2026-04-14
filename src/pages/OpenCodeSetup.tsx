@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { useStore } from '../store';
 import { Toast } from '../components/Toast';
+import CustomAgentsManager from '../components/CustomAgentsManager';
 import {
   getOpencodeConfigPath,
   setOpencodeConfigPath,
@@ -414,6 +415,11 @@ export default function OpenCodeSetup() {
               Clear Agent Mapping
             </button>
           </div>
+        </SectionCard>
+
+        {/* Custom Agents section */}
+        <SectionCard>
+          <CustomAgentsManager />
         </SectionCard>
 
         {/* Config preview panel */}

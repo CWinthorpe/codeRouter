@@ -342,6 +342,12 @@ fn main() {
             commands::check_proxy_health,
             commands::check_for_updates,
             commands::install_update,
+            commands::list_custom_agents,
+            commands::create_custom_agent,
+            commands::update_custom_agent,
+            commands::delete_custom_agent,
+            commands::get_agent_templates,
+            commands::enhance_agent_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
