@@ -176,19 +176,28 @@ function AiEnhanceButton({
   text,
   enhanceType,
   modelGroup,
+  validGroups,
   onEnhanced,
 }: {
   text: string;
   enhanceType: 'description' | 'prompt' | 'suggestions';
   modelGroup: string | null;
+  validGroups: string[];
   onEnhanced: (result: string) => void;
 }) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const groupExists = modelGroup !== null && validGroups.includes(modelGroup);
+
   const handleEnhance = useCallback(async () => {
     if (!text.trim()) return;
     if (!modelGroup) {
+      setError('Select a model group first');
+      return;
+    }
+    if (!groupExists) {
+      setError(`Model group "${modelGroup}" does not exist`);
       return;
     }
     setLoading(true);
@@ -206,13 +215,13 @@ function AiEnhanceButton({
     } finally {
       setLoading(false);
     }
-  }, [text, enhanceType, modelGroup, onEnhanced]);
+  }, [text, enhanceType, modelGroup, groupExists, onEnhanced]);
 
   return (
     <div className="flex items-center gap-2">
       <button
         onClick={handleEnhance}
-        disabled={loading || !text.trim() || !modelGroup}
+        disabled={loading || !text.trim() || !groupExists}
         className="flex items-center gap-1.5 rounded-md bg-violet-600/20 px-2.5 py-1.5 text-xs font-medium text-violet-300 transition-colors hover:bg-violet-600/30 disabled:opacity-40"
         title={enhanceType === 'suggestions' ? 'Get AI suggestions for settings' : `AI enhance ${enhanceType}`}
       >
@@ -305,6 +314,7 @@ function CustomAgentForm({
               text={agent.description}
               enhanceType="description"
               modelGroup={agent.model ?? null}
+              validGroups={groupAliases}
               onEnhanced={(result) => updateField('description', result)}
             />
           </div>
@@ -397,6 +407,7 @@ function CustomAgentForm({
               text={agent.prompt}
               enhanceType="prompt"
               modelGroup={agent.model ?? null}
+              validGroups={groupAliases}
               onEnhanced={(result) => updateField('prompt', result)}
             />
           </div>
@@ -417,6 +428,7 @@ function CustomAgentForm({
               text={`${agent.description}\n\n${agent.prompt}`}
               enhanceType="suggestions"
               modelGroup={agent.model ?? null}
+              validGroups={groupAliases}
               onEnhanced={(result) => {
                 try {
                   const suggestions = JSON.parse(result);

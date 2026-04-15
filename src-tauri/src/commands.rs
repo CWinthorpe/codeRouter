@@ -1690,8 +1690,11 @@ Return ONLY the JSON object, no explanations."#
 
     let user_content = request.text;
 
+    let model = request.model_group.strip_prefix("coderouter/")
+        .unwrap_or(&request.model_group);
+
     let body = serde_json::json!({
-        "model": format!("coderouter/{}", request.model_group),
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content}
