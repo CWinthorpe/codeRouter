@@ -42,6 +42,7 @@ If you use multiple LLM providers or multiple accounts with the same provider, C
 ### OpenCode Integration
 - **One-Click Setup** — Auto-configure OpenCode to use CodeRouter as a provider
 - **Agent Mapping** — Assign different model groups to OpenCode agents (build, plan, general, explore)
+- **Custom Agents & Subagents** — Create specialized agents from templates or scratch, saved as markdown files in OpenCode's native format. Includes AI-powered prompt enhancement, permission management, and model group assignment
 - **Surgical JSON Patching** — Only updates the relevant sections of OpenCode config, preserving all other settings
 
 ### Desktop Experience
@@ -74,8 +75,8 @@ If you use multiple LLM providers or multiple accounts with the same provider, C
 Grab the latest AppImage from [Releases](https://github.com/CWinthorpe/codeRouter/releases):
 
 ```bash
-chmod +x CodeRouter_0.1.16_amd64.AppImage
-./CodeRouter_0.1.16_amd64.AppImage
+chmod +x CodeRouter_0.1.20_amd64.AppImage
+./CodeRouter_0.1.20_amd64.AppImage
 ```
 
 On first launch, CodeRouter creates `~/.config/coderouter/` and `~/.local/share/coderouter/`.
@@ -98,7 +99,7 @@ make dev
 make build
 ```
 
-The AppImage will be produced at `target/release/bundle/appimage/CodeRouter_0.1.16_amd64.AppImage`.
+The AppImage will be produced at `target/release/bundle/appimage/CodeRouter_0.1.20_amd64.AppImage`.
 
 ## Proxy API
 
@@ -198,14 +199,14 @@ codeRouter/
 │       ├── credentials/  # libsecret keychain wrapper
 │       ├── metrics/      # SQLite recorder, queries, scheduler
 │       ├── models/       # Upstream model discovery
-│       ├── opencode/     # OpenCode config writer
+│       ├── opencode/     # OpenCode config writer + custom agents
 │       └── proxy/        # Axum server, router, protocol translator
 ├── src-tauri/            # Tauri desktop shell
 │   └── src/
 │       ├── commands.rs   # All Tauri IPC commands
 │       └── main.rs       # Entry point, sidecar lifecycle, tray
 ├── src/                  # React frontend
-│   ├── components/       # AppShell (sidebar layout)
+│   ├── components/       # AppShell, CustomAgentsManager, shared UI
 │   ├── pages/            # Dashboard, Providers, Groups, etc.
 │   ├── store/            # Zustand global state
 │   ├── lib/ipc.ts        # Typed IPC wrapper
