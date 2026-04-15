@@ -1117,6 +1117,7 @@ pub fn reset_all_config() -> Result<(), String> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct UpdateStatus {
     pub available: bool,
     pub current_version: String,
