@@ -24,6 +24,8 @@ export const providerPresets: ProviderPreset[] = [
       { id: 'mimo-v2-omni', context_window: 262144, max_output_tokens: 65536 },
       { id: 'minimax-m2.7', context_window: 204800, max_output_tokens: 131072, protocol: 'anthropic' },
       { id: 'minimax-m2.5', context_window: 196608, max_output_tokens: 65536, protocol: 'anthropic' },
+      { id: 'qwen3.6-plus', context_window: 1000000, max_output_tokens: 65536 },
+      { id: 'qwen3.5-plus', context_window: 1000000, max_output_tokens: 65536 },
     ],
   },
   {
