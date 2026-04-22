@@ -354,9 +354,10 @@ mod tests {
                 on_consecutive_errors: true,
                 consecutive_error_threshold: 5,
                 on_latency_timeout: true,
-                latency_timeout_ms: 30000,
-                latency_timeout_cooldown_ms: 300000,
+                latency_timeout_ms: 90000,
+                latency_timeout_cooldown_ms: 60000,
                 consecutive_error_cooldown_ms: 600000,
+                max_response_duration_ms: 1_200_000,
             },
         }
     }

@@ -33,9 +33,10 @@ const DEFAULT_FAILOVER: FailoverConfig = {
   onConsecutiveErrors: true,
   consecutiveErrorThreshold: 5,
   onLatencyTimeout: true,
-  latencyTimeoutMs: 30000,
-  latencyTimeoutCooldownMs: 300000,
+  latencyTimeoutMs: 90000,
+  latencyTimeoutCooldownMs: 60000,
   consecutiveErrorCooldownMs: 600000,
+  maxResponseDurationMs: 1200000,
 };
 
 /** Formats a number with locale-aware separators, or '—' for undefined. */
@@ -1084,6 +1085,27 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                       />
                     </div>
                   )}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-sm text-zinc-300">Max streaming response duration</span>
+                      <p className="text-xs text-zinc-500">Total wall-clock timeout for streaming responses</p>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        value={failoverConfig.maxResponseDurationMs / 1000}
+                        onChange={(e) =>
+                          setFailoverConfig((c) => ({
+                            ...c,
+                            maxResponseDurationMs: Math.max(1, Number(e.target.value) * 1000),
+                          }))
+                        }
+                        className="w-28 rounded-md border border-zinc-700 bg-zinc-800 px-3 py-1.5 text-sm text-zinc-100 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
+                        min="1"
+                      />
+                      <span className="text-xs text-zinc-500">seconds</span>
+                    </div>
+                  </div>
                 </div>
               </div>
             )}

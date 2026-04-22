@@ -36,7 +36,7 @@ describe('useStore', () => {
 
   it('should update groups via setGroups', () => {
     const { setGroups } = useStore.getState();
-    const mockGroups = [{ id: 'g1', alias: 'test', displayName: 'Test', entries: [], failoverConfig: { on429: true, onQuotaExhausted: true, onConsecutiveErrors: true, consecutiveErrorThreshold: 5, onLatencyTimeout: true, latencyTimeoutMs: 30000 } }];
+    const mockGroups = [{ id: 'g1', alias: 'test', displayName: 'Test', entries: [], failoverConfig: { on429: true, onQuotaExhausted: true, onConsecutiveErrors: true, consecutiveErrorThreshold: 5, onLatencyTimeout: true, latencyTimeoutMs: 90000 } }];
     setGroups(mockGroups as any);
     expect(useStore.getState().groups).toHaveLength(1);
     expect(useStore.getState().groups[0].alias).toBe('test');

@@ -530,9 +530,10 @@ mod tests {
                 on_consecutive_errors: true,
                 consecutive_error_threshold: 3,
                 on_latency_timeout: true,
-                latency_timeout_ms: 30000,
-                latency_timeout_cooldown_ms: 300000,
+                latency_timeout_ms: 90000,
+                latency_timeout_cooldown_ms: 60000,
                 consecutive_error_cooldown_ms: 600000,
+                max_response_duration_ms: 1_200_000,
             },
         }
     }
@@ -682,7 +683,7 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            let result = record_latency_timeout(&mut s, "p1", 0, 300000);
+            let result = record_latency_timeout(&mut s, "p1", 0, 60000);
             assert!(result.is_ok());
         }
         let state = state.lock().unwrap();
@@ -973,7 +974,7 @@ mod tests {
         let state = init_router_state(&[group.clone()], &providers);
         {
             let mut s = state.lock().unwrap();
-            record_latency_timeout(&mut s, "p1", 0, 300000).unwrap();
+            record_latency_timeout(&mut s, "p1", 0, 60000).unwrap();
             let entry = s.entries.get("p1:0").unwrap();
             assert_eq!(entry.cooldown_reason, Some(CooldownReason::LatencyTimeout));
         }

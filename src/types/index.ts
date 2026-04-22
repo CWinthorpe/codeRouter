@@ -90,6 +90,8 @@ export interface FailoverConfig {
   latencyTimeoutCooldownMs: number;
   /** Cooldown period in milliseconds after consecutive errors triggers failover. */
   consecutiveErrorCooldownMs: number;
+  /** Maximum total wall-clock duration in milliseconds for a streaming response. */
+  maxResponseDurationMs: number;
 }
 
 /** A routing group that maps an alias to an ordered list of provider entries with failover rules. */

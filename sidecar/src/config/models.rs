@@ -158,10 +158,10 @@ pub struct FailoverConfig {
     /// Fail over when a request exceeds the latency timeout. Defaults to `true`.
     #[serde(default = "default_true", rename = "onLatencyTimeout")]
     pub on_latency_timeout: bool,
-    /// Milliseconds after which a request is considered timed out for failover purposes. Defaults to 30 000 (30 s).
+    /// Milliseconds after which a request is considered timed out for failover purposes. Defaults to 90 000 (90 s).
     #[serde(default = "default_latency_timeout_ms", rename = "latencyTimeoutMs")]
     pub latency_timeout_ms: u64,
-    /// Cooldown in milliseconds before a latency-timed-out entry is retried. Defaults to 300 000 (5 min).
+    /// Cooldown in milliseconds before a latency-timed-out entry is retried. Defaults to 60 000 (60 s).
     #[serde(
         default = "default_latency_timeout_cooldown_ms",
         rename = "latencyTimeoutCooldownMs"
@@ -173,6 +173,12 @@ pub struct FailoverConfig {
         rename = "consecutiveErrorCooldownMs"
     )]
     pub consecutive_error_cooldown_ms: u64,
+    /// Maximum total wall-clock duration (ms) for a streaming response.
+    /// If the response stream exceeds this duration from first byte received,
+    /// the stream is terminated and failover is triggered.
+    /// Defaults to 1_200_000 (20 minutes).
+    #[serde(default = "default_max_response_duration_ms", rename = "maxResponseDurationMs")]
+    pub max_response_duration_ms: u64,
 }
 
 fn default_error_threshold() -> u32 {
@@ -180,15 +186,19 @@ fn default_error_threshold() -> u32 {
 }
 
 fn default_latency_timeout_ms() -> u64 {
-    30000
+    90000
 }
 
 fn default_latency_timeout_cooldown_ms() -> u64 {
-    300000
+    60000
 }
 
 fn default_consecutive_error_cooldown_ms() -> u64 {
     600000
+}
+
+fn default_max_response_duration_ms() -> u64 {
+    1_200_000
 }
 
 /// A named routing group that maps an alias to an ordered list of

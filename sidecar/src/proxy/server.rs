@@ -467,7 +467,7 @@ async fn route_request(
         };
 
         let result = match upstream::send_with_timeout(req, timeout_ms, group.failover_config.on_latency_timeout).await {
-            Ok(resp) => process_response(resp, stream, &group.alias, is_anthropic, timeout_ms).await,
+            Ok(resp) => process_response(resp, stream, &group.alias, is_anthropic, timeout_ms, group.failover_config.max_response_duration_ms).await,
             Err(UpstreamError::Timeout) => {
                 eprintln!("request timed out for provider {}", provider.id);
                 {
@@ -746,6 +746,7 @@ async fn process_response(
     group_alias: &str,
     is_anthropic: bool,
     _latency_timeout_ms: u64,
+    max_response_duration_ms: u64,
 ) -> Result<StreamProcessResult, RequestError> {
     let status = resp.status();
 
@@ -782,6 +783,8 @@ async fn process_response(
                 }),
                 STREAM_INTER_CHUNK_TIMEOUT_MS,
             );
+
+            let raw_stream = TotalTimeoutStream::new(raw_stream, max_response_duration_ms);
 
             if is_anthropic {
                 let (body, token_counts) = translator::translate_anthropic_stream(raw_stream, group_alias.to_string(), token_counts);
@@ -941,6 +944,54 @@ where
                     Poll::Ready(Some(Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "streaming response timed out (inter-chunk gap exceeded)",
+                    ))))
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
+}
+
+struct TotalTimeoutStream<S> {
+    inner: S,
+    deadline: Instant,
+}
+
+impl<S> TotalTimeoutStream<S> {
+    fn new(inner: S, timeout_ms: u64) -> Self {
+        Self {
+            inner,
+            deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
+        }
+    }
+}
+
+impl<S> Stream for TotalTimeoutStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(item))) => {
+                if Instant::now() >= self.deadline {
+                    Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "streaming response timed out (total duration exceeded)",
+                    ))))
+                } else {
+                    Poll::Ready(Some(Ok(item)))
+                }
+            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Some(Err(e))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => {
+                if Instant::now() >= self.deadline {
+                    Poll::Ready(Some(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "streaming response timed out (total duration exceeded)",
                     ))))
                 } else {
                     Poll::Pending
@@ -1348,6 +1399,70 @@ mod tests {
         while let Some(_) = metrics_stream.next().await {}
 
         assert_eq!(*called.lock().unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_total_timeout_stream_yields_chunks_within_deadline() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("chunk1")),
+            Ok(Bytes::from("chunk2")),
+            Ok(Bytes::from("chunk3")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let mut total_stream = TotalTimeoutStream::new(stream, 5000);
+
+        let mut results = Vec::new();
+        while let Some(item) = total_stream.next().await {
+            results.push(item);
+        }
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.is_ok()));
+    }
+
+    #[tokio::test]
+    async fn test_total_timeout_stream_yields_error_after_deadline() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("chunk1")),
+            Ok(Bytes::from("chunk2")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let mut total_stream = TotalTimeoutStream::new(stream, 50);
+
+        let r1: Result<Bytes, std::io::Error> = total_stream.next().await.unwrap();
+        assert_eq!(r1.unwrap(), Bytes::from("chunk1"));
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let r2: Result<Bytes, std::io::Error> = total_stream.next().await.unwrap();
+        assert!(r2.is_err());
+        assert_eq!(r2.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn test_total_timeout_stream_forwards_inner_errors() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from("chunk1")),
+            Err(std::io::Error::new(std::io::ErrorKind::Other, "inner error")),
+        ];
+        let stream = futures::stream::iter(chunks);
+        let mut total_stream = TotalTimeoutStream::new(stream, 5000);
+
+        let r1 = total_stream.next().await.unwrap().unwrap();
+        assert_eq!(r1, Bytes::from("chunk1"));
+
+        let r2 = total_stream.next().await.unwrap();
+        assert!(r2.is_err());
+        assert_eq!(r2.unwrap_err().kind(), std::io::ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn test_total_timeout_stream_forwards_end_of_stream() {
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![];
+        let stream = futures::stream::iter(chunks);
+        let mut total_stream = TotalTimeoutStream::new(stream, 5000);
+
+        let result = total_stream.next().await;
+        assert!(result.is_none());
     }
 
     #[tokio::test]
