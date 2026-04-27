@@ -224,6 +224,50 @@ make tui-arm64
 
 Page-specific keys are shown in the help overlay (press `?`).
 
+## Release Pipeline
+
+A single command builds all 3 release artifacts and publishes a GitHub release:
+
+```bash
+make release        # full pipeline: build + publish
+```
+
+Or run the steps individually:
+
+```bash
+./build.sh --release   # build all artifacts into dist/
+./release.sh           # build + create GitHub release
+```
+
+### Artifacts
+
+| Artifact | Description |
+|---|---|
+| `CodeRouter_<VERSION>_amd64.AppImage` | GUI desktop app (signed) |
+| `CodeRouter_<VERSION>_amd64.AppImage.sig` | Update signature |
+| `coderouter-tui-<VERSION>-linux-x86_64.tar.gz` | TUI + proxy for x86_64 |
+| `coderouter-tui-<VERSION>-linux-aarch64.tar.gz` | TUI + proxy for ARM64 |
+| `latest.json` | Tauri updater manifest |
+
+### Installing the TUI tarball
+
+```bash
+tar xzf coderouter-tui-<VERSION>-linux-x86_64.tar.gz
+cd coderouter-tui-<VERSION>-linux-x86_64
+chmod +x coderouter-tui coderouter-proxy
+./coderouter-tui
+```
+
+### Versioning
+
+Version is read from `src-tauri/tauri.conf.json` (`"version"` field). Bump it there before running `make release`.
+
+### Previewing release notes
+
+```bash
+make release-notes
+```
+
 ## Development
 
 ```bash

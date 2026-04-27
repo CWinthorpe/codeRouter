@@ -1,4 +1,4 @@
-.PHONY: build dev test clean tui tui-dev tui-arm64
+.PHONY: build dev test clean tui tui-dev tui-arm64 release release-notes
 
 build:
 	@bash build.sh
@@ -27,3 +27,14 @@ tui-dev:
 tui-arm64:
 	cargo build --release -p coderouter-tui --target aarch64-unknown-linux-gnu
 	@echo "ARM64 TUI binary: target/aarch64-unknown-linux-gnu/release/coderouter-tui"
+
+release:
+	@bash release.sh
+
+release-notes:
+	@PREV_TAG=$$(git describe --tags --abbrev=0 2>/dev/null || echo ""); \
+	if [ -n "$$PREV_TAG" ]; then \
+		git log --oneline "$$PREV_TAG..HEAD" | sed 's/^/- /'; \
+	else \
+		echo "Initial release"; \
+	fi
