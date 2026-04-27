@@ -1,4 +1,4 @@
-.PHONY: build dev test clean
+.PHONY: build dev test clean tui tui-dev tui-arm64
 
 build:
 	@bash build.sh
@@ -16,3 +16,14 @@ clean:
 	rm -rf src-tauri/gen/
 	rm -rf src-tauri/target/
 	rm -rf target/
+
+tui:
+	cargo build --release -p coderouter-tui
+	@echo "TUI binary: target/release/coderouter-tui"
+
+tui-dev:
+	cargo run -p coderouter-tui
+
+tui-arm64:
+	cargo build --release -p coderouter-tui --target aarch64-unknown-linux-gnu
+	@echo "ARM64 TUI binary: target/aarch64-unknown-linux-gnu/release/coderouter-tui"

@@ -1,5 +1,5 @@
 [workspace]
-members = ["src-tauri", "sidecar"]
+members = ["src-tauri", "sidecar", "tui"]
 resolver = "2"
 
 [workspace.dependencies]

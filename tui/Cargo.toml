@@ -1,0 +1,22 @@
+[package]
+name = "coderouter-tui"
+version = "0.1.22"
+edition = "2021"
+
+[[bin]]
+name = "coderouter-tui"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+tui-textarea = "0.7"
+coderouter-proxy = { path = "../sidecar" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+anyhow = "1"
+libc = "0.2"
+reqwest = { workspace = true, features = ["blocking", "json"] }
+rusqlite = { workspace = true }

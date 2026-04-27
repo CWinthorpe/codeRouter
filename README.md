@@ -173,6 +173,57 @@ Config files live at `~/.config/coderouter/`:
 
 API keys are stored in the Linux Secret Service (libsecret), never in config files.
 
+## TUI (Terminal Interface)
+
+CodeRouter includes a terminal UI for managing providers, groups, usage, and settings from the command line. Built with [Ratatui](https://ratatui.rs/).
+
+### Building the TUI
+
+```bash
+# Build TUI binary only
+make tui
+
+# Or via build.sh
+./build.sh --tui-only
+
+# Build both GUI (AppImage) and TUI
+./build.sh --tui
+```
+
+### Running the TUI
+
+```bash
+# Dev mode (with debug output)
+make tui-dev
+
+# Or run the release binary directly
+./target/release/coderouter-tui
+```
+
+### ARM64 Cross-Compilation
+
+```bash
+# Install the target
+rustup target add aarch64-unknown-linux-gnu
+
+# Build for ARM64
+make tui-arm64
+
+# Note: When libsecret is unavailable on ARM64, file-based credential fallback is used.
+```
+
+### TUI Key Bindings
+
+| Key | Action |
+|---|---|
+| `1`-`6` | Switch tab |
+| `Tab` / `S-Tab` | Next / previous tab |
+| `?` | Show help overlay |
+| `q` | Quit |
+| `j`/`k` or `↑`/`↓` | Navigate / scroll |
+
+Page-specific keys are shown in the help overlay (press `?`).
+
 ## Development
 
 ```bash
@@ -184,6 +235,12 @@ npx tsc --noEmit
 
 # Build AppImage
 make build         # runs ./build.sh
+
+# Build TUI only
+make tui           # cargo build --release -p coderouter-tui
+
+# Run TUI in dev mode
+make tui-dev       # cargo run -p coderouter-tui
 
 # Dev mode with hot reload
 make dev           # npm run tauri dev
@@ -212,7 +269,14 @@ codeRouter/
 │   ├── lib/ipc.ts        # Typed IPC wrapper
 │   └── types/index.ts    # Shared TypeScript types
 ├── build.sh              # AppImage build script
-└── Makefile              # build / dev / test targets
+├── Makefile              # build / dev / test / tui targets
+└── tui/                  # Terminal UI (Ratatui)
+    └── src/
+        ├── main.rs       # Entry point, panic hook, sidecar lifecycle
+        ├── app.rs        # App state, key routing, tab management
+        ├── pages/        # Dashboard, Providers, Groups, OpenCode, Usage, Settings
+        ├── widgets/      # Tab bar, status bar, help overlay, toast
+        └── presets.rs    # Provider preset definitions
 ```
 
 ## License
