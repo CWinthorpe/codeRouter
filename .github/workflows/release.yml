@@ -22,7 +22,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libssl-dev pkg-config libfuse2 fuse
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libssl-dev pkg-config libfuse2 fuse librsvg2-dev
           sudo modprobe fuse 2>/dev/null || true
           # Pre-extract linuxdeploy to avoid FUSE issues
           mkdir -p /opt/linuxdeploy
@@ -95,7 +95,10 @@ jobs:
           Categories=Utility;
           EOF
           cp src-tauri/icons/256x256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/coderouter.png"
-          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --output appimage
+          # Create lib64 symlink (gtk plugin expects it)
+          ln -s lib "$APPDIR/usr/lib64"
+          # Run linuxdeploy with gtk plugin
+          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk --output appimage
           mkdir -p target/release/bundle/appimage
           mv CodeRouter*.AppImage "target/release/bundle/appimage/CodeRouter_${VERSION}_amd64.AppImage"
 
