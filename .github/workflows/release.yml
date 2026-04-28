@@ -11,7 +11,6 @@ permissions:
 env:
   TAURI_SIGNING_PRIVATE_KEY: ''
   APPIMAGE_EXTRACT_AND_RUN: '1'
-  TAURI_LINUXDEPLOY_ARGS: '--appimage-extract-and-run'
 
 jobs:
   linux-x86_64:
@@ -103,11 +102,13 @@ jobs:
           mv CodeRouter*.AppImage "target/release/bundle/appimage/CodeRouter_${VERSION}_amd64.AppImage"
 
       - name: Sign AppImage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
         run: |
           APPIMAGE=$(find target/release/bundle/appimage/ -name "*.AppImage" 2>/dev/null | head -1)
-          if [ -n "$APPIMAGE" ] && [ -f src-tauri/update.key ]; then
-            SIGN_PASS="${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
-            cargo tauri signer sign -f src-tauri/update.key -p "$SIGN_PASS" "$APPIMAGE"
+          if [ -n "$APPIMAGE" ]; then
+            cargo tauri signer sign "$APPIMAGE"
           fi
 
       - name: Upload AppImage
