@@ -30,10 +30,10 @@ jobs:
           chmod +x /tmp/ld.AppImage
           /tmp/ld.AppImage --appimage-extract
           mv squashfs-root/* /opt/linuxdeploy/
-          wget -q -O /opt/linuxdeploy/linuxdeploy-plugin-gtk.sh https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
-          chmod +x /opt/linuxdeploy/linuxdeploy-plugin-gtk.sh
-          wget -q -O /opt/linuxdeploy/linuxdeploy-plugin-gstreamer.sh https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh
-          chmod +x /opt/linuxdeploy/linuxdeploy-plugin-gstreamer.sh
+          wget -q -O /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gtk https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          chmod +x /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gtk
+          wget -q -O /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gstreamer https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh
+          chmod +x /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gstreamer
           echo "/opt/linuxdeploy/usr/bin" >> $GITHUB_PATH
           echo "TAURI_LINUXDEPLOY_PATH=/opt/linuxdeploy/usr/bin/linuxdeploy" >> $GITHUB_ENV
 
