@@ -95,7 +95,7 @@ jobs:
           Categories=Utility;
           EOF
           cp src-tauri/icons/256x256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/coderouter.png"
-          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk --output appimage
+          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --output appimage
           mkdir -p target/release/bundle/appimage
           mv CodeRouter*.AppImage "target/release/bundle/appimage/CodeRouter_${VERSION}_amd64.AppImage"
 
