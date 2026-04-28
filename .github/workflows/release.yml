@@ -101,6 +101,9 @@ jobs:
           mkdir -p target/release/bundle/appimage
           mv CodeRouter*.AppImage "target/release/bundle/appimage/CodeRouter_${VERSION}_amd64.AppImage"
 
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2"
+
       - name: Sign AppImage
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
