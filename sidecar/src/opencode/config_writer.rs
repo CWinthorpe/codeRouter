@@ -12,6 +12,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 /// Result type alias for config operations, boxing errors for IO and JSON failures.
@@ -631,8 +632,8 @@ fn write_config(config_path: &Path, config: &serde_json::Value) -> Result<()> {
     file.sync_all()?;
     file.unlock()?;
 
-    // Restrict permissions to owner-only because the config may contain API keys.
     let mut perms = file.metadata()?.permissions();
+    #[cfg(unix)]
     perms.set_mode(0o600);
     file.set_permissions(perms)?;
 
@@ -642,6 +643,7 @@ fn write_config(config_path: &Path, config: &serde_json::Value) -> Result<()> {
     // Also set permissions on the final path in case rename didn't preserve them.
     if let Ok(metadata) = fs::metadata(config_path) {
         let mut perms = metadata.permissions();
+        #[cfg(unix)]
         perms.set_mode(0o600);
         fs::set_permissions(config_path, perms)?;
     }

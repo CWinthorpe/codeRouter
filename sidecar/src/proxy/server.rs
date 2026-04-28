@@ -30,6 +30,7 @@ use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::net::TcpListener;
+#[cfg(unix)]
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, oneshot};
 
@@ -176,20 +177,27 @@ pub async fn start_server() -> anyhow::Result<()> {
 
     eprintln!("CodeRouter proxy listening on {addr}");
 
-    let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-    let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
-
     let shutdown_recorder = metrics_recorder.clone();
     let shutdown_metrics_handle = metrics_handle.clone();
     let shutdown_scheduler_handle = scheduler_handle.clone();
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        tokio::select! {
-            _ = sigterm.recv() => {
-                eprintln!("Received SIGTERM, shutting down gracefully");
+        #[cfg(unix)]
+        {
+            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    eprintln!("Received SIGTERM, shutting down gracefully");
+                }
+                _ = sigint.recv() => {
+                    eprintln!("Received SIGINT, shutting down gracefully");
+                }
             }
-            _ = sigint.recv() => {
-                eprintln!("Received SIGINT, shutting down gracefully");
-            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            eprintln!("Received shutdown signal, shutting down gracefully");
         }
         let _ = scheduler_shutdown.send(());
         let _ = refresh_shutdown.send(());

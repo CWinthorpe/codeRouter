@@ -13,6 +13,7 @@ use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use crate::config::models::{AppConfig, Group, Provider};
@@ -80,6 +81,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 
         // Owner-only permissions keep API keys private on multi-user systems
         let mut perms = file.metadata()?.permissions();
+        #[cfg(unix)]
         perms.set_mode(0o600);
         file.set_permissions(perms)?;
 
@@ -87,9 +89,9 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 
         fs::rename(&tmp_path, path)?;
 
-        // rename preserves permissions on most Unix systems, but be explicit
         if let Ok(metadata) = fs::metadata(path) {
             let mut perms = metadata.permissions();
+            #[cfg(unix)]
             perms.set_mode(0o600);
             fs::set_permissions(path, perms)?;
         }
@@ -215,8 +217,8 @@ pub fn update_providers_with_lock<F: FnOnce(&mut Vec<Provider>)>(f: F) -> Result
     file.flush()?;
     file.sync_all()?;
 
-    // Re-assert 0600 permissions after the in-place rewrite
     let mut perms = file.metadata()?.permissions();
+    #[cfg(unix)]
     perms.set_mode(0o600);
     file.set_permissions(perms)?;
 

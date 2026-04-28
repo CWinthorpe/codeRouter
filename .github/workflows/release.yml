@@ -21,6 +21,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libssl-dev pkg-config
+          wget -q -O linuxdeploy https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          chmod +x linuxdeploy
+          sudo mv linuxdeploy /usr/local/bin/linuxdeploy
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -171,8 +174,8 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Build sidecar binary
-        run: cargo build --release -p coderouter-proxy
+      - name: Build sidecar + TUI binaries
+        run: cargo build --release -p coderouter-proxy -p coderouter-tui
 
       - name: Copy sidecar to tauri binaries
         run: |
@@ -240,8 +243,8 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Build sidecar binary
-        run: cargo build --release -p coderouter-proxy
+      - name: Build sidecar + TUI binaries
+        run: cargo build --release -p coderouter-proxy -p coderouter-tui
 
       - name: Copy sidecar to tauri binaries (aarch64)
         run: |
@@ -309,8 +312,8 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
-      - name: Build sidecar binary
-        run: cargo build --release -p coderouter-proxy
+      - name: Build sidecar + TUI binaries
+        run: cargo build --release -p coderouter-proxy -p coderouter-tui
 
       - name: Copy sidecar to tauri binaries
         shell: pwsh
