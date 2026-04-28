@@ -1,8 +1,10 @@
 # CodeRouter
 
-A Linux desktop application that acts as a local OpenAI-compatible proxy router. Sits between AI coding tools (like [OpenCode](https://opencode.ai)) and multiple upstream LLM providers, providing intelligent failover, cost management, model grouping, and seamless OpenCode configuration integration.
+[![Release](https://github.com/CWinthorpe/codeRouter/actions/workflows/release.yml/badge.svg)](https://github.com/CWinthorpe/codeRouter/actions/workflows/release.yml)
 
-Built with **Tauri 2.x** (Rust sidecar + React/TypeScript frontend) and distributed as an **AppImage**.
+A desktop application that acts as a local OpenAI-compatible proxy router. Sits between AI coding tools (like [OpenCode](https://opencode.ai)) and multiple upstream LLM providers, providing intelligent failover, cost management, model grouping, and seamless OpenCode configuration integration.
+
+Built with **Tauri 2.x** (Rust sidecar + React/TypeScript frontend). Distributed as **AppImage** (Linux), **DMG** (macOS), and **EXE installer** (Windows).
 
 ## Screenshots
 
@@ -226,41 +228,56 @@ Page-specific keys are shown in the help overlay (press `?`).
 
 ## Release Pipeline
 
-A single command builds all 3 release artifacts and publishes a GitHub release:
+Pushing a version tag triggers the [GitHub Actions release workflow](https://github.com/CWinthorpe/codeRouter/actions/workflows/release.yml) which builds all platforms in parallel:
 
 ```bash
-make release        # full pipeline: build + publish
+# Bump version in src-tauri/tauri.conf.json, then:
+git tag v0.1.23
+git push origin v0.1.23
 ```
 
-Or run the steps individually:
+For local Linux builds you can still use:
 
 ```bash
-./build.sh --release   # build all artifacts into dist/
-./release.sh           # build + create GitHub release
+make release        # full pipeline: build + publish (Linux only)
+./build.sh --release   # build all Linux artifacts into dist/
 ```
 
 ### Artifacts
 
-| Artifact | Description |
-|---|---|
-| `CodeRouter_<VERSION>_amd64.AppImage` | GUI desktop app (signed) |
-| `CodeRouter_<VERSION>_amd64.AppImage.sig` | Update signature |
-| `coderouter-tui-<VERSION>-linux-x86_64.tar.gz` | TUI + proxy for x86_64 |
-| `coderouter-tui-<VERSION>-linux-aarch64.tar.gz` | TUI + proxy for ARM64 |
-| `latest.json` | Tauri updater manifest |
+| Artifact | Platform | Description |
+|---|---|---|
+| `CodeRouter_<VER>_amd64.AppImage` + `.sig` | Linux x86_64 | GUI desktop app (signed) |
+| `coderouter-tui-<VER>-linux-x86_64.tar.gz` | Linux x86_64 | TUI + proxy |
+| `coderouter-tui-<VER>-linux-aarch64.tar.gz` | Linux ARM64 | TUI + proxy |
+| `CodeRouter_<VER>_x64.dmg` | macOS Intel | GUI desktop app |
+| `coderouter-tui-<VER>-macos-x86_64.tar.gz` | macOS Intel | TUI + proxy |
+| `CodeRouter_<VER>_aarch64.dmg` | macOS Apple Silicon | GUI desktop app |
+| `coderouter-tui-<VER>-macos-aarch64.tar.gz` | macOS Apple Silicon | TUI + proxy |
+| `CodeRouter_<VER>_x64-setup.exe` | Windows x86_64 | GUI installer |
+| `coderouter-tui-<VER>-windows-x86_64.zip` | Windows x86_64 | TUI + proxy |
+| `latest.json` | All | Tauri updater manifest |
 
 ### Installing the TUI tarball
 
+**Linux / macOS:**
 ```bash
-tar xzf coderouter-tui-<VERSION>-linux-x86_64.tar.gz
-cd coderouter-tui-<VERSION>-linux-x86_64
+tar xzf coderouter-tui-<VERSION>-<platform>.tar.gz
+cd coderouter-tui-<VERSION>-<platform>
 chmod +x coderouter-tui coderouter-proxy
 ./coderouter-tui
 ```
 
+**Windows:**
+```powershell
+Expand-Archive coderouter-tui-<VERSION>-windows-x86_64.zip
+cd coderouter-tui-<VERSION>-windows-x86_64
+.\coderouter-tui.exe
+```
+
 ### Versioning
 
-Version is read from `src-tauri/tauri.conf.json` (`"version"` field). Bump it there before running `make release`.
+Version is read from `src-tauri/tauri.conf.json` (`"version"` field). Bump it there, then push a `v*` tag to trigger the release workflow.
 
 ### Previewing release notes
 

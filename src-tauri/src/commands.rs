@@ -1180,27 +1180,33 @@ pub struct AppState {
 /// Sends SIGTERM to the sidecar process and waits up to 5 seconds for it to
 /// exit. Falls back to `kill()` if the process hasn't exited by then.
 ///
+/// On non-Linux platforms, skips the graceful SIGTERM and goes straight to
+/// `child.kill()`.
+///
 /// # Arguments
 /// * `child` — Mutable reference to the sidecar [`Child`] process.
 pub fn kill_sidecar(child: &mut Child) {
-    let pid = child.id() as i32;
-    // Send SIGTERM for a graceful shutdown first
-    let _ = nix::sys::signal::kill(
-        nix::unistd::Pid::from_raw(pid),
-        nix::sys::signal::Signal::SIGTERM,
-    );
-    // Wait up to 5 seconds for the process to exit gracefully
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => return,
-            Ok(None) => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+    // Send SIGTERM for a graceful shutdown first (Linux only)
+    #[cfg(target_os = "linux")]
+    {
+        let pid = child.id() as i32;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+        // Wait up to 5 seconds for the process to exit gracefully
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(_) => break,
             }
-            Err(_) => break,
         }
     }
-    // Force kill if it didn't exit gracefully
+    // Force kill if it didn't exit gracefully (or on non-Linux platforms)
     let _ = child.kill();
     let _ = child.wait();
 }

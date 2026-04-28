@@ -6,20 +6,27 @@
 //! available (e.g. headless CI, SSH sessions) the module transparently falls
 //! back to `~/.config/coderouter/credentials.json` with 0600 permissions.
 //!
+//! On macOS and Windows the secret service is not available, so the file-based
+//! fallback is used exclusively.
+//!
 //! All public functions are async because the secret-service calls are async.
 
+#[cfg(target_os = "linux")]
 use secret_service::{EncryptionType, SecretService};
 use std::collections::HashMap;
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 /// Secret Service collection name used to group all coderouter credentials.
+#[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "coderouter";
 
 /// Attribute key under which the `provider_id` is stored in each secret item.
+#[cfg(target_os = "linux")]
 const ATTRIBUTE_KEY: &str = "provider_id";
 
 /// Returns the path to the fallback credentials file
@@ -58,15 +65,13 @@ fn write_fallback_file(map: &HashMap<String, String>) -> Result<()> {
     }
     let json = serde_json::to_string_pretty(map)?;
     fs::write(&path, &json)?;
-    // Restrict file to owner-only to protect API keys
+    // Restrict file to owner-only to protect API keys (Unix only)
+    #[cfg(unix)]
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
 
-/// Attempts to store `api_key` under `provider_id` in the Secret Service.
-///
-/// Connects to the D-Bus secret service, opens the default collection, and
-/// creates (or updates) an item keyed by the provider ID.
+#[cfg(target_os = "linux")]
 async fn try_store_secret_service(provider_id: &str, api_key: &str) -> Result<()> {
     let ss = SecretService::connect(EncryptionType::Dh).await?;
     let collection = ss.get_default_collection().await?;
@@ -86,10 +91,7 @@ async fn try_store_secret_service(provider_id: &str, api_key: &str) -> Result<()
     Ok(())
 }
 
-/// Attempts to retrieve the API key for `provider_id` from the Secret Service.
-///
-/// Returns the stored secret as a UTF-8 string, or an error if the item is
-/// not found or the secret service is unavailable.
+#[cfg(target_os = "linux")]
 async fn try_get_secret_service(provider_id: &str) -> Result<String> {
     let ss = SecretService::connect(EncryptionType::Dh).await?;
     let collection = ss.get_default_collection().await?;
@@ -105,9 +107,7 @@ async fn try_get_secret_service(provider_id: &str) -> Result<String> {
     String::from_utf8(secret).map_err(|e| e.into())
 }
 
-/// Attempts to delete the credential for `provider_id` from the Secret Service.
-///
-/// Silently succeeds if the item does not exist (deletion is idempotent).
+#[cfg(target_os = "linux")]
 async fn try_delete_secret_service(provider_id: &str) -> Result<()> {
     let ss = SecretService::connect(EncryptionType::Dh).await?;
     let collection = ss.get_default_collection().await?;
@@ -121,6 +121,21 @@ async fn try_delete_secret_service(provider_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn try_store_secret_service(_provider_id: &str, _api_key: &str) -> Result<()> {
+    Err("credential storage not available on this platform — using file-based fallback".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn try_get_secret_service(_provider_id: &str) -> Result<String> {
+    Err("credential storage not available on this platform — using file-based fallback".into())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn try_delete_secret_service(_provider_id: &str) -> Result<()> {
+    Err("credential storage not available on this platform — using file-based fallback".into())
 }
 
 /// Stores an API key for the given provider.
@@ -196,9 +211,12 @@ mod tests {
         map.remove(test_id);
         write_fallback_file(&map).unwrap();
 
-        let meta = fs::metadata(&path).unwrap();
-        let mode = meta.permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            let meta = fs::metadata(&path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
     }
 
     #[tokio::test]

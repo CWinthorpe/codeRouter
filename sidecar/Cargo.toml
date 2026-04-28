@@ -19,7 +19,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
-secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 fs2 = "0.4"
 dirs = "5"
 chrono = { workspace = true }
@@ -27,6 +26,9 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 async-stream = "0.3"
 serde_yaml = "0.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "4", features = ["rt-tokio-crypto-rust"] }
 
 [lib]
 name = "coderouter_proxy"
