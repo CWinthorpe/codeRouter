@@ -106,7 +106,8 @@ jobs:
         run: |
           APPIMAGE=$(find target/release/bundle/appimage/ -name "*.AppImage" 2>/dev/null | head -1)
           if [ -n "$APPIMAGE" ] && [ -f src-tauri/update.key ]; then
-            cargo tauri signer sign -f src-tauri/update.key -p "" "$APPIMAGE"
+            SIGN_PASS="${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}"
+            cargo tauri signer sign -f src-tauri/update.key -p "$SIGN_PASS" "$APPIMAGE"
           fi
 
       - name: Upload AppImage
