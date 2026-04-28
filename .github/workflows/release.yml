@@ -101,8 +101,20 @@ jobs:
           cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitDatabaseProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/" 2>/dev/null || true
           # Create lib64 symlink (gtk plugin expects it)
           ln -s lib "$APPDIR/usr/lib64"
-          # Run linuxdeploy with gtk plugin
-          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk --output appimage
+          # Run linuxdeploy WITHOUT --output appimage (just bundles into AppDir)
+          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk
+          # Create custom AppRun to fix WebKitGTK helper paths and sandbox
+          cat > "$APPDIR/AppRun" <<'APPRUN'
+          #!/bin/bash
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export WEBKIT_DISABLE_SANDBOX=1
+          export WEBKIT_EXEC_PATH="$HERE/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
+          export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          exec "$HERE/usr/bin/coderouter" "$@"
+          APPRUN
+          chmod +x "$APPDIR/AppRun"
+          # Package AppImage manually with custom AppRun
+          /opt/linuxdeploy/plugins/linuxdeploy-plugin-appimage/usr/bin/appimagetool "$APPDIR"
           mkdir -p target/release/bundle/appimage
           mv CodeRouter*.AppImage "target/release/bundle/appimage/CodeRouter_${VERSION}_amd64.AppImage"
 
