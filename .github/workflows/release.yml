@@ -10,6 +10,7 @@ permissions:
 
 env:
   TAURI_SIGNING_PRIVATE_KEY: ''
+  APPIMAGE_EXTRACT_AND_RUN: '1'
 
 jobs:
   linux-x86_64:
