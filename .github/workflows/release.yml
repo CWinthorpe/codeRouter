@@ -165,6 +165,7 @@ jobs:
 
   macos-x86_64:
     runs-on: macos-13
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
