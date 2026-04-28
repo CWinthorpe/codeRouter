@@ -76,7 +76,35 @@ jobs:
           chmod +x src-tauri/sidecar/coderouter-proxy-$TARGET
 
       - name: Build Tauri AppImage
-        run: npm run tauri build
+        run: |
+          # Build frontend
+          npm run build
+          # Build Tauri binary (embeds frontend)
+          cargo build --release -p coderouter
+          # Manually create AppImage using pre-extracted linuxdeploy
+          VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
+          APPDIR=AppDir
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
+          cp target/release/coderouter "$APPDIR/usr/bin/"
+          cat > "$APPDIR/usr/share/applications/coderouter.desktop" <<EOF
+          [Desktop Entry]
+          Name=CodeRouter
+          Exec=coderouter
+          Icon=coderouter
+          Type=Application
+          Categories=Utility;
+          EOF
+          cp src-tauri/icons/256x256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/coderouter.png"
+          ~/.local/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk --output appimage
+          mkdir -p target/release/bundle/appimage
+          mv CodeRouter*.AppImage "target/release/bundle/appimage/CodeRouter_${VERSION}_amd64.AppImage"
+
+      - name: Sign AppImage
+        run: |
+          APPIMAGE=$(find target/release/bundle/appimage/ -name "*.AppImage" 2>/dev/null | head -1)
+          if [ -n "$APPIMAGE" ] && [ -f src-tauri/update.key ]; then
+            cargo tauri signer sign -f src-tauri/update.key -p "" "$APPIMAGE"
+          fi
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
