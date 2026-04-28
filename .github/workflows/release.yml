@@ -57,7 +57,7 @@ jobs:
         run: |
           TARGET=$(rustc -vV | grep host | cut -d' ' -f2)
           mkdir -p src-tauri/sidecar
-          cp target/$TARGET/release/coderouter-proxy src-tauri/sidecar/coderouter-proxy-$TARGET
+          cp target/release/coderouter-proxy src-tauri/sidecar/coderouter-proxy-$TARGET
           chmod +x src-tauri/sidecar/coderouter-proxy-$TARGET
 
       - name: Build Tauri AppImage
@@ -178,7 +178,7 @@ jobs:
         run: |
           TARGET=$(rustc -vV | grep host | cut -d' ' -f2)
           mkdir -p src-tauri/sidecar
-          cp target/$TARGET/release/coderouter-proxy src-tauri/sidecar/coderouter-proxy-$TARGET
+          cp target/release/coderouter-proxy src-tauri/sidecar/coderouter-proxy-$TARGET
           chmod +x src-tauri/sidecar/coderouter-proxy-$TARGET
 
       - name: Build Tauri DMG
@@ -243,11 +243,11 @@ jobs:
       - name: Build sidecar binary
         run: cargo build --release -p coderouter-proxy
 
-      - name: Copy sidecar to tauri binaries
+      - name: Copy sidecar to tauri binaries (aarch64)
         run: |
           TARGET=$(rustc -vV | grep host | cut -d' ' -f2)
           mkdir -p src-tauri/sidecar
-          cp target/$TARGET/release/coderouter-proxy src-tauri/sidecar/coderouter-proxy-$TARGET
+          cp target/release/coderouter-proxy src-tauri/sidecar/coderouter-proxy-$TARGET
           chmod +x src-tauri/sidecar/coderouter-proxy-$TARGET
 
       - name: Build Tauri DMG
@@ -317,7 +317,7 @@ jobs:
         run: |
           $target = (rustc -vV | Select-String "host:" | ForEach-Object { $_ -replace 'host: ', '' }).Trim()
           New-Item -ItemType Directory -Force -Path src-tauri\sidecar
-          Copy-Item "target\$target\release\coderouter-proxy.exe" "src-tauri\sidecar\coderouter-proxy-$target.exe"
+          Copy-Item "target/release/coderouter-proxy.exe" "src-tauri\sidecar\coderouter-proxy-$target.exe"
 
       - name: Build Tauri installer
         run: npm run tauri build
