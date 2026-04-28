@@ -94,6 +94,11 @@ jobs:
           Categories=Utility;
           EOF
           cp src-tauri/icons/256x256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/coderouter.png"
+          # Bundle WebKitGTK helper binaries (linuxdeploy misses these)
+          mkdir -p "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
+          cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitNetworkProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/"
+          cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/"
+          cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitDatabaseProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/" 2>/dev/null || true
           # Create lib64 symlink (gtk plugin expects it)
           ln -s lib "$APPDIR/usr/lib64"
           # Run linuxdeploy with gtk plugin
