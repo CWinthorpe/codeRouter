@@ -94,25 +94,31 @@ jobs:
           Categories=Utility;
           EOF
           cp src-tauri/icons/256x256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/coderouter.png"
+          # Bundle dependencies into AppDir (no appimage output yet)
+          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk --output none
+          
           # Bundle WebKitGTK helper binaries (linuxdeploy misses these)
           mkdir -p "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
           cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitNetworkProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/"
           cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/"
           cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitDatabaseProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/" 2>/dev/null || true
+          
           # Create lib64 symlink (gtk plugin expects it)
           ln -s lib "$APPDIR/usr/lib64"
-          # Run linuxdeploy WITHOUT --output appimage (just bundles into AppDir)
-          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk
-          # Create custom AppRun to fix WebKitGTK helper paths and sandbox
+          
+          # Create custom AppRun that sets WebKit env vars and resolves mount point correctly
           cat > "$APPDIR/AppRun" <<'APPRUN'
           #!/bin/bash
           HERE="$(dirname "$(readlink -f "$0")")"
           export WEBKIT_DISABLE_SANDBOX=1
           export WEBKIT_EXEC_PATH="$HERE/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
           export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+          export GSETTINGS_SCHEMA_DIR="$HERE/usr/share/glib-2.0/schemas"
           exec "$HERE/usr/bin/coderouter" "$@"
           APPRUN
           chmod +x "$APPDIR/AppRun"
+          
           # Package AppImage manually with custom AppRun
           /opt/linuxdeploy/plugins/linuxdeploy-plugin-appimage/usr/bin/appimagetool "$APPDIR"
           mkdir -p target/release/bundle/appimage
