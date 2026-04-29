@@ -21,20 +21,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libssl-dev pkg-config libfuse2 fuse librsvg2-dev
-          sudo modprobe fuse 2>/dev/null || true
-          # Pre-extract linuxdeploy to avoid FUSE issues
-          mkdir -p /opt/linuxdeploy
-          wget -q -O /tmp/ld.AppImage https://github.com/tauri-apps/binary-releases/releases/download/linuxdeploy/linuxdeploy-x86_64.AppImage
-          chmod +x /tmp/ld.AppImage
-          /tmp/ld.AppImage --appimage-extract
-          mv squashfs-root/* /opt/linuxdeploy/
-          wget -q -O /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gtk https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
-          chmod +x /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gtk
-          wget -q -O /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gstreamer https://raw.githubusercontent.com/tauri-apps/linuxdeploy-plugin-gstreamer/master/linuxdeploy-plugin-gstreamer.sh
-          chmod +x /opt/linuxdeploy/usr/bin/linuxdeploy-plugin-gstreamer
-          echo "/opt/linuxdeploy/usr/bin" >> $GITHUB_PATH
-          echo "TAURI_LINUXDEPLOY_PATH=/opt/linuxdeploy/usr/bin/linuxdeploy" >> $GITHUB_ENV
+          sudo apt-get install -y libssl-dev pkg-config
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -49,100 +36,19 @@ jobs:
           key: linux-x86_64-rust-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: linux-x86_64-rust-
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      - name: Build TUI + proxy (x86_64)
+        run: cargo build --release -p coderouter-tui -p coderouter-proxy
 
-      - name: Cache npm dependencies
-        uses: actions/cache@v4
-        with:
-          path: node_modules
-          key: linux-x86_64-npm-${{ hashFiles('package-lock.json') }}
-          restore-keys: linux-x86_64-npm-
-
-      - name: Install npm dependencies
-        run: npm ci
-
-      - name: Build sidecar binary
-        run: cargo build --release -p coderouter-proxy
-
-      - name: Copy sidecar to tauri binaries
+      - name: Package TUI tarball
         run: |
-          TARGET=$(rustc -vV | grep host | cut -d' ' -f2)
-          mkdir -p src-tauri/sidecar
-          cp target/release/coderouter-proxy src-tauri/sidecar/coderouter-proxy-$TARGET
-          chmod +x src-tauri/sidecar/coderouter-proxy-$TARGET
-
-      - name: Build Tauri AppImage
-        run: |
-          # Build frontend
-          npm run build
-          # Build Tauri binary (embeds frontend)
-          cargo build --release -p coderouter
-          # Manually create AppImage using pre-extracted linuxdeploy
           VERSION=$(grep '"version"' src-tauri/tauri.conf.json | head -1 | sed 's/.*: *"\([^"]*\)".*/\1/')
-          APPDIR=AppDir
-          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/256x256/apps"
-          cp target/release/coderouter "$APPDIR/usr/bin/"
-          cat > "$APPDIR/usr/share/applications/coderouter.desktop" <<EOF
-          [Desktop Entry]
-          Name=CodeRouter
-          Exec=coderouter
-          Icon=coderouter
-          Type=Application
-          Categories=Utility;
-          EOF
-          cp src-tauri/icons/256x256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/coderouter.png"
-          # Bundle dependencies into AppDir
-          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk
-          
-          # Bundle WebKitGTK helper binaries (linuxdeploy misses these)
-          mkdir -p "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
-          cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitNetworkProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/"
-          cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitWebProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/"
-          cp /usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/WebKitDatabaseProcess "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1/" 2>/dev/null || true
-          
-          # Create lib64 symlink (gtk plugin expects it)
-          ln -s lib "$APPDIR/usr/lib64"
-          
-          # Create custom AppRun using $APPDIR (set automatically by AppImage runtime)
-          cat > "$APPDIR/AppRun" <<'APPRUN'
-          #!/bin/bash
-          export WEBKIT_DISABLE_SANDBOX=1
-          export WEBKIT_EXEC_PATH="$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
-          export LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-          export XDG_DATA_DIRS="$APPDIR/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-          export GSETTINGS_SCHEMA_DIR="$APPDIR/usr/share/glib-2.0/schemas"
-          exec "$APPDIR/usr/bin/coderouter" "$@"
-          APPRUN
-          chmod +x "$APPDIR/AppRun"
-          
-          # Package AppImage manually with custom AppRun
-          /opt/linuxdeploy/plugins/linuxdeploy-plugin-appimage/usr/bin/appimagetool "$APPDIR"
-          mkdir -p target/release/bundle/appimage
-          mv CodeRouter*.AppImage "target/release/bundle/appimage/CodeRouter_${VERSION}_amd64.AppImage"
-
-      - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2"
-
-      - name: Sign AppImage
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-        run: |
-          APPIMAGE=$(find target/release/bundle/appimage/ -name "*.AppImage" 2>/dev/null | head -1)
-          if [ -n "$APPIMAGE" ]; then
-            cargo tauri signer sign "$APPIMAGE"
-          fi
-
-      - name: Upload AppImage
-        uses: actions/upload-artifact@v4
-        with:
-          name: linux-x86_64-appimage
-          path: |
-            target/release/bundle/appimage/*.AppImage
-            target/release/bundle/appimage/*.AppImage.sig
+          STAGE=dist/.stage-x86
+          STAGEDIR=$STAGE/coderouter-tui-$VERSION-linux-x86_64
+          mkdir -p "$STAGEDIR"
+          cp target/release/coderouter-tui "$STAGEDIR/"
+          cp target/release/coderouter-proxy "$STAGEDIR/"
+          chmod +x "$STAGEDIR/coderouter-tui" "$STAGEDIR/coderouter-proxy"
+          (cd "$STAGE" && tar czf "$GITHUB_WORKSPACE/dist/coderouter-tui-$VERSION-linux-x86_64.tar.gz" "coderouter-tui-$VERSION-linux-x86_64")
 
       - name: Upload TUI tarball
         uses: actions/upload-artifact@v4
