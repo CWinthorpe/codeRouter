@@ -94,8 +94,8 @@ jobs:
           Categories=Utility;
           EOF
           cp src-tauri/icons/256x256.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/coderouter.png"
-          # Bundle dependencies into AppDir (skip appimage generation for now)
-          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk --output dir
+          # Bundle dependencies into AppDir
+          /opt/linuxdeploy/usr/bin/linuxdeploy --appdir "$APPDIR" --desktop-file "$APPDIR/usr/share/applications/coderouter.desktop" --plugin gtk
           
           # Bundle WebKitGTK helper binaries (linuxdeploy misses these)
           mkdir -p "$APPDIR/usr/lib/x86_64-linux-gnu/webkit2gtk-4.1"
