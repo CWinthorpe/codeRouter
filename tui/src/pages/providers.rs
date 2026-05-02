@@ -74,16 +74,6 @@ impl ProviderFormState {
         }
     }
 
-    fn next_field(&mut self, include_presets: bool) {
-        let min = if include_presets { 0 } else { 0 };
-        let max = 3;
-        self.focused = if self.focused >= max { min } else { self.focused + 1 };
-    }
-
-    fn prev_field(&mut self, _include_presets: bool) {
-        self.focused = if self.focused == 0 { 3 } else { self.focused - 1 };
-    }
-
     fn get_value(textarea: &TextArea<'_>) -> String {
         textarea.lines().iter().map(|l: &String| l.as_str()).collect::<Vec<_>>().join("").trim().to_string()
     }
@@ -112,6 +102,80 @@ impl ProviderFormState {
     }
 }
 
+#[derive(Clone)]
+struct OverrideFormState {
+    model_id: String,
+    context_window: String,
+    max_output: String,
+    input_cost: String,
+    output_cost: String,
+    protocol: String,
+    focused: usize,
+}
+
+impl OverrideFormState {
+    fn new() -> Self {
+        Self {
+            model_id: String::new(),
+            context_window: String::new(),
+            max_output: String::new(),
+            input_cost: String::new(),
+            output_cost: String::new(),
+            protocol: String::new(),
+            focused: 0,
+        }
+    }
+
+    fn active_field(&mut self) -> &mut String {
+        match self.focused {
+            0 => &mut self.model_id,
+            1 => &mut self.context_window,
+            2 => &mut self.max_output,
+            3 => &mut self.input_cost,
+            4 => &mut self.output_cost,
+            _ => &mut self.protocol,
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.focused = (self.focused + 1) % 6;
+    }
+
+    fn prev_field(&mut self) {
+        self.focused = if self.focused == 0 { 5 } else { self.focused - 1 };
+    }
+
+    fn to_provider_model(&self) -> Option<ProviderModel> {
+        let id = self.model_id.trim().to_string();
+        if id.is_empty() {
+            return None;
+        }
+        Some(ProviderModel {
+            id,
+            context_window: self.context_window.trim().parse().ok(),
+            max_output_tokens: self.max_output.trim().parse().ok(),
+            input_cost_per_1m: self.input_cost.trim().parse().ok(),
+            output_cost_per_1m: self.output_cost.trim().parse().ok(),
+            last_refreshed: None,
+            protocol: if self.protocol.trim().is_empty() {
+                None
+            } else {
+                Some(self.protocol.trim().to_string())
+            },
+        })
+    }
+
+    fn clear(&mut self) {
+        self.model_id.clear();
+        self.context_window.clear();
+        self.max_output.clear();
+        self.input_cost.clear();
+        self.output_cost.clear();
+        self.protocol.clear();
+        self.focused = 0;
+    }
+}
+
 fn make_textarea(initial: &str) -> TextArea<'static> {
     let mut ta = TextArea::new(vec![initial.to_string()]);
     ta.set_style(Style::default().fg(Color::White));
@@ -128,6 +192,12 @@ struct ProviderListState {
     detail_scroll: usize,
     preset_active: bool,
     preset_index: usize,
+    model_overrides: Vec<ProviderModel>,
+    show_overrides: bool,
+    override_selected: usize,
+    adding_override: bool,
+    override_focused: bool,
+    override_form: OverrideFormState,
 }
 
 static STATE: OnceLock<Mutex<Option<ProviderListState>>> = OnceLock::new();
@@ -229,6 +299,12 @@ impl ProviderListState {
             detail_scroll: 0,
             preset_active: false,
             preset_index: 0,
+            model_overrides: Vec::new(),
+            show_overrides: false,
+            override_selected: 0,
+            adding_override: false,
+            override_focused: false,
+            override_form: OverrideFormState::new(),
         }
     }
 
@@ -651,7 +727,17 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, state: &mut ProviderListSt
     let presets = presets::provider_presets();
 
     let form_width = 64.min(area.width);
-    let form_height = if is_add { 22.min(area.height) } else { 16.min(area.height) };
+    let form_height = if is_add {
+        if state.show_overrides {
+            34.min(area.height)
+        } else {
+            23.min(area.height)
+        }
+    } else if state.show_overrides {
+        28.min(area.height)
+    } else {
+        17.min(area.height)
+    };
     let x = (area.width.saturating_sub(form_width)) / 2;
     let y = (area.height.saturating_sub(form_height)) / 2;
     let popup_area = Rect::new(x, y, form_width, form_height);
@@ -674,20 +760,30 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, state: &mut ProviderListSt
     frame.render_widget(block, popup_area);
 
     if is_add {
-        let preset_chunks = Layout::default()
+        let mut constraints: Vec<Constraint> = vec![
+            Constraint::Length(3),
+            Constraint::Length(1),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ];
+        if state.show_overrides {
+            constraints.push(Constraint::Min(0));
+            constraints.push(Constraint::Length(1));
+        } else {
+            constraints.push(Constraint::Min(1));
+        }
+
+        let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Length(1),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(1),
-            ])
+            .constraints(constraints)
             .split(inner);
 
-        render_presets_row(frame, preset_chunks[0], state, &presets);
+        let mut ci = 0;
+        render_presets_row(frame, chunks[ci], state, &presets);
+        ci += 1;
 
         let hint_desc = if state.preset_active && state.preset_index > 0 {
             if let Some(p) = presets.get(state.preset_index - 1) {
@@ -704,44 +800,79 @@ fn render_form_overlay(frame: &mut Frame, area: Rect, state: &mut ProviderListSt
             hint_desc,
             Style::default().fg(Color::DarkGray),
         ));
-        frame.render_widget(desc_p, preset_chunks[1]);
+        frame.render_widget(desc_p, chunks[ci]);
+        ci += 1;
 
-        update_textarea_block_styles(&mut state.form, state.preset_active);
+        update_textarea_block_styles(&mut state.form, state.preset_active, state.override_focused);
 
-        frame.render_widget(&state.form.name, preset_chunks[2]);
-        frame.render_widget(&state.form.base_url, preset_chunks[3]);
-        frame.render_widget(&state.form.protocol, preset_chunks[4]);
-        frame.render_widget(&state.form.api_key, preset_chunks[5]);
+        frame.render_widget(&state.form.name, chunks[ci]);
+        ci += 1;
+        frame.render_widget(&state.form.base_url, chunks[ci]);
+        ci += 1;
+        frame.render_widget(&state.form.protocol, chunks[ci]);
+        ci += 1;
+        frame.render_widget(&state.form.api_key, chunks[ci]);
+        ci += 1;
+
+        render_overrides_header(frame, chunks[ci], state);
+        ci += 1;
+
+        if state.show_overrides {
+            render_overrides_content(frame, chunks[ci], state);
+            ci += 1;
+        }
 
         let hint = Paragraph::new(Span::styled(
             " Tab:Next  Enter:Save  Esc:Cancel ",
             Style::default().fg(Color::DarkGray),
         ))
         .alignment(Alignment::Center);
-        frame.render_widget(hint, preset_chunks[6]);
+        frame.render_widget(hint, chunks[ci]);
     } else {
+        let mut constraints: Vec<Constraint> = vec![
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(3),
+            Constraint::Length(1),
+        ];
+        if state.show_overrides {
+            constraints.push(Constraint::Min(0));
+            constraints.push(Constraint::Length(1));
+        } else {
+            constraints.push(Constraint::Min(1));
+        }
+
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(1),
-            ])
+            .constraints(constraints)
             .split(inner);
 
-        update_textarea_block_styles(&mut state.form, false);
+        let mut ci = 0;
 
-        frame.render_widget(&state.form.name, chunks[0]);
-        frame.render_widget(&state.form.base_url, chunks[1]);
-        frame.render_widget(&state.form.protocol, chunks[2]);
-        frame.render_widget(&state.form.api_key, chunks[3]);
+        update_textarea_block_styles(&mut state.form, false, state.override_focused);
+
+        frame.render_widget(&state.form.name, chunks[ci]);
+        ci += 1;
+        frame.render_widget(&state.form.base_url, chunks[ci]);
+        ci += 1;
+        frame.render_widget(&state.form.protocol, chunks[ci]);
+        ci += 1;
+        frame.render_widget(&state.form.api_key, chunks[ci]);
+        ci += 1;
+
+        render_overrides_header(frame, chunks[ci], state);
+        ci += 1;
+
+        if state.show_overrides {
+            render_overrides_content(frame, chunks[ci], state);
+            ci += 1;
+        }
 
         let hint = " Tab:Next  Enter:Save  Esc:Cancel  (leave key empty to keep)";
         let hint_p = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
             .alignment(Alignment::Center);
-        frame.render_widget(hint_p, chunks[4]);
+        frame.render_widget(hint_p, chunks[ci]);
     }
 }
 
@@ -776,8 +907,8 @@ fn render_presets_row(
             Style::default().fg(Color::DarkGray)
         };
         spans.push(Span::raw(" "));
-        let display_name = if p.name.len() > 14 {
-            format!("{}…", &p.name[..12])
+        let display_name = if p.name.len() > 22 {
+            format!("{}…", &p.name[..20])
         } else {
             p.name.to_string()
         };
@@ -819,7 +950,116 @@ fn render_presets_row(
     frame.render_widget(Paragraph::new(Line::from(indicator_span)), indicator_area);
 }
 
-fn update_textarea_block_styles(form: &mut ProviderFormState, preset_active: bool) {
+fn render_overrides_header(frame: &mut Frame, area: Rect, state: &ProviderListState) {
+    let count = state.model_overrides.len();
+    let focused = state.override_focused;
+    let header_text = if state.show_overrides {
+        format!(" Model Overrides: {} items  Enter:collapse ", count)
+    } else {
+        format!(" Model Overrides: {} items  Enter:expand ", count)
+    };
+    let style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(Paragraph::new(Span::styled(header_text, style)), area);
+}
+
+fn render_overrides_content(frame: &mut Frame, area: Rect, state: &mut ProviderListState) {
+    let mut lines: Vec<Line> = Vec::new();
+    let inner_w = area.width.saturating_sub(2) as usize;
+
+    lines.push(Line::from(Span::styled(
+        format!("┌{}┐", "─".repeat(inner_w)),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let available = area.height.saturating_sub(3) as usize;
+    let visible = state.model_overrides.len().min(available);
+
+    for (i, mo) in state.model_overrides.iter().enumerate().take(visible) {
+        let is_selected = i == state.override_selected && !state.adding_override;
+        let style = if is_selected {
+            Style::default().fg(Color::Black).bg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        let id_str = if mo.id.len() > 18 {
+            format!("{}…", &mo.id[..17])
+        } else {
+            mo.id.clone()
+        };
+        let ctx = format_tokens(mo.context_window);
+        let max_out = format_tokens(mo.max_output_tokens);
+        let inp = format_cost_per_m(mo.input_cost_per_1m);
+        let out = format_cost_per_m(mo.output_cost_per_1m);
+        let proto = mo.protocol.as_deref().unwrap_or("-");
+        let row = format!(
+            "│ {:<18} {:>6} {:>6} {:>7} {:>7} {:>6}│",
+            id_str, ctx, max_out, inp, out, proto
+        );
+        lines.push(Line::from(Span::styled(row, style)));
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("└{}┘", "─".repeat(inner_w)),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    if state.adding_override {
+        let form = &state.override_form;
+        let fields: [(&str, &str, usize); 6] = [
+            ("id", &form.model_id, 0),
+            ("ctx", &form.context_window, 1),
+            ("max", &form.max_output, 2),
+            ("$in", &form.input_cost, 3),
+            ("$out", &form.output_cost, 4),
+            ("proto", &form.protocol, 5),
+        ];
+        let mut spans: Vec<Span> = vec![Span::styled(
+            "Add: ",
+            Style::default().fg(Color::Cyan),
+        )];
+        for (label, val, idx) in &fields {
+            if *idx == form.focused {
+                spans.push(Span::styled(
+                    format!("{}=[{}]", label, val),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::REVERSED),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("{}=[{}]", label, val),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            spans.push(Span::raw(" "));
+        }
+        spans.push(Span::styled(
+            "Enter:Ok Esc:Cancel",
+            Style::default().fg(Color::DarkGray),
+        ));
+        lines.push(Line::from(spans));
+    } else if !state.model_overrides.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " j/k:nav  d:del  a:add  Enter:collapse",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            " a:add override  Enter:collapse",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn update_textarea_block_styles(form: &mut ProviderFormState, preset_active: bool, override_focused: bool) {
     let focused = form.focused;
     let pairs: [(&str, &mut TextArea<'static>); 4] = [
         ("Name", &mut form.name),
@@ -829,7 +1069,7 @@ fn update_textarea_block_styles(form: &mut ProviderFormState, preset_active: boo
     ];
 
     for (i, (label, ta)) in pairs.into_iter().enumerate() {
-        let style = if preset_active {
+        let style = if preset_active || override_focused {
             Style::default().fg(Color::DarkGray)
         } else if i == focused {
             Style::default().fg(Color::Cyan)
@@ -947,6 +1187,12 @@ fn handle_list_key(app: &mut App, key: KeyEvent, state: &mut ProviderListState) 
             state.mode = ProviderMode::AddForm;
             state.preset_active = false;
             state.preset_index = 0;
+            state.model_overrides = Vec::new();
+            state.show_overrides = false;
+            state.override_selected = 0;
+            state.override_focused = false;
+            state.adding_override = false;
+            state.override_form = OverrideFormState::new();
         }
         KeyCode::Char('e') => {
             if let Some(i) = state.table_state.selected() {
@@ -958,6 +1204,15 @@ fn handle_list_key(app: &mut App, key: KeyEvent, state: &mut ProviderListState) 
                         &p.protocol,
                         "",
                     );
+                    let overrides = load_full_provider(&p.id)
+                        .and_then(|p| p.model_overrides)
+                        .unwrap_or_default();
+                    state.model_overrides = overrides;
+                    state.show_overrides = !state.model_overrides.is_empty();
+                    state.override_selected = 0;
+                    state.override_focused = false;
+                    state.adding_override = false;
+                    state.override_form = OverrideFormState::new();
                     state.mode = ProviderMode::EditForm(i);
                 }
             }
@@ -1040,12 +1295,106 @@ fn handle_form_key(app: &mut App, key: KeyEvent, state: &mut ProviderListState) 
         }
     }
 
+    if state.override_focused {
+        match key.code {
+            KeyCode::Esc => {
+                if state.adding_override {
+                    state.adding_override = false;
+                    state.override_form.clear();
+                } else {
+                    state.override_focused = false;
+                }
+                return;
+            }
+            KeyCode::Tab => {
+                if state.adding_override {
+                    state.override_form.next_field();
+                } else {
+                    state.override_focused = false;
+                    state.form.focused = 0;
+                }
+                return;
+            }
+            KeyCode::BackTab => {
+                if state.adding_override {
+                    state.override_form.prev_field();
+                } else {
+                    state.override_focused = false;
+                    state.form.focused = 3;
+                }
+                return;
+            }
+            KeyCode::Enter => {
+                if state.adding_override {
+                    if let Some(mo) = state.override_form.to_provider_model() {
+                        state.model_overrides.push(mo);
+                        state.override_form.clear();
+                        state.override_selected =
+                            state.model_overrides.len().saturating_sub(1);
+                    }
+                    state.adding_override = false;
+                } else if state.show_overrides {
+                    state.show_overrides = false;
+                } else {
+                    state.show_overrides = true;
+                }
+                return;
+            }
+            KeyCode::Char('a') if !state.adding_override => {
+                state.adding_override = true;
+                state.override_form = OverrideFormState::new();
+                return;
+            }
+            KeyCode::Char('d') if !state.adding_override => {
+                if !state.model_overrides.is_empty() {
+                    let idx = state
+                        .override_selected
+                        .min(state.model_overrides.len() - 1);
+                    state.model_overrides.remove(idx);
+                    if state.override_selected >= state.model_overrides.len() {
+                        state.override_selected =
+                            state.model_overrides.len().saturating_sub(1);
+                    }
+                }
+                return;
+            }
+            KeyCode::Char('j') | KeyCode::Down if !state.adding_override => {
+                if !state.model_overrides.is_empty() {
+                    state.override_selected = (state.override_selected + 1)
+                        .min(state.model_overrides.len() - 1);
+                }
+                return;
+            }
+            KeyCode::Char('k') | KeyCode::Up if !state.adding_override => {
+                state.override_selected = state.override_selected.saturating_sub(1);
+                return;
+            }
+            KeyCode::Backspace if state.adding_override => {
+                state.override_form.active_field().pop();
+                return;
+            }
+            KeyCode::Char(c) if state.adding_override => {
+                state.override_form.active_field().push(c);
+                return;
+            }
+            _ => return,
+        }
+    }
+
     match key.code {
         KeyCode::Tab => {
-            state.form.next_field(false);
+            if state.form.focused >= 3 {
+                state.override_focused = true;
+            } else {
+                state.form.focused += 1;
+            }
         }
         KeyCode::BackTab => {
-            state.form.prev_field(false);
+            if state.form.focused == 0 {
+                state.override_focused = true;
+            } else {
+                state.form.focused -= 1;
+            }
         }
         KeyCode::Left if is_add => {
             state.preset_active = true;
@@ -1124,6 +1473,9 @@ fn apply_preset(state: &mut ProviderListState) {
 
     if idx == 0 {
         state.form = ProviderFormState::new_empty();
+        state.model_overrides = Vec::new();
+        state.show_overrides = false;
+        state.override_selected = 0;
         return;
     }
 
@@ -1135,6 +1487,9 @@ fn apply_preset(state: &mut ProviderListState) {
             "",
         );
         state.form.focused = 0;
+        state.model_overrides = preset.model_overrides.clone();
+        state.show_overrides = !preset.model_overrides.is_empty();
+        state.override_selected = 0;
     }
 }
 
@@ -1143,15 +1498,10 @@ fn submit_form(app: &mut App, state: &mut ProviderListState) {
     let result = form.validate();
     match result {
         Ok((name, base_url, protocol, api_key)) => {
-            let is_add = matches!(state.mode, ProviderMode::AddForm);
-            let preset_idx = if is_add { state.preset_index } else { 0 };
-            let model_overrides = if is_add && preset_idx > 0 {
-                let presets = presets::provider_presets();
-                presets.get(preset_idx - 1)
-                    .filter(|p| !p.model_overrides.is_empty())
-                    .map(|p| p.model_overrides.clone())
-            } else {
+            let model_overrides = if state.model_overrides.is_empty() {
                 None
+            } else {
+                Some(state.model_overrides.clone())
             };
 
             let outcome = match state.mode {
@@ -1162,7 +1512,15 @@ fn submit_form(app: &mut App, state: &mut ProviderListState) {
                     let has_key = !api_key.is_empty();
                     let rows = &state.providers;
                     if idx < rows.len() {
-                        do_edit_provider(idx, &name, &base_url, &protocol, if has_key { Some(&api_key) } else { None }, rows)
+                        do_edit_provider(
+                            idx,
+                            &name,
+                            &base_url,
+                            &protocol,
+                            if has_key { Some(&api_key) } else { None },
+                            rows,
+                            model_overrides,
+                        )
                     } else {
                         Err("Invalid selection".into())
                     }
@@ -1234,6 +1592,7 @@ fn do_edit_provider(
     protocol: &str,
     new_api_key: Option<&str>,
     rows: &[ProviderRow],
+    model_overrides: Option<Vec<ProviderModel>>,
 ) -> Result<(), String> {
     let row = rows.get(idx).ok_or("Invalid selection")?;
     let id = row.id.clone();
@@ -1243,6 +1602,7 @@ fn do_edit_provider(
             p.name = name.to_string();
             p.protocol = protocol.to_string();
             p.base_url = base_url.to_string();
+            p.model_overrides = model_overrides;
         }
     })
     .map_err(|e| e.to_string())?;
