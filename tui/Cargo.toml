@@ -1,6 +1,6 @@
 [package]
 name = "coderouter-tui"
-version = "0.1.22"
+version = "0.1.25"
 edition = "2021"
 
 [[bin]]
