@@ -517,6 +517,7 @@ pub async fn refresh_provider_models(provider_id: String) -> Result<Vec<Provider
         existing.models = models;
     }
     store::save_providers(&all_providers).map_err(|e| e.to_string())?;
+    notify_sidecar_config_reload().await;
 
     Ok(all_providers.iter().map(|p| p.into()).collect())
 }

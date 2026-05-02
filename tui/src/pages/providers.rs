@@ -219,6 +219,17 @@ fn blocking_delete_credential(provider_id: &str) -> Result<(), Box<dyn std::erro
     tokio_runtime().block_on(keychain::delete_credential(provider_id))
 }
 
+fn notify_sidecar_reload() {
+    let config = store::load_app_config().unwrap_or_default();
+    let url = format!("http://{}:{}/internal/config/reload", config.proxy_host, config.proxy_port);
+    if let Ok(client) = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        let _ = client.post(&url).send();
+    }
+}
+
 fn slugify(s: &str) -> String {
     s.trim()
         .to_lowercase()
@@ -1581,6 +1592,7 @@ fn do_add_provider(
     .map_err(|e| e.to_string())?;
 
     blocking_store_credential(&credential_key, api_key).map_err(|e| e.to_string())?;
+    notify_sidecar_reload();
 
     Ok(())
 }
@@ -1610,6 +1622,7 @@ fn do_edit_provider(
     if let Some(key) = new_api_key {
         blocking_store_credential(&id, key).map_err(|e| e.to_string())?;
     }
+    notify_sidecar_reload();
 
     Ok(())
 }
@@ -1624,6 +1637,7 @@ fn do_delete_provider(idx: usize, rows: &[ProviderRow]) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
 
     let _ = blocking_delete_credential(&id);
+    notify_sidecar_reload();
 
     Ok(())
 }
@@ -1715,6 +1729,7 @@ fn do_refresh_models(provider_id: &str, provider_name: &str) {
                 coderouter_proxy::models::refresher::refresh_provider_models(pid, &client).await
             }) {
                 Ok(models) => {
+                    notify_sidecar_reload();
                     (format!("Refreshed {} models for '{}'", models.len(), pname), true)
                 }
                 Err(e) => {
