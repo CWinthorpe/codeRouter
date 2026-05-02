@@ -21,6 +21,14 @@ use crate::credentials::keychain::get_credential;
 /// Result type alias for model refresh operations, boxing errors for flexibility across IO and HTTP failures.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
+fn normalize_pricing(value: f64) -> f64 {
+    if value < 0.001 {
+        value * 1_000_000.0
+    } else {
+        value
+    }
+}
+
 /// Deserializes a JSON value that may be a number, a quoted string, or null into `Option<f64>`.
 ///
 /// Some providers (e.g. OpenRouter) return pricing values as strings like `"0.000003"`
@@ -245,14 +253,14 @@ async fn fetch_openai_compatible_models(
         // per-million-token costs. model_spec pricing is already expressed in USD
         // per million tokens, so it is used as-is.
         let entry_input_cost = entry.input_cost_per_token.map(|c| c * 1_000_000.0)
-            .or_else(|| entry.pricing.as_ref().and_then(|p| p.prompt).map(|c| c * 1_000_000.0))
+            .or_else(|| entry.pricing.as_ref().and_then(|p| p.prompt).map(|c| normalize_pricing(c)))
             .or_else(|| entry.model_spec.as_ref()
                 .and_then(|ms| ms.pricing.as_ref())
                 .and_then(|p| p.input.as_ref())
                 .and_then(|i| i.usd));
 
         let entry_output_cost = entry.output_cost_per_token.map(|c| c * 1_000_000.0)
-            .or_else(|| entry.pricing.as_ref().and_then(|p| p.completion).map(|c| c * 1_000_000.0))
+            .or_else(|| entry.pricing.as_ref().and_then(|p| p.completion).map(|c| normalize_pricing(c)))
             .or_else(|| entry.model_spec.as_ref()
                 .and_then(|ms| ms.pricing.as_ref())
                 .and_then(|p| p.output.as_ref())
@@ -290,10 +298,10 @@ async fn fetch_openai_compatible_models(
                         // PricingInfo fields are per-token costs, so they need the 1M multiplier.
                         if let Some(pricing) = detail.pricing {
                             if let Some(prompt) = pricing.prompt {
-                                model.input_cost_per_1m = Some(prompt * 1_000_000.0);
+                                model.input_cost_per_1m = Some(normalize_pricing(prompt));
                             }
                             if let Some(completion) = pricing.completion {
-                                model.output_cost_per_1m = Some(completion * 1_000_000.0);
+                                model.output_cost_per_1m = Some(normalize_pricing(completion));
                             }
                         }
 
@@ -370,16 +378,15 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
         // OpenRouter-style pricing object with per-token prompt/completion costs.
         if let Some(pricing) = obj.get("pricing").and_then(|v| v.as_object()) {
             if let Some(prompt) = pricing.get("prompt") {
-                // Pricing values may be numbers or quoted strings.
                 let parsed = prompt.as_f64().or_else(|| prompt.as_str().and_then(|s| s.parse::<f64>().ok()));
                 if let Some(p) = parsed {
-                    model.input_cost_per_1m = Some(p * 1_000_000.0);
+                    model.input_cost_per_1m = Some(normalize_pricing(p));
                 }
             }
             if let Some(completion) = pricing.get("completion") {
                 let parsed = completion.as_f64().or_else(|| completion.as_str().and_then(|s| s.parse::<f64>().ok()));
                 if let Some(p) = parsed {
-                    model.output_cost_per_1m = Some(p * 1_000_000.0);
+                    model.output_cost_per_1m = Some(normalize_pricing(p));
                 }
             }
         }
@@ -1300,5 +1307,43 @@ mod tests {
         assert_eq!(pricing.prompt, Some(0.000005));
         assert_eq!(pricing.completion, Some(0.000015));
         assert!(gpt.top_provider.is_none());
+    }
+
+    #[test]
+    fn test_normalize_per_token_pricing() {
+        assert!((normalize_pricing(0.000003) - 3.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_normalize_per_million_pricing() {
+        assert!((normalize_pricing(0.40) - 0.40).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_normalize_boundary_pricing() {
+        assert!((normalize_pricing(0.001) - 0.001).abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_crofai_style_pricing_in_full_response() {
+        let json = serde_json::json!({
+            "data": [
+                {
+                    "id": "deepseek-v4-pro",
+                    "context_length": 1000000,
+                    "max_completion_tokens": 131072,
+                    "pricing": {
+                        "prompt": "0.40",
+                        "completion": "0.85"
+                    }
+                }
+            ]
+        });
+
+        let resp: OpenAiModelsResponse = serde_json::from_value(json).unwrap();
+        let entry = &resp.data[0];
+        let pricing = entry.pricing.as_ref().unwrap();
+        assert!((pricing.prompt.unwrap() - 0.40).abs() < 0.001);
+        assert!((pricing.completion.unwrap() - 0.85).abs() < 0.001);
     }
 }
