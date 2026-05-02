@@ -901,6 +901,22 @@ fn render_delete_overlay(frame: &mut Frame, area: Rect, state: &ProviderListStat
     }
 }
 
+pub fn is_form_active() -> bool {
+    if let Some(state_ref) = STATE.get() {
+        if let Ok(guard) = state_ref.lock() {
+            if let Some(state) = guard.as_ref() {
+                return matches!(
+                    state.mode,
+                    ProviderMode::AddForm
+                        | ProviderMode::EditForm(_)
+                        | ProviderMode::DeleteConfirm(_)
+                );
+            }
+        }
+    }
+    false
+}
+
 fn handle_list_key(app: &mut App, key: KeyEvent, state: &mut ProviderListState) {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => {

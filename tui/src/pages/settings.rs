@@ -313,6 +313,17 @@ fn render_confirm(frame: &mut Frame, area: Rect, msg: &str) {
     );
 }
 
+pub fn is_form_active() -> bool {
+    if let Some(state_ref) = STATE.get() {
+        if let Ok(guard) = state_ref.lock() {
+            if let Some(state) = guard.as_ref() {
+                return state.mode == SettingsMode::Editing;
+            }
+        }
+    }
+    false
+}
+
 fn handle_view(app: &mut App, key: KeyEvent, state: &mut SettingsState) {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => {
@@ -343,6 +354,19 @@ fn handle_view(app: &mut App, key: KeyEvent, state: &mut SettingsState) {
 }
 
 fn handle_editing(key: KeyEvent, state: &mut SettingsState) {
+    match key.code {
+        KeyCode::Tab => {
+            state.focused_field = (state.focused_field + 1) % 4;
+        }
+        KeyCode::BackTab => {
+            state.focused_field = if state.focused_field == 0 {
+                3
+            } else {
+                state.focused_field - 1
+            };
+        }
+        _ => {}
+    }
     match state.focused_field {
         0 | 2 => match key.code {
             KeyCode::Char(c) if c.is_ascii_digit() => {

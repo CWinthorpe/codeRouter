@@ -97,10 +97,16 @@ impl App {
             crossterm::event::KeyCode::Char('5') => self.active_tab = 4,
             crossterm::event::KeyCode::Char('6') => self.active_tab = 5,
             crossterm::event::KeyCode::Tab => {
-                self.active_tab = (self.active_tab + 1) % TAB_NAMES.len();
+                if pages::is_form_active(self) {
+                    pages::handle_key(self, key);
+                } else {
+                    self.active_tab = (self.active_tab + 1) % TAB_NAMES.len();
+                }
             }
             crossterm::event::KeyCode::BackTab => {
-                if self.active_tab == 0 {
+                if pages::is_form_active(self) {
+                    pages::handle_key(self, key);
+                } else if self.active_tab == 0 {
                     self.active_tab = TAB_NAMES.len() - 1;
                 } else {
                     self.active_tab -= 1;

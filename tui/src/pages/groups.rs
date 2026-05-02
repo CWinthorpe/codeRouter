@@ -1320,6 +1320,23 @@ fn render_failover_edit(frame: &mut Frame, area: Rect, state: &mut GroupsListSta
     frame.render_widget(hint, layout[9]);
 }
 
+pub fn is_form_active() -> bool {
+    if let Some(state_ref) = STATE.get() {
+        if let Ok(guard) = state_ref.lock() {
+            if let Some(state) = guard.as_ref() {
+                return matches!(
+                    state.mode,
+                    GroupsMode::AddGroupForm
+                        | GroupsMode::EditGroupForm(_)
+                        | GroupsMode::AddEntryForm(_)
+                        | GroupsMode::FailoverConfigEdit(_)
+                );
+            }
+        }
+    }
+    false
+}
+
 fn handle_list_key(_app: &mut App, key: KeyEvent, state: &mut GroupsListState) {
     match key.code {
         KeyCode::Char('j') | KeyCode::Down => {

@@ -1526,6 +1526,22 @@ fn render_agent_detail(frame: &mut Frame, area: Rect, state: &mut OpenCodeState)
     );
 }
 
+pub fn is_form_active() -> bool {
+    if let Some(state_ref) = STATE.get() {
+        if let Ok(guard) = state_ref.lock() {
+            if let Some(state) = guard.as_ref() {
+                return matches!(
+                    state.mode,
+                    OpenCodeMode::EditMapping(_)
+                        | OpenCodeMode::SetCustomPath
+                        | OpenCodeMode::AgentForm(_)
+                );
+            }
+        }
+    }
+    false
+}
+
 fn handle_list_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState) {
     match key.code {
         KeyCode::Tab => {

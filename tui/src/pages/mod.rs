@@ -32,3 +32,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         _ => {}
     }
 }
+
+pub fn is_form_active(app: &App) -> bool {
+    match app.active_tab {
+        1 => providers::is_form_active(),
+        2 => groups::is_form_active(),
+        3 => opencode::is_form_active(),
+        5 => settings::is_form_active(),
+        _ => false,
+    }
+}
