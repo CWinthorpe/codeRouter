@@ -98,6 +98,7 @@ function emptyAgent(): CustomAgent {
     hidden: undefined,
     color: undefined,
     topP: undefined,
+    reasoningEffort: undefined,
     permissions: undefined,
   };
 }
@@ -115,6 +116,7 @@ function agentFromTemplate(template: AgentTemplate, name: string): CustomAgent {
     hidden: template.agent.hidden,
     color: template.agent.color,
     topP: template.agent.topP,
+    reasoningEffort: template.agent.reasoningEffort,
     permissions: template.agent.permissions,
   };
 }
@@ -131,6 +133,7 @@ function generateMarkdownPreview(agent: CustomAgent): string {
   if (agent.hidden) frontmatter.hidden = true;
   if (agent.color) frontmatter.color = agent.color;
   if (agent.topP !== undefined) frontmatter.top_p = agent.topP;
+  if (agent.reasoningEffort) frontmatter.reasoningEffort = agent.reasoningEffort;
   if (agent.permissions) {
     const perm: Record<string, unknown> = {};
     if (agent.permissions.edit) perm.edit = agent.permissions.edit;
@@ -655,6 +658,24 @@ function CustomAgentForm({
                 placeholder="—"
                 className="w-16 rounded border border-zinc-600 bg-zinc-800 px-2 py-1 text-xs text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none"
               />
+            </div>
+
+            <div className="flex items-center gap-2">
+              <label htmlFor="agent-reasoning" className="text-xs text-zinc-400">Reasoning</label>
+              <Select value={agent.reasoningEffort ?? '__none__'} onValueChange={(v) => updateField('reasoningEffort', v === '__none__' ? undefined : v)}>
+                <SelectTrigger id="agent-reasoning" className="h-7 w-28 border-zinc-600 bg-zinc-800 px-2 py-1 text-xs text-zinc-100">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-zinc-800 border-zinc-700">
+                  <SelectItem value="__none__" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">— default —</SelectItem>
+                  <SelectItem value="none" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">None</SelectItem>
+                  <SelectItem value="low" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Low</SelectItem>
+                  <SelectItem value="medium" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Medium</SelectItem>
+                  <SelectItem value="high" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">High</SelectItem>
+                  <SelectItem value="xhigh" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Extra High</SelectItem>
+                  <SelectItem value="max" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Max</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
 
             <div className="flex items-center gap-2">

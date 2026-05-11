@@ -41,9 +41,19 @@ const AGENT_LABELS: Record<string, string> = {
 /** User-facing agent keys that should have dropdowns in the UI. */
 const AGENT_KEYS = ['build', 'plan', 'general', 'explore'] as const;
 
+const REASONING_OPTIONS = [
+  { value: '__none__', label: '— default —' },
+  { value: 'none', label: 'None' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra High' },
+  { value: 'max', label: 'Max' },
+] as const;
+
 /** Creates a blank agent mapping object with all fields set to null. */
 function emptyMapping(): OpenCodeAgentMapping {
-  return { build: null, plan: null, general: null, explore: null, compaction: null, title: null, summary: null, small_model: null };
+  return { build: null, plan: null, general: null, explore: null, compaction: null, title: null, summary: null, small_model: null, reasoning_efforts: undefined };
 }
 
 /**
@@ -114,6 +124,7 @@ export default function OpenCodeSetup() {
       title: mapping.title || null,
       summary: mapping.summary || null,
       small_model: mapping.small_model || null,
+      reasoning_efforts: mapping.reasoning_efforts,
     };
   }, [mapping]);
 
@@ -174,6 +185,7 @@ export default function OpenCodeSetup() {
           title: current.title ?? prev.title,
           summary: current.summary ?? prev.summary,
           small_model: current.small_model ?? prev.small_model,
+          reasoning_efforts: current.reasoning_efforts ?? prev.reasoning_efforts,
         }));
       } catch {
         // IPC may fail outside Tauri or config may not exist yet
@@ -205,6 +217,18 @@ export default function OpenCodeSetup() {
   /** Updates a single agent→group mapping key, converting empty strings to null. */
   const handleMappingChange = useCallback((key: keyof OpenCodeAgentMapping, value: string) => {
     setMapping((prev) => ({ ...prev, [key]: value || null }));
+  }, []);
+
+  const handleReasoningChange = useCallback((agentKey: string, value: string) => {
+    setMapping((prev) => {
+      const efforts = { ...(prev.reasoning_efforts ?? {}) };
+      if (value === '__none__') {
+        delete efforts[agentKey];
+      } else {
+        efforts[agentKey] = value;
+      }
+      return { ...prev, reasoning_efforts: Object.keys(efforts).length > 0 ? efforts : undefined };
+    });
   }, []);
 
   /** Persists the current agent mapping to the OpenCode config file via IPC. */
@@ -370,6 +394,18 @@ export default function OpenCodeSetup() {
                     {groupAliases.map((alias) => (
                       <SelectItem key={alias} value={alias} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
                         {alias}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <Select value={mapping.reasoning_efforts?.[key] ?? '__none__'} onValueChange={(v) => handleReasoningChange(key, v)}>
+                  <SelectTrigger className="w-36 border-zinc-700 bg-zinc-800 text-zinc-100">
+                    <SelectValue placeholder="Reasoning" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-zinc-800 border-zinc-700">
+                    {REASONING_OPTIONS.map((opt) => (
+                      <SelectItem key={opt.value} value={opt.value} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
+                        {opt.label}
                       </SelectItem>
                     ))}
                   </SelectContent>

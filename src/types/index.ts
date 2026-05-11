@@ -298,6 +298,8 @@ export interface CustomAgent {
   color?: string;
   /** Top P for response diversity (0.0–1.0). */
   topP?: number;
+  /** Reasoning effort for models that support it (none, low, medium, high, xhigh, max). */
+  reasoningEffort?: string;
   /** Tool access permissions. */
   permissions?: AgentPermissions;
   /** Additional provider-specific options passed through as-is. */
