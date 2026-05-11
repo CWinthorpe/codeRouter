@@ -741,7 +741,7 @@ impl From<OpenCodeAgentMapping> for AgentMapping {
             title: m.title,
             summary: m.summary,
             small_model: m.small_model,
-            reasoning_efforts: m.reasoning_efforts,
+            reasoning_efforts: m.reasoning_efforts.unwrap_or_default(),
         }
     }
 }
@@ -1487,6 +1487,8 @@ pub struct CustomAgentResponse {
     pub top_p: Option<f64>,
     #[serde(default, rename = "permissions", skip_serializing_if = "Option::is_none")]
     pub permission: Option<AgentPermissionsResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub additional: HashMap<String, serde_json::Value>,
 }
@@ -1506,6 +1508,7 @@ impl From<CustomAgent> for CustomAgentResponse {
             color: a.color,
             top_p: a.top_p,
             permission: a.permission.map(|p| p.into()),
+            reasoning_effort: a.reasoning_effort,
             additional: a.additional,
         }
     }
@@ -1526,6 +1529,7 @@ impl From<CustomAgentResponse> for CustomAgent {
             color: a.color,
             top_p: a.top_p,
             permission: a.permission.map(|p| p.into()),
+            reasoning_effort: a.reasoning_effort,
             additional: a.additional,
         }
     }
