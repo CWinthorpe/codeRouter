@@ -95,6 +95,8 @@ pub struct AgentFrontmatter {
     pub top_p: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission: Option<AgentPermissions>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "reasoningEffort")]
+    pub reasoning_effort: Option<String>,
     /// Additional provider-specific options passed through as-is.
     #[serde(flatten, default)]
     pub additional: HashMap<String, serde_json::Value>,
@@ -137,6 +139,8 @@ pub struct CustomAgent {
     /// Tool access permissions.
     #[serde(default)]
     pub permission: Option<AgentPermissions>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     /// Additional provider-specific options.
     #[serde(default)]
     pub additional: HashMap<String, serde_json::Value>,
@@ -174,6 +178,8 @@ pub struct TemplateAgent {
     pub model: Option<String>,
     #[serde(default)]
     pub disable: Option<bool>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub additional: HashMap<String, serde_json::Value>,
 }
@@ -553,6 +559,7 @@ pub fn parse_agent_file(path: &Path) -> Result<CustomAgent> {
         color: fm.color,
         top_p: fm.top_p,
         permission: fm.permission,
+        reasoning_effort: fm.reasoning_effort,
         additional: fm.additional,
     })
 }
@@ -582,6 +589,7 @@ fn write_agent_file(path: &Path, agent: &CustomAgent) -> Result<()> {
         color: agent.color.clone(),
         top_p: agent.top_p,
         permission: agent.permission.clone(),
+        reasoning_effort: agent.reasoning_effort.clone(),
         additional: agent.additional.clone(),
     };
 

@@ -104,6 +104,8 @@ export interface OpenCodeAgentMapping {
   summary: string | null;
   /** Alias for a cost-effective model used for lightweight tasks. */
   small_model: string | null;
+  /** Optional reasoning effort per agent role. */
+  reasoning_efforts?: Record<string, string>;
 }
 
 /** Get the filesystem path to the opencode configuration file that CodeRouter manages. */

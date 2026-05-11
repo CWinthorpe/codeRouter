@@ -16,6 +16,7 @@ use coderouter_proxy::opencode::custom_agents;
 struct AgentMappingRow {
     name: String,
     group: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -48,7 +49,8 @@ const AGENT_NAMES: &[&str] = &[
 
 const PERM_OPTIONS: &[&str] = &["none", "allow", "deny", "ask"];
 const MODE_OPTIONS: &[&str] = &["subagent", "all", "primary"];
-const FORM_FIELD_COUNT: usize = 14;
+const REASONING_EFFORT_OPTIONS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+const FORM_FIELD_COUNT: usize = 15;
 
 struct AgentFormState {
     original_name: Option<String>,
@@ -57,6 +59,7 @@ struct AgentFormState {
     prompt: TextArea<'static>,
     mode_idx: usize,
     group_idx: usize,
+    reasoning_effort_idx: usize,
     steps_buf: String,
     top_p_buf: String,
     color_buf: String,
@@ -137,9 +140,20 @@ fn load_mappings(config_path: &PathBuf) -> Vec<AgentMappingRow> {
                 "small_model" => mapping.small_model.clone(),
                 _ => None,
             };
+            let reasoning_effort = match *name {
+                "build" => mapping.reasoning_efforts.get("build").cloned(),
+                "plan" => mapping.reasoning_efforts.get("plan").cloned(),
+                "general" => mapping.reasoning_efforts.get("general").cloned(),
+                "explore" => mapping.reasoning_efforts.get("explore").cloned(),
+                "compaction" => mapping.reasoning_efforts.get("compaction").cloned(),
+                "title" => mapping.reasoning_efforts.get("title").cloned(),
+                "summary" => mapping.reasoning_efforts.get("summary").cloned(),
+                _ => None,
+            };
             AgentMappingRow {
                 name: name.to_string(),
                 group,
+                reasoning_effort,
             }
         })
         .collect()
@@ -217,6 +231,7 @@ impl AgentFormState {
             prompt: make_textarea(""),
             mode_idx: 0,
             group_idx: 0,
+            reasoning_effort_idx: 0,
             steps_buf: String::new(),
             top_p_buf: String::new(),
             color_buf: String::new(),
@@ -238,6 +253,7 @@ impl AgentFormState {
             prompt: make_textarea(&tmpl.agent.prompt),
             mode_idx: mode_to_idx(&tmpl.agent.mode),
             group_idx: 0,
+            reasoning_effort_idx: 0,
             steps_buf: tmpl.agent.steps.map(|s| s.to_string()).unwrap_or_default(),
             top_p_buf: tmpl.agent.top_p.map(|p| p.to_string()).unwrap_or_default(),
             color_buf: tmpl.agent.color.clone().unwrap_or_default(),
@@ -258,6 +274,11 @@ impl AgentFormState {
             .and_then(|m| available_groups.iter().position(|g| g == m))
             .map(|p| p + 1)
             .unwrap_or(0);
+        let reasoning_effort_idx = agent
+            .reasoning_effort
+            .as_ref()
+            .and_then(|re| REASONING_EFFORT_OPTIONS.iter().position(|&opt| opt == re))
+            .unwrap_or(0);
         Self {
             original_name: Some(agent.name.clone()),
             name: make_textarea(&agent.name),
@@ -265,6 +286,7 @@ impl AgentFormState {
             prompt: make_textarea(&agent.prompt),
             mode_idx: mode_to_idx(&agent.mode),
             group_idx,
+            reasoning_effort_idx,
             steps_buf: agent.steps.map(|s| s.to_string()).unwrap_or_default(),
             top_p_buf: agent.top_p.map(|p| p.to_string()).unwrap_or_default(),
             color_buf: agent.color.clone().unwrap_or_default(),
@@ -281,6 +303,11 @@ impl AgentFormState {
     fn to_agent(&self, available_groups: &[String]) -> custom_agents::CustomAgent {
         let model = if self.group_idx > 0 && self.group_idx <= available_groups.len() {
             Some(available_groups[self.group_idx - 1].clone())
+        } else {
+            None
+        };
+        let reasoning_effort = if self.reasoning_effort_idx > 0 {
+            Some(REASONING_EFFORT_OPTIONS[self.reasoning_effort_idx].to_string())
         } else {
             None
         };
@@ -328,6 +355,7 @@ impl AgentFormState {
             },
             top_p,
             permission,
+            reasoning_effort,
             ..Default::default()
         }
     }
@@ -357,6 +385,7 @@ impl OpenCodeState {
                     .map(|n| AgentMappingRow {
                         name: n.to_string(),
                         group: None,
+                        reasoning_effort: None,
                     })
                     .collect()
             });
@@ -411,6 +440,7 @@ impl OpenCodeState {
                     .map(|n| AgentMappingRow {
                         name: n.to_string(),
                         group: None,
+                        reasoning_effort: None,
                     })
                     .collect()
             });
@@ -624,7 +654,7 @@ fn render_provider_section(frame: &mut Frame, area: Rect, state: &OpenCodeState)
 }
 
 fn render_agent_table(frame: &mut Frame, area: Rect, state: &mut OpenCodeState) {
-    let header_cells = ["Agent", "Assigned Group"];
+    let header_cells = ["Agent", "Assigned Group", "Reasoning"];
     let header = Row::new(
         header_cells
             .iter()
@@ -648,9 +678,16 @@ fn render_agent_table(frame: &mut Frame, area: Rect, state: &mut OpenCodeState) 
             } else {
                 Style::default().fg(Color::DarkGray)
             };
+            let reasoning_display = m.reasoning_effort.as_deref().unwrap_or("—");
+            let reasoning_style = if m.reasoning_effort.is_some() {
+                Style::default().fg(Color::White)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
             Row::new(vec![
                 Cell::from(m.name.as_str()).style(Style::default().fg(Color::White)),
                 Cell::from(group_display).style(group_style),
+                Cell::from(reasoning_display).style(reasoning_style),
             ])
         })
         .collect();
@@ -668,7 +705,7 @@ fn render_agent_table(frame: &mut Frame, area: Rect, state: &mut OpenCodeState) 
         Color::DarkGray
     };
 
-    let table = Table::new(rows, [Constraint::Length(20), Constraint::Min(20)])
+    let table = Table::new(rows, [Constraint::Length(20), Constraint::Length(20), Constraint::Length(12)])
         .header(header)
         .block(
             Block::default()
@@ -1055,6 +1092,7 @@ fn render_agent_form_popup(frame: &mut Frame, area: Rect, state: &mut OpenCodeSt
             Constraint::Length(3),  // desc
             Constraint::Length(3),  // prompt
             Constraint::Length(1),  // mode+group
+            Constraint::Length(1),  // reasoning effort
             Constraint::Length(1),  // steps+topp
             Constraint::Length(1),  // color
             Constraint::Length(1),  // hidden+disabled
@@ -1135,12 +1173,26 @@ fn render_agent_form_popup(frame: &mut Frame, area: Rect, state: &mut OpenCodeSt
         chunks[3],
     );
 
-    let steps_style = if form.focused == 5 {
+    let re_val = REASONING_EFFORT_OPTIONS[form.reasoning_effort_idx];
+    let re_style = if form.focused == 5 {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let topp_style = if form.focused == 6 {
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Reasoning Effort: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} ◄►", re_val), re_style),
+        ])),
+        chunks[4],
+    );
+
+    let steps_style = if form.focused == 6 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let topp_style = if form.focused == 7 {
         Style::default().fg(Color::Cyan)
     } else {
         Style::default().fg(Color::DarkGray)
@@ -1166,7 +1218,109 @@ fn render_agent_form_popup(frame: &mut Frame, area: Rect, state: &mut OpenCodeSt
             Span::styled("Top P: ", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("[{}]", topp_display), topp_style),
         ])),
-        chunks[4],
+        chunks[5],
+    );
+
+    let color_style = if form.focused == 8 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let color_display = if form.color_buf.is_empty() {
+        "—".to_string()
+    } else {
+        form.color_buf.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Color: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("[{}]", color_display), color_style),
+        ])),
+        chunks[6],
+    );
+
+    let hidden_mark = if form.hidden { "[x]" } else { "[ ]" };
+    let disabled_mark = if form.disabled { "[x]" } else { "[ ]" };
+    let hidden_style = if form.focused == 9 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let disabled_style = if form.focused == 10 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(format!(" {} Hidden ", hidden_mark), hidden_style),
+            Span::raw("   "),
+            Span::styled(format!(" {} Disabled ", disabled_mark), disabled_style),
+        ])),
+        chunks[7],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            "── Permissions ──",
+            Style::default().fg(Color::DarkGray),
+        )),
+        chunks[8],
+    );
+
+    let pe = PERM_OPTIONS[form.perm_edit];
+    let pb = PERM_OPTIONS[form.perm_bash];
+    let pe_style = if form.focused == 11 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let pb_style = if form.focused == 12 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Edit: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} ◄►", pe), pe_style),
+            Span::raw("   "),
+            Span::styled("Bash: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} ◄►", pb), pb_style),
+        ])),
+        chunks[9],
+    );
+
+    let pw = PERM_OPTIONS[form.perm_webfetch];
+    let pt = PERM_OPTIONS[form.perm_task];
+    let pw_style = if form.focused == 13 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let pt_style = if form.focused == 14 {
+        Style::default().fg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" Web: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} ◄►", pw), pw_style),
+            Span::raw("   "),
+            Span::styled("Task: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{} ◄►", pt), pt_style),
+        ])),
+        chunks[10],
+    );
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Tab:Next  j/k:Change  Space:Toggle  Enter:Save  Esc:Cancel",
+            Style::default().fg(Color::DarkGray),
+        ))
+        .alignment(Alignment::Center),
+        chunks[11],
     );
 
     let color_style = if form.focused == 7 {
@@ -1808,6 +1962,19 @@ fn handle_agent_form_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState
                     }
                 }
                 5 => match key.code {
+                    KeyCode::Left | KeyCode::Char('k') | KeyCode::Up => {
+                        form.reasoning_effort_idx = if form.reasoning_effort_idx == 0 {
+                            REASONING_EFFORT_OPTIONS.len() - 1
+                        } else {
+                            form.reasoning_effort_idx - 1
+                        };
+                    }
+                    KeyCode::Right | KeyCode::Char('j') | KeyCode::Down | KeyCode::Enter | KeyCode::Char(' ') => {
+                        form.reasoning_effort_idx = (form.reasoning_effort_idx + 1) % REASONING_EFFORT_OPTIONS.len();
+                    }
+                    _ => {}
+                },
+                6 => match key.code {
                     KeyCode::Char(c) if c.is_ascii_digit() => {
                         form.steps_buf.push(c);
                     }
@@ -1816,7 +1983,7 @@ fn handle_agent_form_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState
                     }
                     _ => {}
                 },
-                6 => match key.code {
+                7 => match key.code {
                     KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
                         if c == '.' && form.top_p_buf.contains('.') {
                             return;
@@ -1828,7 +1995,7 @@ fn handle_agent_form_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState
                     }
                     _ => {}
                 },
-                7 => match key.code {
+                8 => match key.code {
                     KeyCode::Char(c) if !c.is_control() => {
                         form.color_buf.push(c);
                     }
@@ -1837,19 +2004,19 @@ fn handle_agent_form_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState
                     }
                     _ => {}
                 },
-                8 => match key.code {
+                9 => match key.code {
                     KeyCode::Char(' ') | KeyCode::Enter => {
                         form.hidden = !form.hidden;
                     }
                     _ => {}
                 },
-                9 => match key.code {
+                10 => match key.code {
                     KeyCode::Char(' ') | KeyCode::Enter => {
                         form.disabled = !form.disabled;
                     }
                     _ => {}
                 },
-                10 => match key.code {
+                11 => match key.code {
                     KeyCode::Char('j') | KeyCode::Down | KeyCode::Char(' ') => {
                         form.perm_edit = (form.perm_edit + 1) % PERM_OPTIONS.len();
                     }
@@ -1862,7 +2029,7 @@ fn handle_agent_form_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState
                     }
                     _ => {}
                 },
-                11 => match key.code {
+                12 => match key.code {
                     KeyCode::Char('j') | KeyCode::Down | KeyCode::Char(' ') => {
                         form.perm_bash = (form.perm_bash + 1) % PERM_OPTIONS.len();
                     }
@@ -1875,7 +2042,7 @@ fn handle_agent_form_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState
                     }
                     _ => {}
                 },
-                12 => match key.code {
+                13 => match key.code {
                     KeyCode::Char('j') | KeyCode::Down | KeyCode::Char(' ') => {
                         form.perm_webfetch = (form.perm_webfetch + 1) % PERM_OPTIONS.len();
                     }
@@ -1888,7 +2055,7 @@ fn handle_agent_form_key(app: &mut App, key: KeyEvent, state: &mut OpenCodeState
                     }
                     _ => {}
                 },
-                13 => match key.code {
+                14 => match key.code {
                     KeyCode::Char('j') | KeyCode::Down | KeyCode::Char(' ') => {
                         form.perm_task = (form.perm_task + 1) % PERM_OPTIONS.len();
                     }
@@ -2053,6 +2220,13 @@ fn do_save(app: &mut App, state: &mut OpenCodeState) {
         }
     }
 
+    let mut reasoning_efforts = HashMap::new();
+    for m in &state.agent_mappings {
+        if let Some(ref re) = m.reasoning_effort {
+            reasoning_efforts.insert(m.name.clone(), re.clone());
+        }
+    }
+
     let mapping = config_writer::AgentMapping {
         build: state.agent_mappings.get(0).and_then(|m| m.group.clone()),
         plan: state.agent_mappings.get(1).and_then(|m| m.group.clone()),
@@ -2062,6 +2236,7 @@ fn do_save(app: &mut App, state: &mut OpenCodeState) {
         title: state.agent_mappings.get(5).and_then(|m| m.group.clone()),
         summary: state.agent_mappings.get(6).and_then(|m| m.group.clone()),
         small_model: state.agent_mappings.get(7).and_then(|m| m.group.clone()),
+        reasoning_efforts,
     };
 
     if let Err(e) = config_writer::set_agent_models(&config_path, &mapping) {

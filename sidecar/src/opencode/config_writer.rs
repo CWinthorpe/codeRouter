@@ -58,6 +58,11 @@ pub struct AgentMapping {
         rename = "small_model"
     )]
     pub small_model: Option<String>,
+    /// Optional reasoning effort per agent role.
+    /// Keys are agent names (build, plan, general, explore, etc.)
+    /// Values are one of: none, low, medium, high, xhigh, max
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub reasoning_efforts: HashMap<String, String>,
 }
 
 /// Returns the default OpenCode config path at `~/.config/opencode/opencode.json`,
@@ -334,6 +339,12 @@ pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()
                         "model".to_string(),
                         json_str(&format!("coderouter/{}", alias)),
                     );
+                    if let Some(re) = mapping.reasoning_efforts.get(*agent_name) {
+                        config_map.insert(
+                            "reasoningEffort".to_string(),
+                            json_str(re),
+                        );
+                    }
                 }
             }
         }
@@ -383,11 +394,12 @@ pub fn remove_agent_models(config_path: &Path) -> Result<()> {
                 })
                 .collect();
 
-            // Remove the "model" key from each coderouter-referencing agent,
+            // Remove the "model" and "reasoningEffort" keys from each coderouter-referencing agent,
             // and clean up the agent entry entirely if it becomes empty.
             for key in keys_to_remove {
                 if let Some(serde_json::Value::Object(agent_config)) = agents.get_mut(&key) {
                     agent_config.remove("model");
+                    agent_config.remove("reasoningEffort");
                     if agent_config.is_empty() {
                         agents.remove(&key);
                     }
@@ -558,6 +570,12 @@ pub fn preview_opencode_config(
                             "model".to_string(),
                             json_str(&format!("coderouter/{}", alias)),
                         );
+                        if let Some(re) = mapping.reasoning_efforts.get(*agent_name) {
+                            config_map.insert(
+                                "reasoningEffort".to_string(),
+                                json_str(re),
+                            );
+                        }
                     }
                 }
             }
@@ -736,6 +754,21 @@ pub fn get_current_agent_mapping(config_path: &Path) -> Result<AgentMapping> {
     if let Some(serde_json::Value::String(small)) = obj.get("small_model") {
         if let Some(alias) = small.strip_prefix("coderouter/") {
             mapping.small_model = Some(alias.to_string());
+        }
+    }
+
+    // Read back reasoningEffort for any agent that has a CodeRouter model.
+    if let Some(serde_json::Value::Object(agents)) = obj.get("agent") {
+        for (agent_name, agent_config) in agents {
+            if let serde_json::Value::Object(config_map) = agent_config {
+                if let Some(serde_json::Value::String(model)) = config_map.get("model") {
+                    if model.starts_with("coderouter/") {
+                        if let Some(serde_json::Value::String(re)) = config_map.get("reasoningEffort") {
+                            mapping.reasoning_efforts.insert(agent_name.clone(), re.clone());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1059,6 +1092,7 @@ mod tests {
             title: None,
             summary: None,
             small_model: Some("fast-model-router".to_string()),
+            ..Default::default()
         };
 
         set_agent_models(&config_path, &mapping).unwrap();
@@ -1123,6 +1157,7 @@ mod tests {
             title: None,
             summary: None,
             small_model: Some("fast-model-router".to_string()),
+            ..Default::default()
         };
 
         set_agent_models(&config_path, &mapping).unwrap();
@@ -1314,6 +1349,7 @@ mod tests {
             title: None,
             summary: None,
             small_model: Some("fast-model-router".to_string()),
+            ..Default::default()
         };
 
         let result =

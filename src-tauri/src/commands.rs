@@ -708,7 +708,7 @@ pub fn get_daily_usage_by_model(days: u32) -> Result<Vec<queries::DailyModelUsag
 ///
 /// Each field corresponds to an agent role whose requests should be routed to
 /// a specific model. `None` means the mapping is not overridden.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct OpenCodeAgentMapping {
     #[serde(default)]
     pub build: Option<String>,
@@ -726,6 +726,8 @@ pub struct OpenCodeAgentMapping {
     pub summary: Option<String>,
     #[serde(default)]
     pub small_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<HashMap<String, String>>,
 }
 
 impl From<OpenCodeAgentMapping> for AgentMapping {
@@ -739,6 +741,7 @@ impl From<OpenCodeAgentMapping> for AgentMapping {
             title: m.title,
             summary: m.summary,
             small_model: m.small_model,
+            reasoning_efforts: m.reasoning_efforts,
         }
     }
 }
@@ -754,6 +757,11 @@ impl From<AgentMapping> for OpenCodeAgentMapping {
             title: m.title,
             summary: m.summary,
             small_model: m.small_model,
+            reasoning_efforts: if m.reasoning_efforts.is_empty() {
+                None
+            } else {
+                Some(m.reasoning_efforts)
+            },
         }
     }
 }
@@ -1807,6 +1815,7 @@ mod tests {
             title: None,
             summary: None,
             small_model: Some("small-model".to_string()),
+            ..Default::default()
         };
         let mapping: AgentMapping = input.into();
         assert_eq!(mapping.build, Some("glm-5-router".to_string()));
@@ -1826,6 +1835,7 @@ mod tests {
             title: None,
             summary: None,
             small_model: None,
+            ..Default::default()
         };
         let mapping: AgentMapping = input.into();
         assert_eq!(mapping.build, None);
@@ -1844,6 +1854,7 @@ mod tests {
             title: Some("f".to_string()),
             summary: Some("g".to_string()),
             small_model: Some("h".to_string()),
+            ..Default::default()
         };
         let mapping: AgentMapping = input.into();
         assert_eq!(mapping.build, Some("a".to_string()));
