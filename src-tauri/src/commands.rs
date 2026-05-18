@@ -1487,7 +1487,7 @@ pub struct CustomAgentResponse {
     pub top_p: Option<f64>,
     #[serde(default, rename = "permissions", skip_serializing_if = "Option::is_none")]
     pub permission: Option<AgentPermissionsResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "reasoningEffort")]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub additional: HashMap<String, serde_json::Value>,
