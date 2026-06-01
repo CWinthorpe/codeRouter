@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { open } from '@tauri-apps/plugin-shell';
 import {
   Plus,
   Edit2,
@@ -25,9 +26,11 @@ import {
   refreshProviderModels,
   getGroups,
   getProviders,
+  startCodexDeviceAuth,
+  pollCodexDeviceAuth,
 } from '../lib/ipc';
 import type { Provider, ProviderModel, Group, GroupEntry } from '../types';
-import type { TestConnectionResult } from '../lib/ipc';
+import type { CodexDeviceAuthStart, TestConnectionResult } from '../lib/ipc';
 import { providerPresets, type ProviderPreset } from '../lib/provider-presets';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -593,6 +596,10 @@ function ProviderModal({
   const [overrideInputCost, setOverrideInputCost] = useState('');
   const [overrideOutputCost, setOverrideOutputCost] = useState('');
   const [overrideProtocol, setOverrideProtocol] = useState<string>('');
+  const [codexAuth, setCodexAuth] = useState<CodexDeviceAuthStart | null>(null);
+  const [codexAuthStatus, setCodexAuthStatus] = useState<string | null>(null);
+  const [codexAuthPolling, setCodexAuthPolling] = useState(false);
+  const codexPollInFlight = useRef(false);
 
   /** Builds a ProviderModel from the override form fields and appends it. */
   const handleAddOverride = () => {
@@ -611,6 +618,68 @@ function ProviderModal({
     setOverrideOutputCost('');
     setOverrideProtocol('');
   };
+
+  const checkCodexAuth = useCallback(
+    async (manual: boolean) => {
+      if (!codexAuth || codexPollInFlight.current) return;
+      codexPollInFlight.current = true;
+      setCodexAuthPolling(true);
+      try {
+        const result = await pollCodexDeviceAuth(codexAuth.deviceAuthId, codexAuth.userCode);
+        if (result.status === 'authorized' && result.credential) {
+          setApiKey(result.credential);
+          setShowApiKey(false);
+          setCodexAuth(null);
+          setCodexAuthStatus('ChatGPT sign-in complete. Save this provider to store the credential.');
+          return;
+        }
+        if (manual) {
+          setCodexAuthStatus(result.message ?? 'Waiting for ChatGPT approval.');
+        }
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        codexPollInFlight.current = false;
+        setCodexAuthPolling(false);
+      }
+    },
+    [codexAuth],
+  );
+
+  const handleStartCodexAuth = async () => {
+    setError(null);
+    setCodexAuthStatus('Requesting ChatGPT device code...');
+    try {
+      const auth = await startCodexDeviceAuth();
+      setCodexAuth(auth);
+      setCodexAuthStatus('Open the link, sign in, and enter the one-time code. CodeRouter will detect approval automatically.');
+      try {
+        await open(auth.verificationUrl);
+      } catch {
+        // The URL is displayed below if the OS refuses to open a browser.
+      }
+    } catch (e: unknown) {
+      setCodexAuth(null);
+      setCodexAuthStatus(null);
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  useEffect(() => {
+    if (!codexAuth) return;
+    const intervalMs = Math.max(codexAuth.interval, 3) * 1000;
+    const timer = window.setInterval(() => {
+      void checkCodexAuth(false);
+    }, intervalMs);
+    return () => window.clearInterval(timer);
+  }, [codexAuth, checkCodexAuth]);
+
+  useEffect(() => {
+    if (protocol !== 'openai-codex') {
+      setCodexAuth(null);
+      setCodexAuthStatus(null);
+    }
+  }, [protocol]);
 
   /**
    * Validates all form fields (name, URL, API key, quotas), constructs
@@ -635,7 +704,7 @@ function ProviderModal({
       return;
     }
     if (!isEditing && !apiKey.trim()) {
-      setError(protocol === 'openai-codex' ? 'Codex credential is required for new providers.' : 'API key is required for new providers.');
+      setError(protocol === 'openai-codex' ? 'Use Sign in with ChatGPT to generate the Codex credential.' : 'API key is required for new providers.');
       return;
     }
     if (dailyTokenQuota) {
@@ -683,7 +752,7 @@ function ProviderModal({
 
   return (
     <Dialog open onOpenChange={() => onClose()}>
-      <DialogContent className="max-w-lg bg-zinc-900 border-zinc-800 text-zinc-100">
+      <DialogContent className="max-h-[90vh] max-w-lg overflow-y-auto bg-zinc-900 border-zinc-800 text-zinc-100">
         <DialogHeader>
           <DialogTitle>{isEditing ? 'Edit Provider' : 'Add Provider'}</DialogTitle>
         </DialogHeader>
@@ -755,18 +824,80 @@ function ProviderModal({
             </Select>
           </div>
 
+          {protocol === 'openai-codex' && (
+            <div className="rounded-md border border-amber-700/40 bg-amber-950/20 p-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium text-amber-200">ChatGPT device login</p>
+                  <p className="mt-1 text-xs text-amber-100/70">
+                    Generate a one-time code, sign in with ChatGPT in your browser, then save the provider after the credential is filled.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleStartCodexAuth}
+                  disabled={saving || codexAuthPolling}
+                  className="shrink-0 rounded-md bg-amber-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-amber-500 disabled:opacity-50"
+                >
+                  {codexAuth ? 'New Code' : 'Sign in'}
+                </button>
+              </div>
+
+              {codexAuth && (
+                <div className="mt-3 rounded-md border border-amber-700/40 bg-zinc-950/40 p-3">
+                  <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-300">
+                    <span>Open</span>
+                    <button
+                      type="button"
+                      onClick={() => void open(codexAuth.verificationUrl)}
+                      className="font-medium text-amber-200 underline decoration-amber-500/60 underline-offset-2 hover:text-amber-100"
+                    >
+                      {codexAuth.verificationUrl}
+                    </button>
+                    <span>and enter</span>
+                    <code className="rounded bg-amber-500/15 px-2 py-1 text-sm font-semibold tracking-widest text-amber-100">
+                      {codexAuth.userCode}
+                    </code>
+                  </div>
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <p className="text-xs text-zinc-500">
+                      Expires in {Math.ceil(codexAuth.expiresIn / 60)} minutes. Never share this code with anyone.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void checkCodexAuth(true)}
+                      disabled={codexAuthPolling}
+                      className="rounded-md border border-zinc-700 px-3 py-1.5 text-xs font-medium text-zinc-300 hover:bg-zinc-800 disabled:opacity-50"
+                    >
+                      {codexAuthPolling ? 'Checking...' : 'Check Now'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {codexAuthStatus && (
+                <p className="mt-2 text-xs text-amber-100/80">{codexAuthStatus}</p>
+              )}
+            </div>
+          )}
+
           <div>
             <label className="mb-1 block text-sm font-medium text-zinc-300">
-              {protocol === 'openai-codex' ? 'Codex auth JSON or access token' : 'API Key'}
+              {protocol === 'openai-codex' ? 'Codex credential' : 'API Key'}
               {isEditing && <span className="ml-2 text-xs text-zinc-500">(leave blank to keep existing)</span>}
             </label>
+            {protocol === 'openai-codex' && (
+              <p className="mb-2 text-xs text-zinc-500">
+                Filled automatically after ChatGPT device login. Manual paste still works for recovery.
+              </p>
+            )}
             <div className="relative">
               <input
                 type={showApiKey ? 'text' : 'password'}
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 pr-16 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                placeholder={protocol === 'openai-codex' ? 'Paste auth.json contents or access token' : isEditing ? 'Leave empty to keep existing key' : 'Enter API key'}
+                placeholder={protocol === 'openai-codex' ? 'Use Sign in above, or paste auth.json/access token' : isEditing ? 'Leave empty to keep existing key' : 'Enter API key'}
               />
               <button
                 type="button"

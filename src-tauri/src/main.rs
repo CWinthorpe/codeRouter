@@ -305,6 +305,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::get_providers,
             commands::save_provider,
+            commands::start_codex_device_auth,
+            commands::poll_codex_device_auth,
             commands::toggle_provider_enabled,
             commands::delete_provider,
             commands::get_groups,

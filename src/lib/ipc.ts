@@ -11,6 +11,22 @@ export interface TestConnectionResult {
   message: string;
 }
 
+/** ChatGPT device-auth data for setting up an OpenAI Codex provider. */
+export interface CodexDeviceAuthStart {
+  verificationUrl: string;
+  userCode: string;
+  deviceAuthId: string;
+  interval: number;
+  expiresIn: number;
+}
+
+/** Result of polling ChatGPT device-auth approval. */
+export interface CodexDeviceAuthPoll {
+  status: 'pending' | 'authorized';
+  credential: string | null;
+  message: string | null;
+}
+
 /** Fetch all configured providers. */
 export async function getProviders(): Promise<Provider[]> {
   return invoke<Provider[]>('get_providers');
@@ -19,6 +35,16 @@ export async function getProviders(): Promise<Provider[]> {
 /** Persist a provider (create or update) along with its API key. */
 export async function saveProvider(provider: Provider, apiKey: string): Promise<void> {
   return invoke<void>('save_provider', { provider, apiKey });
+}
+
+/** Start ChatGPT device authentication for an OpenAI Codex provider. */
+export async function startCodexDeviceAuth(): Promise<CodexDeviceAuthStart> {
+  return invoke<CodexDeviceAuthStart>('start_codex_device_auth');
+}
+
+/** Poll ChatGPT device authentication and return a credential once approved. */
+export async function pollCodexDeviceAuth(deviceAuthId: string, userCode: string): Promise<CodexDeviceAuthPoll> {
+  return invoke<CodexDeviceAuthPoll>('poll_codex_device_auth', { deviceAuthId, userCode });
 }
 
 /** Enable or disable a provider by toggling its `enabled` flag. */

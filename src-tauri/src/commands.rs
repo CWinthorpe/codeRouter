@@ -273,6 +273,31 @@ pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), St
     Ok(())
 }
 
+/// Starts ChatGPT device authentication for the OpenAI Codex provider.
+///
+/// Returns a browser URL and one-time user code. The frontend displays both,
+/// then polls [`poll_codex_device_auth`] until authorization completes.
+#[tauri::command]
+pub async fn start_codex_device_auth(
+) -> Result<coderouter_proxy::proxy::codex::CodexDeviceAuthStart, String> {
+    let client = Client::new();
+    coderouter_proxy::proxy::codex::start_device_auth(&client)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Polls ChatGPT device authentication once and returns a credential JSON when complete.
+#[tauri::command]
+pub async fn poll_codex_device_auth(
+    device_auth_id: String,
+    user_code: String,
+) -> Result<coderouter_proxy::proxy::codex::CodexDeviceAuthPoll, String> {
+    let client = Client::new();
+    coderouter_proxy::proxy::codex::poll_device_auth(&client, &device_auth_id, &user_code)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Toggles a provider's enabled flag and persists the change.
 ///
 /// # Arguments

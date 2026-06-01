@@ -8,8 +8,13 @@
 //! - SSE translation: Codex Responses SSE events → OpenAI chat-completion SSE chunks.
 
 use base64::Engine;
-use serde::{Deserialize, Serialize};
+use serde::de;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+
+const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
+const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_DEVICE_EXPIRES_IN_SECONDS: u64 = 15 * 60;
 
 // ── Codex auth types ──
 
@@ -180,6 +185,186 @@ pub fn build_codex_auth_headers(
     }
 
     headers
+}
+
+// ── Device auth ──
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDeviceAuthStart {
+    pub verification_url: String,
+    pub user_code: String,
+    pub device_auth_id: String,
+    pub interval: u64,
+    pub expires_in: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexDeviceAuthPoll {
+    pub status: String,
+    #[serde(default)]
+    pub credential: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceUserCodeResponse {
+    device_auth_id: String,
+    #[serde(alias = "user_code", alias = "usercode")]
+    user_code: String,
+    #[serde(
+        default = "default_device_poll_interval",
+        deserialize_with = "deserialize_interval"
+    )]
+    interval: u64,
+}
+
+#[derive(Deserialize)]
+struct DeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+#[derive(Deserialize)]
+struct AuthCodeTokenResponse {
+    access_token: String,
+    refresh_token: String,
+    id_token: String,
+}
+
+fn default_device_poll_interval() -> u64 {
+    5
+}
+
+fn deserialize_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::Number(n) => n
+            .as_u64()
+            .ok_or_else(|| de::Error::custom("interval must be a positive integer")),
+        Value::String(s) => s
+            .trim()
+            .parse::<u64>()
+            .map_err(|e| de::Error::custom(format!("invalid interval: {e}"))),
+        _ => Err(de::Error::custom("interval must be a string or integer")),
+    }
+}
+
+/// Starts Codex's ChatGPT device login flow and returns the browser URL plus
+/// one-time user code to display to the user.
+pub async fn start_device_auth(
+    client: &reqwest::Client,
+) -> Result<CodexDeviceAuthStart, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!(
+        "{}/api/accounts/deviceauth/usercode",
+        CODEX_AUTH_ISSUER.trim_end_matches('/')
+    );
+    let resp = client
+        .post(url)
+        .json(&serde_json::json!({ "client_id": CODEX_CLIENT_ID }))
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Codex device code request failed: HTTP {}", resp.status()).into());
+    }
+
+    let body: DeviceUserCodeResponse = resp.json().await?;
+    Ok(CodexDeviceAuthStart {
+        verification_url: format!("{}/codex/device", CODEX_AUTH_ISSUER.trim_end_matches('/')),
+        user_code: body.user_code,
+        device_auth_id: body.device_auth_id,
+        interval: body.interval.max(1),
+        expires_in: CODEX_DEVICE_EXPIRES_IN_SECONDS,
+    })
+}
+
+/// Polls Codex's device login flow once. Returns `pending` while the user has
+/// not approved the code yet, or `authorized` with a CodeRouter credential JSON.
+pub async fn poll_device_auth(
+    client: &reqwest::Client,
+    device_auth_id: &str,
+    user_code: &str,
+) -> Result<CodexDeviceAuthPoll, Box<dyn std::error::Error + Send + Sync>> {
+    let url = format!(
+        "{}/api/accounts/deviceauth/token",
+        CODEX_AUTH_ISSUER.trim_end_matches('/')
+    );
+    let resp = client
+        .post(url)
+        .json(&serde_json::json!({
+            "device_auth_id": device_auth_id,
+            "user_code": user_code,
+        }))
+        .send()
+        .await?;
+
+    if resp.status() == reqwest::StatusCode::FORBIDDEN
+        || resp.status() == reqwest::StatusCode::NOT_FOUND
+    {
+        return Ok(CodexDeviceAuthPoll {
+            status: "pending".to_string(),
+            credential: None,
+            message: Some("Waiting for ChatGPT approval".to_string()),
+        });
+    }
+
+    if !resp.status().is_success() {
+        return Err(format!("Codex device auth failed: HTTP {}", resp.status()).into());
+    }
+
+    let code: DeviceTokenResponse = resp.json().await?;
+    let token = exchange_device_authorization_code(client, &code).await?;
+    let credential = credential_from_device_tokens(&token);
+
+    Ok(CodexDeviceAuthPoll {
+        status: "authorized".to_string(),
+        credential: Some(credential),
+        message: Some("ChatGPT sign-in complete".to_string()),
+    })
+}
+
+async fn exchange_device_authorization_code(
+    client: &reqwest::Client,
+    code: &DeviceTokenResponse,
+) -> Result<AuthCodeTokenResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let token_endpoint = format!("{}/oauth/token", CODEX_AUTH_ISSUER.trim_end_matches('/'));
+    let redirect_uri = format!(
+        "{}/deviceauth/callback",
+        CODEX_AUTH_ISSUER.trim_end_matches('/')
+    );
+    let resp = client
+        .post(token_endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.authorization_code.as_str()),
+            ("redirect_uri", redirect_uri.as_str()),
+            ("client_id", CODEX_CLIENT_ID),
+            ("code_verifier", code.code_verifier.as_str()),
+        ])
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("Codex token exchange failed: HTTP {}", resp.status()).into());
+    }
+
+    Ok(resp.json().await?)
+}
+
+fn credential_from_device_tokens(token: &AuthCodeTokenResponse) -> String {
+    let (account_id, _) = decode_id_token_claims(Some(&token.id_token));
+    build_auth_json(
+        &token.access_token,
+        Some(&token.refresh_token),
+        account_id.as_deref(),
+        Some(&token.id_token),
+    )
 }
 
 // ── JWT expiry & token refresh ──
@@ -1122,6 +1307,41 @@ mod tests {
         let parsed: Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["tokens"]["access_token"], "bare-token");
         assert!(parsed["tokens"].get("refresh_token").is_none());
+    }
+
+    #[test]
+    fn test_device_user_code_interval_accepts_string() {
+        let json = r#"{
+            "device_auth_id": "dev-123",
+            "user_code": "ABCD-EFGH",
+            "interval": "7"
+        }"#;
+        let parsed: DeviceUserCodeResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.device_auth_id, "dev-123");
+        assert_eq!(parsed.user_code, "ABCD-EFGH");
+        assert_eq!(parsed.interval, 7);
+    }
+
+    #[test]
+    fn test_credential_from_device_tokens_includes_account_id() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-device"}}"#);
+        let token = AuthCodeTokenResponse {
+            access_token: "device-access".to_string(),
+            refresh_token: "device-refresh".to_string(),
+            id_token: format!("h.{payload}.s"),
+        };
+
+        let credential = credential_from_device_tokens(&token);
+        let parsed: CodexAuth = serde_json::from_str(&credential).unwrap();
+
+        assert_eq!(parsed.tokens.access_token, "device-access");
+        assert_eq!(
+            parsed.tokens.refresh_token,
+            Some("device-refresh".to_string())
+        );
+        assert_eq!(parsed.tokens.account_id, Some("acct-device".to_string()));
+        assert!(parsed.tokens.id_token.is_some());
     }
 
     // ── Request translation tests ──
