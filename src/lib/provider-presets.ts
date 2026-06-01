@@ -4,7 +4,7 @@ export interface ProviderPreset {
   id: string;
   name: string;
   baseUrl: string;
-  protocol: 'openai' | 'anthropic';
+  protocol: 'openai' | 'anthropic' | 'openai-codex';
   description: string;
   modelOverrides?: ProviderModel[];
 }
@@ -126,6 +126,13 @@ export const providerPresets: ProviderPreset[] = [
     baseUrl: 'https://api.openai.com/v1',
     protocol: 'openai',
     description: 'GPT models directly from OpenAI',
+  },
+  {
+    id: 'openai-codex',
+    name: 'OpenAI Codex',
+    baseUrl: 'https://chatgpt.com/backend-api/codex',
+    protocol: 'openai-codex',
+    description: 'Codex GPT models via ChatGPT device login',
   },
   {
     id: 'anthropic',

@@ -1,0 +1,1269 @@
+//! OpenAI Codex (ChatGPT device-login) provider integration.
+//!
+//! Handles:
+//! - Parsing Codex CLI `auth.json` credentials.
+//! - Building Codex-specific auth headers from those credentials.
+//! - Token expiry detection via JWT `exp` claim and refresh via OAuth token endpoint.
+//! - Translating OpenAI chat-completion requests to the Codex Responses API.
+//! - SSE translation: Codex Responses SSE events → OpenAI chat-completion SSE chunks.
+
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+// ── Codex auth types ──
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CodexTokens {
+    pub access_token: String,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    #[serde(default)]
+    pub account_id: Option<String>,
+    #[serde(default)]
+    pub id_token: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CodexAuth {
+    pub tokens: CodexTokens,
+}
+
+/// Parses the credential string. It may be a raw access token or a JSON
+/// object (the full `auth.json`).  If JSON, extracts the token fields.
+///
+/// Returns `(access_token, account_id, id_token, refresh_token)`.
+pub fn parse_codex_credential(
+    credential: &str,
+) -> (String, Option<String>, Option<String>, Option<String>) {
+    if credential.trim().starts_with('{') {
+        if let Ok(auth) = serde_json::from_str::<CodexAuth>(credential) {
+            // Also extract account_id from id_token JWT claims if available
+            let (acct_from_jwt, _) = decode_id_token_claims(auth.tokens.id_token.as_deref());
+            let account_id = auth.tokens.account_id.or(acct_from_jwt);
+            return (
+                auth.tokens.access_token,
+                account_id,
+                auth.tokens.id_token,
+                auth.tokens.refresh_token,
+            );
+        }
+        if let Ok(tokens) = serde_json::from_str::<CodexTokens>(credential) {
+            let (acct_from_jwt, _) = decode_id_token_claims(tokens.id_token.as_deref());
+            let account_id = tokens.account_id.or(acct_from_jwt);
+            return (
+                tokens.access_token,
+                account_id,
+                tokens.id_token,
+                tokens.refresh_token,
+            );
+        }
+        // Fallback: raw JSON string extraction
+        if let Ok(value) = serde_json::from_str::<Value>(credential) {
+            let access = value
+                .get("access_token")
+                .or_else(|| value.pointer("/tokens/access_token"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if access.is_empty() {
+                return (credential.to_string(), None, None, None);
+            }
+            let refresh = value
+                .get("refresh_token")
+                .or_else(|| value.pointer("/tokens/refresh_token"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let account = value
+                .get("account_id")
+                .or_else(|| value.pointer("/tokens/account_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let id = value
+                .get("id_token")
+                .or_else(|| value.pointer("/tokens/id_token"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            // Also try JWT claims for account_id
+            let (acct_from_jwt, _) = decode_id_token_claims(id.as_deref());
+            let account_id = account.or(acct_from_jwt);
+            return (access.to_string(), account_id, id, refresh);
+        }
+    }
+
+    // Raw token — treat as access_token only
+    (credential.to_string(), None, None, None)
+}
+
+/// Decodes the id_token JWT payload and returns `(chatgpt_account_id, is_fedramp)`.
+///
+/// Checks both top-level `fedramp` and the nested `https://api.openai.com/auth`
+/// namespace used by Codex JWTs.
+fn decode_id_token_claims(id_token: Option<&str>) -> (Option<String>, bool) {
+    let id = match id_token {
+        Some(t) if !t.is_empty() => t,
+        _ => return (None, false),
+    };
+    let parts: Vec<&str> = id.split('.').collect();
+    if parts.len() < 2 {
+        return (None, false);
+    }
+    let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(bytes) => bytes,
+        Err(_) => return (None, false),
+    };
+    let value: Value = match serde_json::from_slice(&payload) {
+        Ok(v) => v,
+        Err(_) => return (None, false),
+    };
+
+    let mut account_id = None;
+    let mut is_fedramp = false;
+
+    // Top-level claims (simple form)
+    if let Some(fr) = value.get("fedramp").and_then(|v| v.as_bool()) {
+        is_fedramp = fr;
+    }
+
+    // OpenAI namespace claims: https://api.openai.com/auth
+    if let Some(auth_ns) = value.get("https://api.openai.com/auth") {
+        if let Some(acct) = auth_ns.get("chatgpt_account_id").and_then(|v| v.as_str()) {
+            account_id = Some(acct.to_string());
+        }
+        if let Some(fr) = auth_ns
+            .get("chatgpt_account_is_fedramp")
+            .and_then(|v| v.as_bool())
+        {
+            is_fedramp = fr;
+        }
+    }
+
+    (account_id, is_fedramp)
+}
+
+/// Returns true when the `id_token` JWT payload indicates FedRAMP.
+pub fn check_fedramp(id_token: &str) -> bool {
+    let (_, fed) = decode_id_token_claims(Some(id_token));
+    fed
+}
+
+/// Builds Codex auth headers from parsed credentials.
+///
+/// Headers:
+/// - `Authorization: Bearer <access_token>`
+/// - `version: <package version>`
+/// - `ChatGPT-Account-ID: <account_id>` when present
+/// - `X-OpenAI-Fedramp: true` when the id token claims FedRAMP
+pub fn build_codex_auth_headers(
+    access_token: &str,
+    account_id: Option<&str>,
+    id_token: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut headers = vec![
+        (
+            "Authorization".to_string(),
+            format!("Bearer {access_token}"),
+        ),
+        ("content-type".to_string(), "application/json".to_string()),
+        ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+    ];
+
+    if let Some(aid) = account_id {
+        if !aid.is_empty() {
+            headers.push(("ChatGPT-Account-ID".to_string(), aid.to_string()));
+        }
+    }
+
+    if let Some(id) = id_token {
+        if check_fedramp(id) {
+            headers.push(("X-OpenAI-Fedramp".to_string(), "true".to_string()));
+        }
+    }
+
+    headers
+}
+
+// ── JWT expiry & token refresh ──
+
+/// Checks whether a JWT access token is expired (or will expire within `skew_secs`).
+/// Returns true if the token does not appear to be a JWT (no `exp` claim),
+/// because raw opaque tokens cannot be checked this way and should be tried.
+fn token_needs_refresh(access_token: &str, skew_secs: i64) -> bool {
+    let parts: Vec<&str> = access_token.split('.').collect();
+    if parts.len() < 2 {
+        // Not a JWT — cannot check expiry; assume it does not need refresh
+        return false;
+    }
+    let payload = match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(parts[1]) {
+        Ok(bytes) => bytes,
+        Err(_) => return true,
+    };
+    let value: Value = match serde_json::from_slice(&payload) {
+        Ok(v) => v,
+        Err(_) => return true,
+    };
+    let exp = match value.get("exp").and_then(|v| v.as_i64()) {
+        Some(e) => e,
+        None => return false,
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    now + skew_secs >= exp
+}
+
+/// Rebuilds a Codex auth JSON string from tokens, for persisting after refresh.
+fn build_auth_json(
+    access_token: &str,
+    refresh_token: Option<&str>,
+    account_id: Option<&str>,
+    id_token: Option<&str>,
+) -> String {
+    let mut tokens_map = serde_json::Map::new();
+    tokens_map.insert(
+        "access_token".to_string(),
+        Value::String(access_token.to_string()),
+    );
+    if let Some(rt) = refresh_token {
+        tokens_map.insert("refresh_token".to_string(), Value::String(rt.to_string()));
+    }
+    if let Some(aid) = account_id {
+        tokens_map.insert("account_id".to_string(), Value::String(aid.to_string()));
+    }
+    if let Some(idt) = id_token {
+        tokens_map.insert("id_token".to_string(), Value::String(idt.to_string()));
+    }
+    let auth = serde_json::json!({ "tokens": tokens_map });
+    auth.to_string()
+}
+
+/// Response from the OAuth token refresh endpoint.
+#[derive(Deserialize)]
+struct TokenRefreshResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+/// Attempts to refresh an expired access token using the stored refresh token.
+///
+/// Returns a new `(access_token, refresh_token, id_token)` tuple on success.
+/// The new `id_token` from the refresh response may carry updated account claims.
+pub async fn refresh_access_token(
+    client: &reqwest::Client,
+    refresh_token: &str,
+) -> Result<(String, Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let payload = serde_json::json!({
+        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    });
+
+    let resp = client
+        .post("https://auth.openai.com/oauth/token")
+        .json(&payload)
+        .send()
+        .await?;
+
+    if !resp.status().is_success() {
+        return Err(format!("token refresh failed: HTTP {}", resp.status()).into());
+    }
+
+    let body: TokenRefreshResponse = resp.json().await?;
+    Ok((
+        body.access_token,
+        body.refresh_token.or(Some(refresh_token.to_string())),
+        body.id_token,
+    ))
+}
+
+/// Resolves the credential for a codex provider: parses, optionally refreshes
+/// an expiring/expired access token, persists updated tokens, and returns
+/// `(access_token, account_id, id_token)` ready for auth header building.
+///
+/// Raw access-token credentials (no refresh_token) skip refresh entirely.
+pub async fn resolve_codex_credential(
+    client: &reqwest::Client,
+    raw_credential: &str,
+    credential_key: &str,
+) -> Result<(String, Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
+    let (access_token, account_id, id_token, refresh_token) =
+        parse_codex_credential(raw_credential);
+
+    // If there's no refresh token, we can't refresh — use as-is
+    let rt = match refresh_token {
+        Some(ref rt) if !rt.is_empty() => rt.clone(),
+        _ => return Ok((access_token, account_id, id_token)),
+    };
+
+    // Check expiry
+    if !token_needs_refresh(&access_token, 60) {
+        return Ok((access_token, account_id, id_token));
+    }
+
+    // Attempt refresh
+    match refresh_access_token(client, &rt).await {
+        Ok((new_access, new_refresh, new_id_token)) => {
+            // Use the new id_token from refresh if provided; otherwise keep old
+            let idt = new_id_token.or(id_token.clone());
+            // Re-derive account_id from refreshed id_token
+            let (acct_jwt, _) = decode_id_token_claims(idt.as_deref());
+            let acct = account_id.or(acct_jwt);
+
+            // Persist updated credential
+            let updated_json = build_auth_json(
+                &new_access,
+                new_refresh.as_deref().or(Some(&rt)),
+                acct.as_deref(),
+                idt.as_deref(),
+            );
+            let _ =
+                crate::credentials::keychain::store_credential(credential_key, &updated_json).await;
+
+            Ok((new_access, acct, idt))
+        }
+        Err(_e) => {
+            // Refresh failed — proceed with existing (possibly expired) token
+            Ok((access_token, account_id, id_token))
+        }
+    }
+}
+
+// ── Request translation: OpenAI chat → Codex Responses ──
+
+/// Converts an OpenAI chat-completion request body into a Codex Responses API request.
+///
+/// Mapping rules:
+/// - `system` / `developer` messages → single `instructions` string.
+/// - `user` messages → `message` items with `input_text` content.
+/// - `assistant` text messages → `message` items with `output_text` content.
+/// - `tool` result messages → `function_call_output` items.
+/// - Assistant `tool_calls` → `function_call` items.
+/// - Chat `tools` → Responses function tools.
+/// - Always forces `stream: true`.
+pub fn openai_to_codex_request(openai_body: &Value, upstream_model: &str) -> Value {
+    let messages = openai_body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut instructions_parts: Vec<String> = Vec::new();
+    let mut input_items: Vec<Value> = Vec::new();
+
+    for msg in &messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+
+        match role {
+            "system" | "developer" => {
+                let content = extract_text_content(msg);
+                if !content.is_empty() {
+                    instructions_parts.push(content);
+                }
+            }
+            "user" => {
+                let content = extract_text_content(msg);
+                let item = serde_json::json!({
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": content }]
+                });
+                input_items.push(item);
+            }
+            "assistant" => {
+                if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                    for tc in tool_calls {
+                        let func = tc.get("function");
+                        let name = func
+                            .and_then(|f| f.get("name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let arguments = func
+                            .and_then(|f| f.get("arguments"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        let call_id = tc
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let item = serde_json::json!({
+                            "type": "function_call",
+                            "name": name,
+                            "arguments": arguments,
+                            "call_id": call_id
+                        });
+                        input_items.push(item);
+                    }
+                }
+                let content = extract_text_content(msg);
+                if !content.is_empty() {
+                    let item = serde_json::json!({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": content }]
+                    });
+                    input_items.push(item);
+                }
+            }
+            "tool" => {
+                let call_id = msg
+                    .get("tool_call_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let output = extract_tool_content(msg);
+                let item = serde_json::json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output
+                });
+                input_items.push(item);
+            }
+            _ => {}
+        }
+    }
+
+    let instructions = if instructions_parts.is_empty() {
+        None
+    } else {
+        Some(instructions_parts.join("\n\n"))
+    };
+
+    let mut body = serde_json::json!({
+        "model": upstream_model,
+        "input": input_items,
+        "stream": true,
+    });
+
+    if let Some(instructions) = instructions {
+        body["instructions"] = Value::String(instructions);
+    }
+
+    // Pass through reasoning / reasoning_effort
+    if let Some(reasoning) = openai_body.get("reasoning") {
+        body["reasoning"] = reasoning.clone();
+    } else if let Some(effort) = openai_body.get("reasoning_effort").and_then(|v| v.as_str()) {
+        body["reasoning"] = serde_json::json!({ "effort": effort });
+    }
+
+    // Tools: chat → codex function tools
+    if let Some(tools) = openai_body.get("tools").and_then(|v| v.as_array()) {
+        let codex_tools: Vec<Value> = tools
+            .iter()
+            .filter_map(|t| {
+                if t.get("type").and_then(|v| v.as_str()) == Some("function") {
+                    let func = t.get("function")?;
+                    Some(serde_json::json!({
+                        "type": "function",
+                        "name": func.get("name"),
+                        "description": func.get("description"),
+                        "parameters": func.get("parameters"),
+                        "strict": func.get("strict"),
+                    }))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !codex_tools.is_empty() {
+            body["tools"] = Value::Array(codex_tools);
+        }
+    }
+
+    // parallel_tool_calls
+    if let Some(ptc) = openai_body
+        .get("parallel_tool_calls")
+        .and_then(|v| v.as_bool())
+    {
+        body["parallel_tool_calls"] = Value::Bool(ptc);
+    } else {
+        body["parallel_tool_calls"] = Value::Bool(true);
+    }
+
+    // tool_choice — pass through if a simple string, ignore object forms
+    if let Some(tc) = openai_body.get("tool_choice").and_then(|v| v.as_str()) {
+        body["tool_choice"] = Value::String(tc.to_string());
+    } else {
+        body["tool_choice"] = Value::String("auto".to_string());
+    }
+
+    // Common params
+    if let Some(temp) = openai_body.get("temperature") {
+        body["temperature"] = temp.clone();
+    }
+    if let Some(top_p) = openai_body.get("top_p") {
+        body["top_p"] = top_p.clone();
+    }
+    if let Some(max_tokens) = openai_body.get("max_tokens") {
+        body["max_output_tokens"] = max_tokens.clone();
+    } else if let Some(max_completion) = openai_body.get("max_completion_tokens") {
+        body["max_output_tokens"] = max_completion.clone();
+    }
+    if let Some(stop) = openai_body.get("stop") {
+        body["stop"] = stop.clone();
+    }
+    if let Some(seed) = openai_body.get("seed") {
+        body["seed"] = seed.clone();
+    }
+    if let Some(user) = openai_body.get("user") {
+        body["user"] = user.clone();
+    }
+
+    body
+}
+
+fn extract_text_content(msg: &Value) -> String {
+    if let Some(content) = msg.get("content") {
+        if let Some(s) = content.as_str() {
+            return s.to_string();
+        }
+        if let Some(arr) = content.as_array() {
+            let parts: Vec<String> = arr
+                .iter()
+                .filter_map(|part| {
+                    part.get("text")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            return parts.join("");
+        }
+    }
+    String::new()
+}
+
+fn extract_tool_content(msg: &Value) -> String {
+    if let Some(content) = msg.get("content") {
+        if let Some(s) = content.as_str() {
+            return s.to_string();
+        }
+        return serde_json::to_string(content).unwrap_or_default();
+    }
+    String::new()
+}
+
+// ── SSE translation: Codex Responses → OpenAI chat chunks ──
+
+use bytes::Bytes;
+use futures::Stream;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+
+use crate::proxy::translator::StreamTokenCounts;
+
+/// Accumulated state for the Codex SSE translation process.
+pub struct CodexToOpenAIStream<S> {
+    inner: S,
+    group_alias: String,
+    chat_id: String,
+    buffer: Vec<u8>,
+    state: CodexStreamState,
+    token_counts: Arc<Mutex<StreamTokenCounts>>,
+    has_sent_role: bool,
+}
+
+enum CodexStreamState {
+    Waiting,
+    Done,
+    Errored(std::io::Error),
+}
+
+impl<S> CodexToOpenAIStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>>,
+{
+    pub fn new(inner: S, group_alias: String, token_counts: Arc<Mutex<StreamTokenCounts>>) -> Self {
+        Self {
+            inner,
+            group_alias,
+            chat_id: format!("chatcmpl-{}", uuid_short()),
+            buffer: Vec::new(),
+            state: CodexStreamState::Waiting,
+            token_counts,
+            has_sent_role: false,
+        }
+    }
+
+    /// Translates a single Codex SSE event.
+    ///
+    /// Returns `Ok(Some(sse_text))` for normal output, `Ok(None)` for
+    /// skip-able events, and `Err(...)` on upstream errors (`response.failed`
+    /// / `response.incomplete`).
+    fn translate_event(&mut self, data: &str) -> Result<Option<String>, std::io::Error> {
+        let event: Value = match serde_json::from_str(data) {
+            Ok(e) => e,
+            Err(_) => return Ok(None),
+        };
+
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match event_type {
+            "response.output_text.delta" => {
+                let delta_text = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+
+                let mut output = String::new();
+                if !self.has_sent_role {
+                    output.push_str(&build_openai_chunk(
+                        &self.chat_id,
+                        &self.group_alias,
+                        Some("assistant"),
+                        None,
+                        None,
+                    ));
+                    self.has_sent_role = true;
+                }
+
+                if delta_text.is_empty() {
+                    return if output.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(output))
+                    };
+                }
+
+                output.push_str(&build_openai_chunk(
+                    &self.chat_id,
+                    &self.group_alias,
+                    None,
+                    Some(delta_text),
+                    None,
+                ));
+                Ok(Some(output))
+            }
+
+            "response.output_item.done" => {
+                let item = event.get("item");
+                if let Some(func_name) = item.and_then(|i| i.get("name")).and_then(|v| v.as_str()) {
+                    let call_id = item
+                        .and_then(|i| i.get("call_id"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let arguments = item
+                        .and_then(|i| i.get("arguments"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}")
+                        .to_string();
+
+                    let mut output = String::new();
+                    if !self.has_sent_role {
+                        output.push_str(&build_openai_chunk(
+                            &self.chat_id,
+                            &self.group_alias,
+                            Some("assistant"),
+                            None,
+                            None,
+                        ));
+                        self.has_sent_role = true;
+                    }
+
+                    let tool_chunk = serde_json::json!({
+                        "id": self.chat_id,
+                        "object": "chat.completion.chunk",
+                        "model": self.group_alias,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": func_name,
+                                        "arguments": arguments,
+                                    }
+                                }]
+                            },
+                            "finish_reason": null
+                        }]
+                    });
+                    if let Ok(json) = serde_json::to_string(&tool_chunk) {
+                        output.push_str(&format!("data: {json}\n\n"));
+                    }
+                    return Ok(Some(output));
+                }
+                Ok(None)
+            }
+
+            "response.completed" => {
+                // Usage is nested under `event.response.usage` in Codex Responses
+                let usage = event
+                    .get("response")
+                    .and_then(|r| r.get("usage"))
+                    .or_else(|| event.get("usage"));
+                if let Some(usage) = usage {
+                    let mut counts = self.token_counts.lock().unwrap();
+                    if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                        counts.input_tokens = input;
+                    }
+                    if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                        counts.output_tokens = output;
+                    }
+                }
+
+                let mut output =
+                    build_openai_chunk(&self.chat_id, &self.group_alias, None, None, Some("stop"));
+                output.push_str("data: [DONE]\n\n");
+                Ok(Some(output))
+            }
+
+            "response.failed" | "response.incomplete" => {
+                let detail = event
+                    .get("response")
+                    .and_then(|r| r.get("status_details"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(event_type);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("codex upstream error: {detail}"),
+                ))
+            }
+
+            _ => Ok(None),
+        }
+    }
+}
+
+fn build_openai_chunk(
+    chat_id: &str,
+    model: &str,
+    role: Option<&str>,
+    content: Option<&str>,
+    finish_reason: Option<&str>,
+) -> String {
+    let mut delta = serde_json::Map::new();
+    if let Some(r) = role {
+        delta.insert("role".to_string(), Value::String(r.to_string()));
+    }
+    if let Some(c) = content {
+        delta.insert("content".to_string(), Value::String(c.to_string()));
+    }
+
+    let chunk = serde_json::json!({
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        }]
+    });
+
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&chunk).unwrap_or_default()
+    )
+}
+
+/// [`Stream`] implementation for Codex SSE to OpenAI SSE translation.
+impl<S> Stream for CodexToOpenAIStream<S>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    type Item = Result<Bytes, std::io::Error>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if matches!(self.state, CodexStreamState::Done) {
+            return Poll::Ready(None);
+        }
+        if matches!(self.state, CodexStreamState::Errored(_)) {
+            // Already errored; drain
+            let CodexStreamState::Errored(e) =
+                std::mem::replace(&mut self.state, CodexStreamState::Done)
+            else {
+                return Poll::Ready(None);
+            };
+            return Poll::Ready(Some(Err(e)));
+        }
+
+        loop {
+            match Pin::new(&mut self.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(chunk))) => {
+                    self.buffer.extend_from_slice(&chunk);
+
+                    if let Some(newline_pos) = self.buffer.iter().position(|&b| b == b'\n') {
+                        let line_bytes = self.buffer[..newline_pos].to_vec();
+                        self.buffer.drain(..=newline_pos);
+
+                        let line = String::from_utf8_lossy(&line_bytes);
+                        let line = line.strip_suffix('\r').unwrap_or(&line).trim();
+
+                        let data = if line.starts_with("data: ") {
+                            Some(&line[6..])
+                        } else if line.starts_with("data:") {
+                            Some(&line[5..])
+                        } else {
+                            None
+                        };
+
+                        if let Some(data) = data {
+                            if !data.is_empty() {
+                                match self.translate_event(data) {
+                                    Ok(Some(output)) => {
+                                        return Poll::Ready(Some(Ok(Bytes::from(output))));
+                                    }
+                                    Ok(None) => continue,
+                                    Err(e) => {
+                                        self.state = CodexStreamState::Errored(
+                                            std::io::Error::new(e.kind(), e.to_string()),
+                                        );
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
+                Poll::Ready(None) => {
+                    if !self.buffer.is_empty() {
+                        let remaining = String::from_utf8_lossy(&self.buffer);
+                        let remaining = remaining.trim().to_string();
+                        let data = if remaining.starts_with("data: ") {
+                            Some(&remaining[6..])
+                        } else if remaining.starts_with("data:") {
+                            Some(&remaining[5..])
+                        } else {
+                            None
+                        };
+
+                        if let Some(data) = data {
+                            if !data.is_empty() {
+                                match self.translate_event(data) {
+                                    Ok(Some(output)) => {
+                                        self.buffer.clear();
+                                        return Poll::Ready(Some(Ok(Bytes::from(output))));
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        self.buffer.clear();
+                                        self.state = CodexStreamState::Errored(
+                                            std::io::Error::new(e.kind(), e.to_string()),
+                                        );
+                                        return Poll::Ready(Some(Err(e)));
+                                    }
+                                }
+                            }
+                        }
+                        self.buffer.clear();
+                    }
+                    self.state = CodexStreamState::Done;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Wraps a Codex SSE stream into an [`axum::body::Body`] that yields
+/// translated OpenAI SSE chunks.
+pub fn translate_codex_stream<S>(
+    stream: S,
+    group_alias: String,
+    token_counts: Arc<Mutex<StreamTokenCounts>>,
+) -> (axum::body::Body, Arc<Mutex<StreamTokenCounts>>)
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+{
+    let translated = CodexToOpenAIStream::new(stream, group_alias, token_counts.clone());
+    let raw_stream = futures::stream::unfold(translated, |mut stream| async move {
+        match futures::StreamExt::next(&mut stream).await {
+            Some(Ok(bytes)) => Some((Ok::<_, std::io::Error>(bytes), stream)),
+            Some(Err(e)) => Some((Err(e), stream)),
+            None => None,
+        }
+    });
+    let body = axum::body::Body::from_stream(raw_stream);
+    (body, token_counts)
+}
+
+/// Generates a short UUID for use in OpenAI-compatible response IDs.
+fn uuid_short() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
+// ── Tests ──
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── parse_codex_credential tests ──
+
+    #[test]
+    fn test_parse_raw_access_token() {
+        let (access, account, id, refresh) = parse_codex_credential("sk-my-access-token");
+        assert_eq!(access, "sk-my-access-token");
+        assert!(account.is_none());
+        assert!(id.is_none());
+        assert!(refresh.is_none());
+    }
+
+    #[test]
+    fn test_parse_full_auth_json_return_order() {
+        let json = serde_json::json!({
+            "tokens": {
+                "access_token": "at-123",
+                "refresh_token": "rt-456",
+                "account_id": "acc-789",
+                "id_token": "eyJhbGciOiJSUzI1NiJ9.eyJmZWRyYW1wIjp0cnVlfQ.signature"
+            }
+        });
+        let (access, account, id, refresh) = parse_codex_credential(&json.to_string());
+        assert_eq!(access, "at-123");
+        assert_eq!(account, Some("acc-789".to_string()));
+        assert_eq!(
+            id,
+            Some("eyJhbGciOiJSUzI1NiJ9.eyJmZWRyYW1wIjp0cnVlfQ.signature".to_string())
+        );
+        assert_eq!(refresh, Some("rt-456".to_string()));
+    }
+
+    #[test]
+    fn test_parse_flat_auth_json_return_order() {
+        let json = serde_json::json!({
+            "access_token": "direct-at",
+            "refresh_token": "direct-rt",
+            "account_id": "direct-acc"
+        });
+        let (access, account, id, refresh) = parse_codex_credential(&json.to_string());
+        assert_eq!(access, "direct-at");
+        assert_eq!(account, Some("direct-acc".to_string()));
+        assert!(id.is_none());
+        assert_eq!(refresh, Some("direct-rt".to_string()));
+    }
+
+    #[test]
+    fn test_parse_json_with_jwt_namespace_account_id() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt-123","chatgpt_account_is_fedramp":false}}"#);
+        let id_token = format!("h.{payload}.s");
+        let json = serde_json::json!({
+            "tokens": {
+                "access_token": "at-1",
+                "refresh_token": "rt-1",
+                "id_token": id_token
+            }
+        });
+        let (access, account, id, refresh) = parse_codex_credential(&json.to_string());
+        assert_eq!(access, "at-1");
+        assert_eq!(account, Some("acct-jwt-123".to_string()));
+        assert!(id.is_some());
+        assert_eq!(refresh, Some("rt-1".to_string()));
+    }
+
+    #[test]
+    fn test_parse_json_account_id_from_both_sources() {
+        // auth.json top-level account_id takes precedence over JWT claim
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-from-jwt"}}"#);
+        let id_token = format!("h.{payload}.s");
+        let json = serde_json::json!({
+            "tokens": {
+                "access_token": "at-x",
+                "account_id": "acct-from-json",
+                "id_token": id_token
+            }
+        });
+        let (_, account, _, _) = parse_codex_credential(&json.to_string());
+        assert_eq!(account, Some("acct-from-json".to_string()));
+    }
+
+    // ── FedRAMP detection tests ──
+
+    #[test]
+    fn test_fedramp_top_level_simple() {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"fedramp":true}"#);
+        let id_token = format!("header.{payload}.sig");
+        assert!(check_fedramp(&id_token));
+
+        let payload2 =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"fedramp":false}"#);
+        let id_token2 = format!("header.{payload2}.sig");
+        assert!(!check_fedramp(&id_token2));
+    }
+
+    #[test]
+    fn test_fedramp_openai_namespace() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_is_fedramp":true}}"#);
+        let id_token = format!("h.{payload}.s");
+        assert!(check_fedramp(&id_token));
+
+        let payload2 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_is_fedramp":false}}"#);
+        let id_token2 = format!("h.{payload2}.s");
+        assert!(!check_fedramp(&id_token2));
+    }
+
+    #[test]
+    fn test_fedramp_openai_namespace_wins_over_simple() {
+        // FedRAMP true in namespace overrides false at top level
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"fedramp":false,"https://api.openai.com/auth":{"chatgpt_account_is_fedramp":true}}"#);
+        let id_token = format!("h.{payload}.s");
+        assert!(check_fedramp(&id_token));
+    }
+
+    #[test]
+    fn test_fedramp_no_claims() {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"sub":"user-1"}"#);
+        let id_token = format!("h.{payload}.s");
+        assert!(!check_fedramp(&id_token));
+    }
+
+    // ── build_codex_auth_headers tests ──
+
+    #[test]
+    fn test_build_codex_auth_headers_basic() {
+        let headers = build_codex_auth_headers("access-token", Some("account-id"), None);
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer access-token"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "ChatGPT-Account-ID" && v == "account-id"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "content-type" && v == "application/json"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "version" && v == env!("CARGO_PKG_VERSION")));
+        assert!(!headers.iter().any(|(k, _)| k == "X-OpenAI-Fedramp"));
+    }
+
+    #[test]
+    fn test_build_codex_auth_headers_fedramp_namespace() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"https://api.openai.com/auth":{"chatgpt_account_is_fedramp":true}}"#);
+        let id_token = format!("h.{payload}.s");
+        let headers = build_codex_auth_headers("at", None, Some(&id_token));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "X-OpenAI-Fedramp" && v == "true"));
+    }
+
+    #[test]
+    fn test_build_codex_auth_headers_no_account() {
+        let headers = build_codex_auth_headers("at", None, None);
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "Bearer at"));
+        assert!(!headers.iter().any(|(k, _)| k == "ChatGPT-Account-ID"));
+    }
+
+    // ── JWT expiry tests ──
+
+    #[test]
+    fn test_token_needs_refresh_expired() {
+        // Token with exp in the past (epoch 1)
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(r#"{"exp":1}"#);
+        let token = format!("h.{payload}.s");
+        assert!(token_needs_refresh(&token, 60));
+    }
+
+    #[test]
+    fn test_token_needs_refresh_far_future() {
+        // Token with exp far in the future
+        let far_future = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64)
+            + 86400;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{}}}"#, far_future));
+        let token = format!("h.{payload}.s");
+        assert!(!token_needs_refresh(&token, 60));
+    }
+
+    #[test]
+    fn test_token_needs_refresh_within_skew() {
+        // Token expiring in 30s, skew is 60s — should be "expired"
+        let near_future = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64)
+            + 30;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!(r#"{{"exp":{}}}"#, near_future));
+        let token = format!("h.{payload}.s");
+        assert!(token_needs_refresh(&token, 60));
+    }
+
+    #[test]
+    fn test_token_needs_refresh_opaque() {
+        // Non-JWT tokens can't be checked; assume they don't need refresh
+        assert!(!token_needs_refresh("sk-opaque-token", 60));
+    }
+
+    // ── build_auth_json tests ──
+
+    #[test]
+    fn test_build_auth_json_all_fields() {
+        let json = build_auth_json("at", Some("rt"), Some("acct"), Some("idt"));
+        let parsed: CodexAuth = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.tokens.access_token, "at");
+        assert_eq!(parsed.tokens.refresh_token, Some("rt".to_string()));
+        assert_eq!(parsed.tokens.account_id, Some("acct".to_string()));
+        assert_eq!(parsed.tokens.id_token, Some("idt".to_string()));
+    }
+
+    #[test]
+    fn test_build_auth_json_minimal() {
+        let json = build_auth_json("bare-token", None, None, None);
+        let parsed: Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["tokens"]["access_token"], "bare-token");
+        assert!(parsed["tokens"].get("refresh_token").is_none());
+    }
+
+    // ── Request translation tests ──
+
+    #[test]
+    fn test_openai_to_codex_request_basic() {
+        let openai_req = serde_json::json!({
+            "model": "gpt-5-codex",
+            "messages": [
+                {"role": "system", "content": "You are helpful."},
+                {"role": "user", "content": "Hello"}
+            ],
+            "max_tokens": 100,
+            "temperature": 0.7
+        });
+
+        let result = openai_to_codex_request(&openai_req, "gpt-5-codex");
+
+        assert_eq!(result["model"], "gpt-5-codex");
+        assert_eq!(result["stream"], true);
+        assert_eq!(result["instructions"], "You are helpful.");
+        assert!(result["input"].as_array().unwrap().len() == 1);
+        assert_eq!(result["input"][0]["role"], "user");
+        assert_eq!(result["max_output_tokens"], 100);
+        assert_eq!(result["temperature"], 0.7);
+    }
+
+    #[test]
+    fn test_openai_to_codex_request_tools() {
+        let openai_req = serde_json::json!({
+            "messages": [{"role": "user", "content": "test"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }],
+            "parallel_tool_calls": false
+        });
+
+        let result = openai_to_codex_request(&openai_req, "model");
+        assert_eq!(result["parallel_tool_calls"], false);
+        let tools = result["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn test_openai_to_codex_request_reasoning() {
+        let openai_req = serde_json::json!({
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning_effort": "high"
+        });
+
+        let result = openai_to_codex_request(&openai_req, "model");
+        assert_eq!(result["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn test_openai_to_codex_request_existing_reasoning_object() {
+        let openai_req = serde_json::json!({
+            "messages": [{"role": "user", "content": "test"}],
+            "reasoning": {"effort": "medium", "summary": "auto"}
+        });
+
+        let result = openai_to_codex_request(&openai_req, "model");
+        assert_eq!(result["reasoning"]["effort"], "medium");
+        assert_eq!(result["reasoning"]["summary"], "auto");
+    }
+
+    // ── SSE stream translation tests ──
+
+    fn make_streamer() -> CodexToOpenAIStream<futures::stream::Empty<Result<Bytes, std::io::Error>>>
+    {
+        let counts = Arc::new(Mutex::new(StreamTokenCounts {
+            input_tokens: 0,
+            output_tokens: 0,
+        }));
+        let mut streamer =
+            CodexToOpenAIStream::new(futures::stream::empty(), "test-group".to_string(), counts);
+        streamer.chat_id = "chatcmpl-test".to_string();
+        streamer
+    }
+
+    #[test]
+    fn test_codex_stream_translation_delta() {
+        let mut streamer = make_streamer();
+        let data = r#"{"type":"response.output_text.delta","delta":"Hello"}"#;
+        let result = streamer.translate_event(data).unwrap().unwrap();
+        assert!(result.contains("chat.completion.chunk"));
+        assert!(result.contains("Hello"));
+        assert!(result.contains("assistant")); // role chunk sent first
+    }
+
+    #[test]
+    fn test_codex_stream_translation_completed_nested_usage() {
+        // Usage under `event.response.usage` — the real Codex shape
+        let mut streamer = make_streamer();
+        let data = r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let result = streamer.translate_event(data).unwrap().unwrap();
+        assert!(result.contains("[DONE]"));
+        assert!(result.contains("\"finish_reason\":\"stop\""));
+        let counts = streamer.token_counts.lock().unwrap();
+        assert_eq!(counts.input_tokens, 10);
+        assert_eq!(counts.output_tokens, 5);
+    }
+
+    #[test]
+    fn test_codex_stream_translation_completed_top_level_usage() {
+        // Backward compat: usage at top-level `event.usage`
+        let mut streamer = make_streamer();
+        let data = r#"{"type":"response.completed","usage":{"input_tokens":7,"output_tokens":3}}"#;
+        let result = streamer.translate_event(data).unwrap().unwrap();
+        assert!(result.contains("[DONE]"));
+        let counts = streamer.token_counts.lock().unwrap();
+        assert_eq!(counts.input_tokens, 7);
+        assert_eq!(counts.output_tokens, 3);
+    }
+
+    #[test]
+    fn test_codex_stream_translation_failed_is_error() {
+        let mut streamer = make_streamer();
+        let data =
+            r#"{"type":"response.failed","response":{"status_details":"rate_limit_exceeded"}}"#;
+        let result = streamer.translate_event(data);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("rate_limit_exceeded"));
+    }
+
+    #[test]
+    fn test_codex_stream_translation_incomplete_is_error() {
+        let mut streamer = make_streamer();
+        let data = r#"{"type":"response.incomplete"}"#;
+        let result = streamer.translate_event(data);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("response.incomplete"));
+    }
+}

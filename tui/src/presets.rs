@@ -57,7 +57,14 @@ fn mo_proto(id: &str, ctx: u64, max_out: u64, proto: &str) -> ProviderModel {
     }
 }
 
-fn mo_full_proto(id: &str, ctx: u64, max_out: u64, inp: f64, out: f64, proto: &str) -> ProviderModel {
+fn mo_full_proto(
+    id: &str,
+    ctx: u64,
+    max_out: u64,
+    inp: f64,
+    out: f64,
+    proto: &str,
+) -> ProviderModel {
     ProviderModel {
         id: id.to_string(),
         context_window: Some(ctx),
@@ -192,6 +199,14 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             model_overrides: vec![],
         },
         ProviderPreset {
+            id: "openai-codex",
+            name: "OpenAI Codex",
+            base_url: "https://chatgpt.com/backend-api/codex",
+            protocol: "openai-codex",
+            description: "Codex GPT models via ChatGPT device login",
+            model_overrides: vec![],
+        },
+        ProviderPreset {
             id: "anthropic",
             name: "Anthropic",
             base_url: "https://api.anthropic.com",
@@ -224,7 +239,8 @@ pub fn provider_presets() -> Vec<ProviderPreset> {
             name: "CrofAI",
             base_url: "https://crof.ai/v1",
             protocol: "openai",
-            description: "World's cheapest inference — quantized OSS models, zero data retention, from $5/mo",
+            description:
+                "World's cheapest inference — quantized OSS models, zero data retention, from $5/mo",
             model_overrides: vec![],
         },
     ]

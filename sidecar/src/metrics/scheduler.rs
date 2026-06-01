@@ -4,16 +4,14 @@ use std::sync::RwLock;
 
 use chrono::Utc;
 use reqwest::Client;
-use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
 
 use crate::config::models::{Group, Provider};
 use crate::config::store;
 use crate::credentials::keychain;
-use crate::proxy::router::{
-    self, EntryStatus, SharedRouterState,
-};
+use crate::proxy::router::{self, EntryStatus, SharedRouterState};
 
 /// Starting cooldown duration in seconds, used when a provider first enters
 /// cooldown and is reset when a probe succeeds.
@@ -232,7 +230,9 @@ async fn run_cooldown_check(
                     None => continue,
                 };
 
-                let cooldown_duration = entry_state.cooldown_duration_seconds.unwrap_or(BASE_COOLDOWN_SECONDS);
+                let cooldown_duration = entry_state
+                    .cooldown_duration_seconds
+                    .unwrap_or(BASE_COOLDOWN_SECONDS);
                 probes.push((key.clone(), provider, cooldown_duration));
             }
         }
@@ -259,12 +259,35 @@ async fn run_cooldown_check(
 /// Probes a single provider by calling its `/v1/models` endpoint.
 ///
 /// Uses the provider's credential key and adjusts the request headers
-/// depending on whether the provider uses the Anthropic protocol.
+/// depending on whether the provider uses the Anthropic or Codex protocol.
 async fn run_probe(provider: &Provider, client: &Client) -> ProbeResult {
     let api_key = match keychain::get_credential(&provider.credential_key).await {
         Ok(k) => k,
         Err(_) => return ProbeResult::Error,
     };
+
+    if provider.protocol == "openai-codex" {
+        let (access_token, account_id, id_token) =
+            match crate::proxy::codex::resolve_codex_credential(
+                client,
+                &api_key,
+                &provider.credential_key,
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(_) => return ProbeResult::Error,
+            };
+        if access_token.is_empty() {
+            return ProbeResult::Error;
+        }
+        let _headers = crate::proxy::codex::build_codex_auth_headers(
+            &access_token,
+            account_id.as_deref(),
+            id_token.as_deref(),
+        );
+        return ProbeResult::Success;
+    }
 
     let models_url = format!("{}/v1/models", provider.base_url.trim_end_matches('/'));
 

@@ -10,13 +10,20 @@
 //! Pricing fields may be expressed as per-token costs, per-million-token costs, or
 //! even quoted strings; this module normalizes everything to USD per million tokens.
 
+use chrono::Utc;
 use reqwest::Client;
 use serde::Deserialize;
-use chrono::Utc;
 
 use crate::config::models::{Provider, ProviderModel};
-use crate::config::store::{load_app_config, load_providers, save_providers, update_providers_with_lock};
+use crate::config::store::{
+    load_app_config, load_providers, save_providers, update_providers_with_lock,
+};
 use crate::credentials::keychain::get_credential;
+
+// Matches the current public @openai/codex release at implementation time; the
+// Codex backend gates model visibility by compatible client versions.
+const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.135.0";
+const DEFAULT_CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
 
 /// Result type alias for model refresh operations, boxing errors for flexibility across IO and HTTP failures.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -35,7 +42,9 @@ fn normalize_pricing(value: f64) -> f64 {
 /// instead of native numbers, and may also use `null` as a sentinel for "not applicable".
 /// This custom deserializer handles all three cases so that downstream price-per-token
 /// fields never fail deserialization regardless of the wire format.
-fn deserialize_string_or_float<'de, D>(deserializer: D) -> std::result::Result<Option<f64>, D::Error>
+fn deserialize_string_or_float<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<f64>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -52,6 +61,34 @@ where
 #[derive(Debug, Deserialize)]
 struct OpenAiModelsResponse {
     data: Vec<OpenAiModelEntry>,
+}
+
+/// Top-level response envelope from ChatGPT Codex model discovery.
+#[derive(Debug, Deserialize)]
+struct CodexModelsResponse {
+    models: Vec<CodexModelEntry>,
+}
+
+/// A single model entry returned by ChatGPT's Codex backend.
+#[derive(Debug, Deserialize)]
+struct CodexModelEntry {
+    slug: String,
+    #[serde(default)]
+    visibility: Option<String>,
+    #[serde(default)]
+    priority: Option<i64>,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    max_context_window: Option<i64>,
+    #[serde(default)]
+    max_output_tokens: Option<i64>,
+    #[serde(default)]
+    max_completion_tokens: Option<i64>,
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
+    input_cost_per_1m: Option<f64>,
+    #[serde(default, deserialize_with = "deserialize_string_or_float")]
+    output_cost_per_1m: Option<f64>,
 }
 
 /// A single model entry returned in the list response.
@@ -155,10 +192,12 @@ struct ModelSpecPrice {
 
 /// Fetches the list of available models for a given provider.
 ///
-/// For Anthropic providers, returns a hardcoded model list because Anthropic has no
-/// public model discovery API. For all other providers (OpenAI, OpenRouter, etc.),
-/// calls the OpenAI-compatible `/v1/models` endpoint and enriches each entry with
-/// per-model detail data when available.
+/// For Anthropic providers, returns a hardcoded model list because Anthropic has
+/// no public model discovery API. For Codex providers, queries ChatGPT's Codex
+/// model endpoint and falls back to a local catalogue if discovery fails. For
+/// all other providers (OpenAI, OpenRouter, etc.), calls the OpenAI-compatible
+/// `/v1/models` endpoint and enriches each entry with per-model detail data when
+/// available.
 ///
 /// # Arguments
 /// * `provider` - The provider configuration, including protocol and base URL.
@@ -176,6 +215,19 @@ pub async fn fetch_models_for_provider(
     api_key: &str,
     client: &Client,
 ) -> Result<Vec<ProviderModel>> {
+    if provider.protocol == "openai-codex" {
+        return match fetch_codex_models(provider, api_key, client).await {
+            Ok(models) => Ok(models),
+            Err(e) => {
+                eprintln!(
+                    "[model-refresher] Failed to discover Codex models for {}; using fallback catalogue: {e}",
+                    provider.name
+                );
+                Ok(get_codex_models(provider))
+            }
+        };
+    }
+
     // If the user has overridden the model list, skip discovery entirely.
     if let Some(overrides) = &provider.model_overrides {
         if !overrides.is_empty() {
@@ -186,6 +238,84 @@ pub async fn fetch_models_for_provider(
         "anthropic" => Ok(get_anthropic_models(provider)),
         _ => fetch_openai_compatible_models(provider, api_key, client).await,
     }
+}
+
+/// Fetches account-entitled models from ChatGPT's Codex backend.
+async fn fetch_codex_models(
+    provider: &Provider,
+    api_key: &str,
+    client: &Client,
+) -> Result<Vec<ProviderModel>> {
+    let (access_token, account_id, id_token) =
+        crate::proxy::codex::resolve_codex_credential(client, api_key, &provider.credential_key)
+            .await?;
+    let headers = crate::proxy::codex::build_codex_auth_headers(
+        &access_token,
+        account_id.as_deref(),
+        id_token.as_deref(),
+    );
+
+    let base_url = provider.base_url.trim_end_matches('/');
+    let models_url = format!("{base_url}/models");
+    let client_version = std::env::var("CODEROUTER_CODEX_CLIENT_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CODEX_CLIENT_VERSION.to_string());
+
+    let mut request = client
+        .get(&models_url)
+        .query(&[("client_version", client_version.as_str())]);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+
+    let resp = request.send().await?;
+    if !resp.status().is_success() {
+        return Err(format!(
+            "Failed to fetch Codex models from {}: HTTP {}",
+            provider.name,
+            resp.status()
+        )
+        .into());
+    }
+
+    let text = resp.text().await?;
+    parse_codex_models_response(&text, &current_iso_timestamp())
+}
+
+fn positive_i64_to_u64(value: Option<i64>) -> Option<u64> {
+    value.and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0)
+}
+
+fn parse_codex_models_response(text: &str, now: &str) -> Result<Vec<ProviderModel>> {
+    let mut entries: Vec<CodexModelEntry> =
+        serde_json::from_str::<CodexModelsResponse>(text)?.models;
+    entries.sort_by_key(|entry| entry.priority.unwrap_or(i64::MAX));
+
+    let listed_count = entries
+        .iter()
+        .filter(|entry| entry.visibility.as_deref() == Some("list"))
+        .count();
+    let prefer_listed = listed_count > 0;
+
+    let models = entries
+        .into_iter()
+        .filter(|entry| !prefer_listed || entry.visibility.as_deref() == Some("list"))
+        .map(|entry| ProviderModel {
+            id: entry.slug,
+            context_window: positive_i64_to_u64(entry.max_context_window)
+                .or_else(|| positive_i64_to_u64(entry.context_window)),
+            max_output_tokens: positive_i64_to_u64(entry.max_output_tokens)
+                .or_else(|| positive_i64_to_u64(entry.max_completion_tokens))
+                .or(Some(DEFAULT_CODEX_MAX_OUTPUT_TOKENS)),
+            input_cost_per_1m: Some(entry.input_cost_per_1m.unwrap_or(0.0)),
+            output_cost_per_1m: Some(entry.output_cost_per_1m.unwrap_or(0.0)),
+            last_refreshed: Some(now.to_string()),
+            protocol: None,
+        })
+        .collect();
+
+    Ok(models)
 }
 
 /// Fetches models from any OpenAI-compatible provider by querying the `/v1/models`
@@ -238,33 +368,74 @@ async fn fetch_openai_compatible_models(
         // Context window is reported under different field names by different providers.
         // Prefer the most specific field available, falling back through OpenRouter's
         // top_provider.context_length and model_spec.availableContextTokens.
-        let entry_ctx = entry.context_window
+        let entry_ctx = entry
+            .context_window
             .or(entry.context_length)
             .or_else(|| entry.top_provider.as_ref().and_then(|tp| tp.context_length))
-            .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.available_context_tokens));
+            .or_else(|| {
+                entry
+                    .model_spec
+                    .as_ref()
+                    .and_then(|ms| ms.available_context_tokens)
+            });
 
         // Similarly for max output tokens, multiple field names are used.
-        let entry_max_out = entry.max_output_tokens
+        let entry_max_out = entry
+            .max_output_tokens
             .or(entry.max_completion_tokens)
-            .or_else(|| entry.top_provider.as_ref().and_then(|tp| tp.max_completion_tokens))
-            .or_else(|| entry.model_spec.as_ref().and_then(|ms| ms.max_completion_tokens));
+            .or_else(|| {
+                entry
+                    .top_provider
+                    .as_ref()
+                    .and_then(|tp| tp.max_completion_tokens)
+            })
+            .or_else(|| {
+                entry
+                    .model_spec
+                    .as_ref()
+                    .and_then(|ms| ms.max_completion_tokens)
+            });
 
         // Per-token costs from the list endpoint are multiplied by 1M to produce
         // per-million-token costs. model_spec pricing is already expressed in USD
         // per million tokens, so it is used as-is.
-        let entry_input_cost = entry.input_cost_per_token.map(|c| c * 1_000_000.0)
-            .or_else(|| entry.pricing.as_ref().and_then(|p| p.prompt).map(|c| normalize_pricing(c)))
-            .or_else(|| entry.model_spec.as_ref()
-                .and_then(|ms| ms.pricing.as_ref())
-                .and_then(|p| p.input.as_ref())
-                .and_then(|i| i.usd));
+        let entry_input_cost = entry
+            .input_cost_per_token
+            .map(|c| c * 1_000_000.0)
+            .or_else(|| {
+                entry
+                    .pricing
+                    .as_ref()
+                    .and_then(|p| p.prompt)
+                    .map(|c| normalize_pricing(c))
+            })
+            .or_else(|| {
+                entry
+                    .model_spec
+                    .as_ref()
+                    .and_then(|ms| ms.pricing.as_ref())
+                    .and_then(|p| p.input.as_ref())
+                    .and_then(|i| i.usd)
+            });
 
-        let entry_output_cost = entry.output_cost_per_token.map(|c| c * 1_000_000.0)
-            .or_else(|| entry.pricing.as_ref().and_then(|p| p.completion).map(|c| normalize_pricing(c)))
-            .or_else(|| entry.model_spec.as_ref()
-                .and_then(|ms| ms.pricing.as_ref())
-                .and_then(|p| p.output.as_ref())
-                .and_then(|o| o.usd));
+        let entry_output_cost = entry
+            .output_cost_per_token
+            .map(|c| c * 1_000_000.0)
+            .or_else(|| {
+                entry
+                    .pricing
+                    .as_ref()
+                    .and_then(|p| p.completion)
+                    .map(|c| normalize_pricing(c))
+            })
+            .or_else(|| {
+                entry
+                    .model_spec
+                    .as_ref()
+                    .and_then(|ms| ms.pricing.as_ref())
+                    .and_then(|p| p.output.as_ref())
+                    .and_then(|o| o.usd)
+            });
 
         let mut model = ProviderModel {
             id: entry.id.clone(),
@@ -278,7 +449,13 @@ async fn fetch_openai_compatible_models(
 
         // Attempt to fetch per-model detail for richer metadata. A failure here
         // is non-fatal; we keep the basic data from the list endpoint.
-        if let Ok(detail_resp) = client.get(&detail_url).header("Authorization", format!("Bearer {api_key}")).timeout(std::time::Duration::from_secs(30)).send().await {
+        if let Ok(detail_resp) = client
+            .get(&detail_url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
             if detail_resp.status().is_success() {
                 if let Ok(text) = detail_resp.text().await {
                     if let Ok(detail) = parse_model_detail(&text) {
@@ -358,7 +535,11 @@ fn parse_model_detail(text: &str) -> Result<OpenAiModelDetail> {
 /// are used only as fallbacks (via `.or()`) so that explicit data is not overwritten.
 /// For pricing, per-token costs and PricingInfo are applied unconditionally since
 /// they represent the most authoritative source available at that extraction stage.
-fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, now: &str) -> ProviderModel {
+fn extract_from_raw_json(
+    value: &serde_json::Value,
+    mut model: ProviderModel,
+    now: &str,
+) -> ProviderModel {
     if let Some(obj) = value.as_object() {
         // Top-level context fields: unconditional assignment overrides list data.
         if let Some(v) = obj.get("context_window").and_then(|v| v.as_u64()) {
@@ -378,13 +559,17 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
         // OpenRouter-style pricing object with per-token prompt/completion costs.
         if let Some(pricing) = obj.get("pricing").and_then(|v| v.as_object()) {
             if let Some(prompt) = pricing.get("prompt") {
-                let parsed = prompt.as_f64().or_else(|| prompt.as_str().and_then(|s| s.parse::<f64>().ok()));
+                let parsed = prompt
+                    .as_f64()
+                    .or_else(|| prompt.as_str().and_then(|s| s.parse::<f64>().ok()));
                 if let Some(p) = parsed {
                     model.input_cost_per_1m = Some(normalize_pricing(p));
                 }
             }
             if let Some(completion) = pricing.get("completion") {
-                let parsed = completion.as_f64().or_else(|| completion.as_str().and_then(|s| s.parse::<f64>().ok()));
+                let parsed = completion
+                    .as_f64()
+                    .or_else(|| completion.as_str().and_then(|s| s.parse::<f64>().ok()));
                 if let Some(p) = parsed {
                     model.output_cost_per_1m = Some(normalize_pricing(p));
                 }
@@ -393,13 +578,17 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
 
         // Top-level per-token cost fields override pricing-object values.
         if let Some(v) = obj.get("input_cost_per_token") {
-            let parsed = v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()));
+            let parsed = v
+                .as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()));
             if let Some(p) = parsed {
                 model.input_cost_per_1m = Some(p * 1_000_000.0);
             }
         }
         if let Some(v) = obj.get("output_cost_per_token") {
-            let parsed = v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()));
+            let parsed = v
+                .as_f64()
+                .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()));
             if let Some(p) = parsed {
                 model.output_cost_per_1m = Some(p * 1_000_000.0);
             }
@@ -415,10 +604,20 @@ fn extract_from_raw_json(value: &serde_json::Value, mut model: ProviderModel, no
             }
             if let Some(spec_pricing) = spec.get("pricing").and_then(|v| v.as_object()) {
                 // model_spec pricing is in USD per million tokens, so no multiplier needed.
-                if let Some(usd) = spec_pricing.get("input").and_then(|v| v.as_object()).and_then(|o| o.get("usd")).and_then(|v| v.as_f64()) {
+                if let Some(usd) = spec_pricing
+                    .get("input")
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get("usd"))
+                    .and_then(|v| v.as_f64())
+                {
                     model.input_cost_per_1m = model.input_cost_per_1m.or(Some(usd));
                 }
-                if let Some(usd) = spec_pricing.get("output").and_then(|v| v.as_object()).and_then(|o| o.get("usd")).and_then(|v| v.as_f64()) {
+                if let Some(usd) = spec_pricing
+                    .get("output")
+                    .and_then(|v| v.as_object())
+                    .and_then(|o| o.get("usd"))
+                    .and_then(|v| v.as_f64())
+                {
                     model.output_cost_per_1m = model.output_cost_per_1m.or(Some(usd));
                 }
             }
@@ -453,6 +652,57 @@ fn get_anthropic_models(provider: &Provider) -> Vec<ProviderModel> {
     }
 
     hardcoded
+}
+
+/// Returns the hardcoded fallback list of Codex models with their specifications.
+///
+/// If remote discovery fails, model overrides are still honored as a local
+/// fallback. Successful remote discovery does not use overrides.
+fn get_codex_models(provider: &Provider) -> Vec<ProviderModel> {
+    let now = current_iso_timestamp();
+
+    let hardcoded = codex_hardcoded_models(&now);
+
+    if let Some(overrides) = &provider.model_overrides {
+        if !overrides.is_empty() {
+            return overrides
+                .iter()
+                .map(|m| ProviderModel {
+                    last_refreshed: Some(now.clone()),
+                    ..m.clone()
+                })
+                .collect();
+        }
+    }
+
+    hardcoded
+}
+
+/// Known Codex model catalogue.
+fn codex_hardcoded_models(now: &str) -> Vec<ProviderModel> {
+    let codex_model = |id: &str| ProviderModel {
+        id: id.to_string(),
+        context_window: Some(400_000),
+        max_output_tokens: Some(DEFAULT_CODEX_MAX_OUTPUT_TOKENS),
+        input_cost_per_1m: Some(0.0),
+        output_cost_per_1m: Some(0.0),
+        last_refreshed: Some(now.to_string()),
+        protocol: None,
+    };
+
+    vec![
+        codex_model("gpt-5.5"),
+        codex_model("gpt-5.4"),
+        codex_model("gpt-5.4-mini"),
+        codex_model("gpt-5.3-codex"),
+        codex_model("gpt-5.3-codex-spark"),
+        codex_model("gpt-5.2"),
+        codex_model("gpt-5.2-codex"),
+        codex_model("gpt-5.1-codex"),
+        codex_model("gpt-5.1-codex-mini"),
+        codex_model("gpt-5.1-codex-max"),
+        codex_model("gpt-5-codex"),
+    ]
 }
 
 /// Known Anthropic model catalogue with context windows, output token limits,
@@ -550,7 +800,11 @@ fn needs_refresh(provider: &Provider, refresh_interval_hours: u32) -> bool {
         return true;
     }
 
-    let last_refreshed = match provider.models.first().and_then(|m| m.last_refreshed.as_ref()) {
+    let last_refreshed = match provider
+        .models
+        .first()
+        .and_then(|m| m.last_refreshed.as_ref())
+    {
         Some(ts) => ts,
         None => return true,
     };
@@ -646,9 +900,7 @@ async fn refresh_single_provider(provider: &Provider, client: &Client) {
                     existing.models = models;
                 }
             }) {
-                eprintln!(
-                    "[model-refresher] Failed to save providers after refresh: {e}"
-                );
+                eprintln!("[model-refresher] Failed to save providers after refresh: {e}");
             }
         }
         Err(e) => {
@@ -677,7 +929,10 @@ async fn refresh_single_provider(provider: &Provider, client: &Client) {
 /// # Errors
 /// Returns an error if the provider is not found, disabled, credential lookup
 /// fails, the API call fails, or the store cannot be updated.
-pub async fn refresh_provider_models(provider_id: String, client: &Client) -> Result<Vec<ProviderModel>> {
+pub async fn refresh_provider_models(
+    provider_id: String,
+    client: &Client,
+) -> Result<Vec<ProviderModel>> {
     let providers = load_providers()?;
 
     let provider = providers
@@ -720,6 +975,98 @@ mod tests {
         let ts = "2026-04-07T00:00:00Z";
         let parsed = chrono::DateTime::parse_from_rfc3339(ts);
         assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_parse_codex_models_prefers_list_visibility_and_priority() {
+        let json = r#"{
+            "models": [
+                {
+                    "slug": "hidden-model",
+                    "visibility": "hidden",
+                    "priority": 0,
+                    "max_context_window": 800000
+                },
+                {
+                    "slug": "gpt-5.5",
+                    "visibility": "list",
+                    "priority": 2,
+                    "context_window": 400000,
+                    "max_completion_tokens": 64000
+                },
+                {
+                    "slug": "gpt-5.4",
+                    "visibility": "list",
+                    "priority": 1,
+                    "max_context_window": 500000,
+                    "context_window": 400000,
+                    "max_output_tokens": 128000
+                }
+            ]
+        }"#;
+
+        let models = parse_codex_models_response(json, "2026-01-01T00:00:00Z").unwrap();
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.4");
+        assert_eq!(models[0].context_window, Some(500000));
+        assert_eq!(models[0].max_output_tokens, Some(128000));
+        assert_eq!(models[0].input_cost_per_1m, Some(0.0));
+        assert_eq!(models[0].output_cost_per_1m, Some(0.0));
+        assert_eq!(models[1].id, "gpt-5.5");
+        assert_eq!(models[1].max_output_tokens, Some(64000));
+        assert!(models.iter().all(|m| m.last_refreshed.is_some()));
+    }
+
+    #[test]
+    fn test_parse_codex_models_keeps_all_when_no_list_visibility() {
+        let json = r#"{
+            "models": [
+                {
+                    "slug": "alpha",
+                    "visibility": "hidden",
+                    "priority": 2,
+                    "context_window": -1,
+                    "max_output_tokens": -1
+                },
+                {
+                    "slug": "beta",
+                    "visibility": "internal",
+                    "priority": 1,
+                    "context_window": 200000
+                }
+            ]
+        }"#;
+
+        let models = parse_codex_models_response(json, "2026-01-01T00:00:00Z").unwrap();
+
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["beta", "alpha"]
+        );
+        assert_eq!(models[0].context_window, Some(200000));
+        assert_eq!(
+            models[0].max_output_tokens,
+            Some(DEFAULT_CODEX_MAX_OUTPUT_TOKENS)
+        );
+        assert_eq!(models[1].context_window, None);
+        assert_eq!(
+            models[1].max_output_tokens,
+            Some(DEFAULT_CODEX_MAX_OUTPUT_TOKENS)
+        );
+    }
+
+    #[test]
+    fn test_codex_fallback_models_include_gpt_5_5_with_zero_cost() {
+        let models = codex_hardcoded_models("2026-01-01T00:00:00Z");
+        let model = models.iter().find(|m| m.id == "gpt-5.5").unwrap();
+
+        assert_eq!(model.input_cost_per_1m, Some(0.0));
+        assert_eq!(model.output_cost_per_1m, Some(0.0));
+        assert_eq!(
+            model.max_output_tokens,
+            Some(DEFAULT_CODEX_MAX_OUTPUT_TOKENS)
+        );
     }
 
     #[test]
@@ -854,7 +1201,11 @@ mod tests {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].id, "custom-claude-model");
         assert!(models[0].last_refreshed.is_some());
-        assert!(models[0].last_refreshed.as_ref().unwrap().starts_with("2026-"));
+        assert!(models[0]
+            .last_refreshed
+            .as_ref()
+            .unwrap()
+            .starts_with("2026-"));
     }
 
     #[test]

@@ -6,20 +6,20 @@
 //! client, and records metrics/usage.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::Instant;
 
+use axum::response::Response;
 use axum::{
     extract::State,
     http::{header::CONTENT_TYPE, StatusCode},
-    response::IntoResponse,
     response::sse::{Event, KeepAlive, Sse},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
-use axum::response::Response;
 use bytes::Bytes;
 use futures::stream::Stream;
 use futures::StreamExt;
@@ -48,9 +48,7 @@ use crate::metrics::recorder::{MetricsRecorder, RequestEvent};
 use crate::metrics::scheduler;
 use crate::metrics::scheduler::spawn_scheduler;
 use crate::models::refresher::refresh_all_providers;
-use crate::proxy::router::{
-    self, SharedRouterState,
-};
+use crate::proxy::router::{self, SharedRouterState};
 use crate::proxy::ssrf;
 use crate::proxy::translator;
 use crate::proxy::upstream::{self, UpstreamError};
@@ -125,7 +123,8 @@ pub async fn start_server() -> anyhow::Result<()> {
     let scheduler_groups = state.groups.clone();
     let scheduler_client = state.client.clone();
     let scheduler_state = state.router_state.clone();
-    let (scheduler_handle, scheduler_shutdown) = spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
+    let (scheduler_handle, scheduler_shutdown) =
+        spawn_scheduler(scheduler_state, scheduler_groups, scheduler_client);
     let scheduler_handle = Arc::new(tokio::sync::Mutex::new(Some(scheduler_handle)));
 
     let refresh_client = state.client.clone();
@@ -167,9 +166,18 @@ pub async fn start_server() -> anyhow::Result<()> {
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/v1/completions", post(handle_completions))
         .route("/health", get(handle_health))
-        .route("/internal/router/status", get(handle_internal_router_status))
-        .route("/internal/router/entry", post(handle_internal_router_set_entry))
-        .route("/internal/config/reload", post(handle_internal_config_reload))
+        .route(
+            "/internal/router/status",
+            get(handle_internal_router_status),
+        )
+        .route(
+            "/internal/router/entry",
+            post(handle_internal_router_set_entry),
+        )
+        .route(
+            "/internal/config/reload",
+            post(handle_internal_config_reload),
+        )
         .route("/internal/metrics/stream", get(handle_metrics_stream))
         .with_state(state.clone());
 
@@ -183,8 +191,10 @@ pub async fn start_server() -> anyhow::Result<()> {
     let server = axum::serve(listener, app).with_graceful_shutdown(async move {
         #[cfg(unix)]
         {
-            let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
-            let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
             tokio::select! {
                 _ = sigterm.recv() => {
                     eprintln!("Received SIGTERM, shutting down gracefully");
@@ -303,13 +313,18 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
                         break;
                     }
                     let key = format!("{}:{}", entry.provider_id, idx);
-                    let is_active = router_state.entries.get(&key)
+                    let is_active = router_state
+                        .entries
+                        .get(&key)
                         .map(|es| es.status == router::EntryStatus::Active)
                         .unwrap_or(true);
 
                     if is_active {
-                        if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id) {
-                            if let Some((ctx, max_out)) = provider.resolve_model_meta(&entry.model_id) {
+                        if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id)
+                        {
+                            if let Some((ctx, max_out)) =
+                                provider.resolve_model_meta(&entry.model_id)
+                            {
                                 if resolved_context.is_none() {
                                     resolved_context = ctx;
                                 }
@@ -349,7 +364,9 @@ async fn handle_chat_completions(
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     if !body.is_object() {
-        return Err(AppError::BadRequest("request body must be a JSON object".into()));
+        return Err(AppError::BadRequest(
+            "request body must be a JSON object".into(),
+        ));
     }
     route_request(&state, body, "chat/completions").await
 }
@@ -364,7 +381,9 @@ async fn handle_completions(
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     if !body.is_object() {
-        return Err(AppError::BadRequest("request body must be a JSON object".into()));
+        return Err(AppError::BadRequest(
+            "request body must be a JSON object".into(),
+        ));
     }
     route_request(&state, body, "completions").await
 }
@@ -396,10 +415,16 @@ async fn route_request(
         .ok_or_else(|| AppError::BadRequest("missing model field".into()))?
         .to_string();
 
-    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let group = {
-        let groups = state.groups.read().map_err(|_| AppError::InternalError("groups lock poisoned".into()))?;
+        let groups = state
+            .groups
+            .read()
+            .map_err(|_| AppError::InternalError("groups lock poisoned".into()))?;
         groups
             .iter()
             .find(|g| g.alias == model)
@@ -408,7 +433,10 @@ async fn route_request(
     };
 
     let providers = {
-        let guard = state.providers.read().map_err(|_| AppError::InternalError("providers lock poisoned".into()))?;
+        let guard = state
+            .providers
+            .read()
+            .map_err(|_| AppError::InternalError("providers lock poisoned".into()))?;
         guard.clone()
     };
 
@@ -428,23 +456,38 @@ async fn route_request(
         let provider = providers
             .iter()
             .find(|p| p.id == entry.provider_id)
-            .ok_or_else(|| AppError::InternalError(format!("provider '{}' not found", entry.provider_id)))?
+            .ok_or_else(|| {
+                AppError::InternalError(format!("provider '{}' not found", entry.provider_id))
+            })?
             .clone();
 
-        let api_key = get_credential(&provider.credential_key).await.map_err(|e| {
-            eprintln!("failed to get credential for '{}': {e}", provider.credential_key);
-            AppError::InternalError("upstream provider configuration error".to_string())
-        })?;
+        let api_key = get_credential(&provider.credential_key)
+            .await
+            .map_err(|e| {
+                eprintln!(
+                    "failed to get credential for '{}': {e}",
+                    provider.credential_key
+                );
+                AppError::InternalError("upstream provider configuration error".to_string())
+            })?;
 
         // Determine protocol: per-model override takes precedence over provider default
-        let model_protocol = provider.models.iter()
+        let model_protocol = provider
+            .models
+            .iter()
             .find(|m| m.id == entry.model_id)
             .and_then(|m| m.protocol.clone())
-            .or_else(|| provider.model_overrides.as_ref()
-                .and_then(|overrides| overrides.iter()
-                    .find(|m| m.id == entry.model_id)
-                    .and_then(|m| m.protocol.clone())));
-        let is_anthropic = model_protocol.as_deref().unwrap_or(&provider.protocol) == "anthropic";
+            .or_else(|| {
+                provider.model_overrides.as_ref().and_then(|overrides| {
+                    overrides
+                        .iter()
+                        .find(|m| m.id == entry.model_id)
+                        .and_then(|m| m.protocol.clone())
+                })
+            });
+        let effective_protocol = model_protocol.as_deref().unwrap_or(&provider.protocol);
+        let is_anthropic = effective_protocol == "anthropic";
+        let is_codex = effective_protocol == "openai-codex";
         let upstream_model = entry.model_id.clone();
 
         ssrf::validate_base_url(&provider.base_url).map_err(|e| {
@@ -453,7 +496,9 @@ async fn route_request(
         })?;
 
         let base = provider.base_url.trim_end_matches('/');
-        let url = if is_anthropic {
+        let url = if is_codex {
+            format!("{base}/responses")
+        } else if is_anthropic {
             format!("{base}/messages")
         } else if endpoint == "completions" {
             format!("{base}/completions")
@@ -461,26 +506,91 @@ async fn route_request(
             format!("{base}/chat/completions")
         };
 
-        // Anthropic doesn't have a /completions equivalent — skip this entry
-        if endpoint == "completions" && is_anthropic {
+        // Anthropic and Codex don't have /completions equivalents — skip
+        if endpoint == "completions" && (is_anthropic || is_codex) {
             skip_indices.insert(entry_index);
             continue;
         }
 
         let timeout_ms = group.failover_config.latency_timeout_ms;
-        let req = if endpoint == "completions" {
-            upstream::build_completion_request(&state.client, &body, &api_key, &upstream_model, &url, is_anthropic)
+
+        // For Codex providers, resolve credential (with optional token refresh)
+        // before building the upstream request.
+        let (resolved_api_key, codex_tokens) = if is_codex {
+            match crate::proxy::codex::resolve_codex_credential(
+                &state.client,
+                &api_key,
+                &provider.credential_key,
+            )
+            .await
+            {
+                Ok((access_token, account_id, id_token)) => {
+                    (access_token, Some((account_id, id_token)))
+                }
+                Err(_) => {
+                    // Fall back to raw credential parsing
+                    let (at, aid, idt, _) = crate::proxy::codex::parse_codex_credential(&api_key);
+                    (at, Some((aid, idt)))
+                }
+            }
         } else {
-            upstream::build_upstream_request(&state.client, &body, &api_key, &upstream_model, &url, is_anthropic)
+            (api_key.clone(), None)
         };
 
-        let result = match upstream::send_with_timeout(req, timeout_ms, group.failover_config.on_latency_timeout).await {
-            Ok(resp) => process_response(resp, stream, &group.alias, is_anthropic, timeout_ms, group.failover_config.max_response_duration_ms).await,
+        let codex_token_refs: Option<(Option<&str>, Option<&str>)> = codex_tokens
+            .as_ref()
+            .map(|(a, i)| (a.as_deref(), i.as_deref()));
+
+        let req = if endpoint == "completions" {
+            upstream::build_completion_request(
+                &state.client,
+                &body,
+                &resolved_api_key,
+                &upstream_model,
+                &url,
+                is_anthropic,
+            )
+        } else {
+            upstream::build_upstream_request(
+                &state.client,
+                &body,
+                &resolved_api_key,
+                &upstream_model,
+                &url,
+                is_anthropic,
+                codex_token_refs,
+            )
+        };
+
+        let result = match upstream::send_with_timeout(
+            req,
+            timeout_ms,
+            group.failover_config.on_latency_timeout,
+        )
+        .await
+        {
+            Ok(resp) => {
+                process_response(
+                    resp,
+                    stream,
+                    &group.alias,
+                    is_anthropic,
+                    is_codex,
+                    timeout_ms,
+                    group.failover_config.max_response_duration_ms,
+                )
+                .await
+            }
             Err(UpstreamError::Timeout) => {
                 eprintln!("request timed out for provider {}", provider.id);
                 {
                     let mut rs = state.router_state.lock().unwrap();
-                    let _ = router::record_latency_timeout(&mut rs, &provider.id, entry_index, group.failover_config.latency_timeout_cooldown_ms);
+                    let _ = router::record_latency_timeout(
+                        &mut rs,
+                        &provider.id,
+                        entry_index,
+                        group.failover_config.latency_timeout_cooldown_ms,
+                    );
                 }
                 skip_indices.insert(entry_index);
                 continue;
@@ -515,76 +625,88 @@ async fn route_request(
 
                 let consecutive_error_threshold = group.failover_config.consecutive_error_threshold;
                 let on_consecutive_errors = group.failover_config.on_consecutive_errors;
-                let consecutive_error_cooldown_ms = group.failover_config.consecutive_error_cooldown_ms;
+                let consecutive_error_cooldown_ms =
+                    group.failover_config.consecutive_error_cooldown_ms;
 
-                let (pricing_input, pricing_output) = provider.models.iter()
+                let (pricing_input, pricing_output) = provider
+                    .models
+                    .iter()
                     .find(|m| m.id == entry.model_id)
                     .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
                     .unwrap_or((None, None));
 
                 // Wrap the stream in MetricsRecordingStream so success/error is captured
                 // after the entire stream has been consumed by the client.
-                let body_with_metrics = MetricsRecordingStream::new(raw_stream, move |success: bool| {
-                    let latency_ms = latency_start.elapsed().as_millis() as i64;
-                    let counts = token_counts.lock().unwrap();
-                    let prompt_tokens = counts.input_tokens;
-                    let output_tokens = counts.output_tokens;
-                    let tokens_used = prompt_tokens + output_tokens;
-                    drop(counts);
+                let body_with_metrics =
+                    MetricsRecordingStream::new(raw_stream, move |success: bool| {
+                        let latency_ms = latency_start.elapsed().as_millis() as i64;
+                        let counts = token_counts.lock().unwrap();
+                        let prompt_tokens = counts.input_tokens;
+                        let output_tokens = counts.output_tokens;
+                        let tokens_used = prompt_tokens + output_tokens;
+                        drop(counts);
 
-                    if success {
-                        let event = RequestEvent {
-                            ts: chrono::Utc::now().timestamp(),
-                            group_alias: group_alias_str.clone(),
-                            provider_id: provider_id.clone(),
-                            model_id: model_id.clone(),
-                            prompt_tokens: prompt_tokens as i64,
-                            output_tokens: output_tokens as i64,
-                            latency_ms,
-                            status: "success".to_string(),
-                            error_type: None,
-                            input_cost_per_1m: pricing_input,
-                            output_cost_per_1m: pricing_output,
-                        };
-                        let _ = metrics_recorder.record_request_sync(event.clone());
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            let _ = metrics_broadcast.send(json);
-                        }
+                        if success {
+                            let event = RequestEvent {
+                                ts: chrono::Utc::now().timestamp(),
+                                group_alias: group_alias_str.clone(),
+                                provider_id: provider_id.clone(),
+                                model_id: model_id.clone(),
+                                prompt_tokens: prompt_tokens as i64,
+                                output_tokens: output_tokens as i64,
+                                latency_ms,
+                                status: "success".to_string(),
+                                error_type: None,
+                                input_cost_per_1m: pricing_input,
+                                output_cost_per_1m: pricing_output,
+                            };
+                            let _ = metrics_recorder.record_request_sync(event.clone());
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                let _ = metrics_broadcast.send(json);
+                            }
 
-                        if tokens_used > 0 {
+                            if tokens_used > 0 {
+                                let mut rs = router_state.lock().unwrap();
+                                router::record_success(
+                                    &mut rs,
+                                    &provider_id,
+                                    entry_index_clone,
+                                    tokens_used,
+                                    effective_quota,
+                                    effective_request_quota,
+                                    on_quota_exhausted,
+                                );
+                            }
+                        } else {
+                            let event = RequestEvent {
+                                ts: chrono::Utc::now().timestamp(),
+                                group_alias: group_alias_str.clone(),
+                                provider_id: provider_id.clone(),
+                                model_id: model_id.clone(),
+                                prompt_tokens: prompt_tokens as i64,
+                                output_tokens: output_tokens as i64,
+                                latency_ms,
+                                status: "error".to_string(),
+                                error_type: Some("stream_error".to_string()),
+                                input_cost_per_1m: pricing_input,
+                                output_cost_per_1m: pricing_output,
+                            };
+                            let _ = metrics_recorder.record_request_sync(event.clone());
+                            if let Ok(json) = serde_json::to_string(&event) {
+                                let _ = metrics_broadcast.send(json);
+                            }
+
                             let mut rs = router_state.lock().unwrap();
-                            router::record_success(&mut rs, &provider_id, entry_index_clone, tokens_used, effective_quota, effective_request_quota, on_quota_exhausted);
+                            router::record_consecutive_error(
+                                &mut rs,
+                                &provider_id,
+                                entry_index_clone,
+                                consecutive_error_threshold,
+                                on_consecutive_errors,
+                                consecutive_error_cooldown_ms,
+                            );
                         }
-                    } else {
-                        let event = RequestEvent {
-                            ts: chrono::Utc::now().timestamp(),
-                            group_alias: group_alias_str.clone(),
-                            provider_id: provider_id.clone(),
-                            model_id: model_id.clone(),
-                            prompt_tokens: prompt_tokens as i64,
-                            output_tokens: output_tokens as i64,
-                            latency_ms,
-                            status: "error".to_string(),
-                            error_type: Some("stream_error".to_string()),
-                            input_cost_per_1m: pricing_input,
-                            output_cost_per_1m: pricing_output,
-                        };
-                        let _ = metrics_recorder.record_request_sync(event.clone());
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            let _ = metrics_broadcast.send(json);
-                        }
-
-                        let mut rs = router_state.lock().unwrap();
-                        router::record_consecutive_error(
-                            &mut rs,
-                            &provider_id,
-                            entry_index_clone,
-                            consecutive_error_threshold,
-                            on_consecutive_errors,
-                            consecutive_error_cooldown_ms,
-                        );
-                    }
-                });
+                    });
 
                 let body = axum::body::Body::from_stream(body_with_metrics);
                 let mut final_resp = Response::new(body);
@@ -609,14 +731,24 @@ async fn route_request(
                         .iter()
                         .find(|p| p.id == entry.provider_id)
                         .and_then(|p| p.daily_request_quota);
-                    router::record_success(&mut rs, &provider.id, entry_index, tokens_used, effective_quota, effective_request_quota, group.failover_config.on_quota_exhausted);
+                    router::record_success(
+                        &mut rs,
+                        &provider.id,
+                        entry_index,
+                        tokens_used,
+                        effective_quota,
+                        effective_request_quota,
+                        group.failover_config.on_quota_exhausted,
+                    );
                 }
                 let model_id = entry.model_id.clone();
                 let provider_id = provider.id.clone();
                 let group_alias = group.alias.clone();
                 let metrics_recorder = state.metrics_recorder.clone();
                 let metrics_broadcast = state.metrics_broadcast.clone();
-                let (pricing_input, pricing_output) = provider.models.iter()
+                let (pricing_input, pricing_output) = provider
+                    .models
+                    .iter()
                     .find(|m| m.id == entry.model_id)
                     .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
                     .unwrap_or((None, None));
@@ -733,7 +865,7 @@ enum StreamProcessResult {
 ///   wraps the byte stream in [`TimeoutStream`] for inter-chunk timeouts,
 ///   then translates via the appropriate translator.
 /// - **Non-streaming** or unexpected content type: reads the full body,
-///   translates if Anthropic, and returns token counts.
+///   translates if Anthropic or Codex, and returns token counts.
 ///
 /// # Arguments
 ///
@@ -741,6 +873,7 @@ enum StreamProcessResult {
 /// * `stream` — Whether the client requested SSE streaming.
 /// * `group_alias` — The group alias used as the model name in responses.
 /// * `is_anthropic` — Whether the upstream speaks the Anthropic protocol.
+/// * `is_codex` — Whether the upstream speaks the Codex protocol.
 /// * `_latency_timeout_ms` — Currently unused; inter-chunk timeout is
 ///   configured via [`STREAM_INTER_CHUNK_TIMEOUT_MS`].
 ///
@@ -753,6 +886,7 @@ async fn process_response(
     stream: bool,
     group_alias: &str,
     is_anthropic: bool,
+    is_codex: bool,
     _latency_timeout_ms: u64,
     max_response_duration_ms: u64,
 ) -> Result<StreamProcessResult, RequestError> {
@@ -764,11 +898,49 @@ async fn process_response(
     }
 
     if !status.is_success() {
-        let body = match tokio::time::timeout(std::time::Duration::from_secs(10), resp.text()).await {
+        let body = match tokio::time::timeout(std::time::Duration::from_secs(10), resp.text()).await
+        {
             Ok(text) => text.unwrap_or_default(),
             Err(_) => "timed out reading error body".to_string(),
         };
-        return Err(RequestError::ServerError(format!("HTTP {}: {}", status, body)));
+        return Err(RequestError::ServerError(format!(
+            "HTTP {}: {}",
+            status, body
+        )));
+    }
+
+    // Codex always responds as SSE, regardless of local client's stream setting,
+    // because we force `stream: true` in the upstream request.
+    if is_codex {
+        let token_counts = Arc::new(std::sync::Mutex::new(translator::StreamTokenCounts {
+            input_tokens: 0,
+            output_tokens: 0,
+        }));
+
+        let raw_stream = TimeoutStream::new(
+            resp.bytes_stream().map(|result| {
+                result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            }),
+            STREAM_INTER_CHUNK_TIMEOUT_MS,
+        );
+
+        let raw_stream = TotalTimeoutStream::new(raw_stream, max_response_duration_ms);
+
+        if stream {
+            let (body, token_counts) = crate::proxy::codex::translate_codex_stream(
+                raw_stream,
+                group_alias.to_string(),
+                token_counts,
+            );
+            let stream: Box<
+                dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+            > = Box::new(body.into_data_stream().map(|r| {
+                r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+            }));
+            return Ok(StreamProcessResult::Streaming(stream, token_counts));
+        } else {
+            return aggregate_codex_stream(raw_stream, group_alias, token_counts).await;
+        }
     }
 
     if stream {
@@ -787,7 +959,8 @@ async fn process_response(
 
             let raw_stream = TimeoutStream::new(
                 resp.bytes_stream().map(|result| {
-                    result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                    result
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
                 }),
                 STREAM_INTER_CHUNK_TIMEOUT_MS,
             );
@@ -795,37 +968,49 @@ async fn process_response(
             let raw_stream = TotalTimeoutStream::new(raw_stream, max_response_duration_ms);
 
             if is_anthropic {
-                let (body, token_counts) = translator::translate_anthropic_stream(raw_stream, group_alias.to_string(), token_counts);
-                let stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static> =
-                    Box::new(body.into_data_stream().map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+                let (body, token_counts) = translator::translate_anthropic_stream(
+                    raw_stream,
+                    group_alias.to_string(),
+                    token_counts,
+                );
+                let stream: Box<
+                    dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+                > = Box::new(body.into_data_stream().map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                }));
                 return Ok(StreamProcessResult::Streaming(stream, token_counts));
             } else {
-                let (body, token_counts) = translator::translate_openai_stream(raw_stream, token_counts);
-                let stream: Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static> =
-                    Box::new(body.into_data_stream().map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))));
+                let (body, token_counts) =
+                    translator::translate_openai_stream(raw_stream, token_counts);
+                let stream: Box<
+                    dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
+                > = Box::new(body.into_data_stream().map(|r| {
+                    r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                }));
                 return Ok(StreamProcessResult::Streaming(stream, token_counts));
             }
         } else {
-            let bytes = tokio::time::timeout(
-                std::time::Duration::from_secs(120),
-                resp.bytes()
-            )
-            .await
-            .map_err(|_| RequestError::Network("response body read timed out".into()))?
-            .map_err(|e| {
-                eprintln!("failed to read response body: {e}");
-                RequestError::Network(e.to_string())
-            })?;
+            let bytes = tokio::time::timeout(std::time::Duration::from_secs(120), resp.bytes())
+                .await
+                .map_err(|_| RequestError::Network("response body read timed out".into()))?
+                .map_err(|e| {
+                    eprintln!("failed to read response body: {e}");
+                    RequestError::Network(e.to_string())
+                })?;
 
             if is_anthropic {
-                let anthropic_resp: translator::MessagesResponse =
-                    serde_json::from_slice(&bytes).map_err(|e| {
-                        eprintln!("failed to parse anthropic response: {e}");
-                        RequestError::ServerError(format!("invalid upstream JSON: {e}"))
-                    })?;
+                let anthropic_resp: translator::MessagesResponse = serde_json::from_slice(&bytes)
+                    .map_err(|e| {
+                    eprintln!("failed to parse anthropic response: {e}");
+                    RequestError::ServerError(format!("invalid upstream JSON: {e}"))
+                })?;
                 let (prompt_tokens, output_tokens) = extract_anthropic_tokens(&anthropic_resp);
                 let openai_resp = translator::anthropic_to_openai(&anthropic_resp, group_alias);
-                return Ok(StreamProcessResult::NonStreaming(Json(openai_resp).into_response(), prompt_tokens, output_tokens));
+                return Ok(StreamProcessResult::NonStreaming(
+                    Json(openai_resp).into_response(),
+                    prompt_tokens,
+                    output_tokens,
+                ));
             } else {
                 let mut json: Value = serde_json::from_slice(&bytes).map_err(|e| {
                     eprintln!("failed to parse upstream JSON response: {e}");
@@ -837,30 +1022,35 @@ async fn process_response(
                 }
                 let mut resp = Json(json).into_response();
                 *resp.status_mut() = status;
-                return Ok(StreamProcessResult::NonStreaming(resp, prompt_tokens, output_tokens));
+                return Ok(StreamProcessResult::NonStreaming(
+                    resp,
+                    prompt_tokens,
+                    output_tokens,
+                ));
             }
         }
     } else {
-        let bytes = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            resp.bytes()
-        )
-        .await
-        .map_err(|_| RequestError::Network("response body read timed out".into()))?
-        .map_err(|e| {
-            eprintln!("failed to read response body: {e}");
-            RequestError::Network(e.to_string())
-        })?;
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(120), resp.bytes())
+            .await
+            .map_err(|_| RequestError::Network("response body read timed out".into()))?
+            .map_err(|e| {
+                eprintln!("failed to read response body: {e}");
+                RequestError::Network(e.to_string())
+            })?;
 
         if is_anthropic {
-            let anthropic_resp: translator::MessagesResponse =
-                serde_json::from_slice(&bytes).map_err(|e| {
+            let anthropic_resp: translator::MessagesResponse = serde_json::from_slice(&bytes)
+                .map_err(|e| {
                     eprintln!("failed to parse anthropic response: {e}");
                     RequestError::ServerError(format!("invalid upstream JSON: {e}"))
                 })?;
             let (prompt_tokens, output_tokens) = extract_anthropic_tokens(&anthropic_resp);
             let openai_resp = translator::anthropic_to_openai(&anthropic_resp, group_alias);
-            return Ok(StreamProcessResult::NonStreaming(Json(openai_resp).into_response(), prompt_tokens, output_tokens));
+            return Ok(StreamProcessResult::NonStreaming(
+                Json(openai_resp).into_response(),
+                prompt_tokens,
+                output_tokens,
+            ));
         } else {
             let mut json: Value = serde_json::from_slice(&bytes).map_err(|e| {
                 eprintln!("failed to parse upstream JSON response: {e}");
@@ -873,9 +1063,189 @@ async fn process_response(
 
             let mut resp = Json(json).into_response();
             *resp.status_mut() = status;
-            return Ok(StreamProcessResult::NonStreaming(resp, prompt_tokens, output_tokens));
+            return Ok(StreamProcessResult::NonStreaming(
+                resp,
+                prompt_tokens,
+                output_tokens,
+            ));
         }
     }
+}
+
+/// Aggregates a Codex SSE response stream into a single OpenAI chat-completion
+/// JSON response for non-streaming local clients. Consumes all SSE events,
+/// collecting content deltas and final usage, then returns a non-streaming response.
+async fn aggregate_codex_stream<S>(
+    stream: S,
+    group_alias: &str,
+    token_counts: Arc<std::sync::Mutex<translator::StreamTokenCounts>>,
+) -> Result<StreamProcessResult, RequestError>
+where
+    S: Stream<Item = Result<Bytes, std::io::Error>> + Unpin,
+{
+    use futures::StreamExt;
+    let mut content = String::new();
+    let mut tool_calls = Vec::new();
+    let mut buffer = String::new();
+    let mut stream = std::pin::pin!(stream);
+
+    fn handle_codex_aggregate_event(
+        data: &str,
+        content: &mut String,
+        tool_calls: &mut Vec<Value>,
+        token_counts: &Arc<std::sync::Mutex<translator::StreamTokenCounts>>,
+    ) -> Result<(), RequestError> {
+        if data.is_empty() || data == "[DONE]" {
+            return Ok(());
+        }
+
+        let Ok(event) = serde_json::from_str::<Value>(data) else {
+            return Ok(());
+        };
+
+        match event.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "response.failed" | "response.incomplete" => {
+                return Err(RequestError::ServerError(
+                    "codex upstream response failed".to_string(),
+                ));
+            }
+            "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    if item.get("type").and_then(|v| v.as_str()) == Some("function_call") {
+                        let call_id = item
+                            .get("call_id")
+                            .or_else(|| item.get("id"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                        let arguments = item
+                            .get("arguments")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("{}");
+                        tool_calls.push(serde_json::json!({
+                            "id": call_id,
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
+            content.push_str(delta);
+        }
+
+        // Usage is nested under `event.response.usage` in Codex
+        let usage = event
+            .get("response")
+            .and_then(|r| r.get("usage"))
+            .or_else(|| event.get("usage"));
+        if let Some(usage) = usage {
+            let mut counts = token_counts.lock().unwrap();
+            if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
+                counts.input_tokens = input;
+            }
+            if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
+                counts.output_tokens = output;
+            }
+        }
+
+        Ok(())
+    }
+
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                buffer.push_str(&String::from_utf8_lossy(&bytes));
+                while let Some(newline) = buffer.find('\n') {
+                    let line: String = buffer.drain(..=newline).collect();
+                    let line = line.trim_end_matches(['\r', '\n']);
+                    let line = line
+                        .strip_prefix("data: ")
+                        .or_else(|| line.strip_prefix("data:"));
+                    if let Some(data) = line {
+                        handle_codex_aggregate_event(
+                            data,
+                            &mut content,
+                            &mut tool_calls,
+                            &token_counts,
+                        )?;
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(RequestError::Network(e.to_string()));
+            }
+        }
+    }
+
+    if !buffer.is_empty() {
+        let line = buffer.trim_end_matches(['\r', '\n']);
+        let line = line
+            .strip_prefix("data: ")
+            .or_else(|| line.strip_prefix("data:"));
+        if let Some(data) = line {
+            handle_codex_aggregate_event(data, &mut content, &mut tool_calls, &token_counts)?;
+        }
+    }
+
+    let counts = token_counts.lock().unwrap();
+    let prompt_tokens = counts.input_tokens;
+    let output_tokens = counts.output_tokens;
+    drop(counts);
+
+    let id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let chat_response = if tool_calls.is_empty() {
+        serde_json::json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": group_alias,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": prompt_tokens + output_tokens
+            }
+        })
+    } else {
+        serde_json::json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": group_alias,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": content, "tool_calls": tool_calls},
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": output_tokens,
+                "total_tokens": prompt_tokens + output_tokens
+            }
+        })
+    };
+
+    Ok(StreamProcessResult::NonStreaming(
+        Json(chat_response).into_response(),
+        prompt_tokens,
+        output_tokens,
+    ))
 }
 
 /// Extracts `prompt_tokens` and `completion_tokens` from an OpenAI-style
@@ -1226,15 +1596,13 @@ async fn handle_internal_router_set_entry(
         req.enabled,
     ) {
         Ok(()) => {
-            let reloaded = load_groups().unwrap_or_else(|_| {
-                state.groups.read().unwrap().as_ref().clone()
-            });
+            let reloaded =
+                load_groups().unwrap_or_else(|_| state.groups.read().unwrap().as_ref().clone());
             *state.groups.write().unwrap() = Arc::new(reloaded);
             // The scheduler holds a clone of state.groups (same Arc<RwLock<...>>),
             // so this write is visible on its next tick when it reads groups_clone.
-            let reloaded_providers = load_providers().unwrap_or_else(|_| {
-                state.providers.read().unwrap().as_ref().clone()
-            });
+            let reloaded_providers = load_providers()
+                .unwrap_or_else(|_| state.providers.read().unwrap().as_ref().clone());
             *state.providers.write().unwrap() = Arc::new(reloaded_providers);
             Ok(Json(serde_json::json!({ "status": "ok" })))
         }
@@ -1308,7 +1676,10 @@ async fn handle_internal_config_reload(
         let mut guard = state.router_state.lock().unwrap();
         for (key, new_entry) in &new_entries {
             if let Some(existing) = old_state.get(key) {
-                let entry = guard.entries.entry(key.clone()).or_insert_with(|| new_entry.clone());
+                let entry = guard
+                    .entries
+                    .entry(key.clone())
+                    .or_insert_with(|| new_entry.clone());
                 entry.status = existing.status.clone();
                 entry.consecutive_errors = existing.consecutive_errors;
                 entry.cooldown_until = existing.cooldown_until;
@@ -1340,10 +1711,30 @@ async fn handle_internal_config_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::models::ProviderModel;
     use bytes::Bytes;
     use futures::stream::StreamExt;
     use std::sync::{Arc, Mutex};
-    use crate::config::models::ProviderModel;
+
+    async fn codex_aggregate_json(chunks: Vec<Result<Bytes, std::io::Error>>) -> Value {
+        let counts = Arc::new(std::sync::Mutex::new(translator::StreamTokenCounts {
+            input_tokens: 0,
+            output_tokens: 0,
+        }));
+        let result =
+            match aggregate_codex_stream(futures::stream::iter(chunks), "codex-test", counts).await
+            {
+                Ok(result) => result,
+                Err(_) => panic!("unexpected codex aggregate error"),
+            };
+        let StreamProcessResult::NonStreaming(resp, _, _) = result else {
+            panic!("expected non-streaming response");
+        };
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
 
     #[tokio::test]
     async fn test_timeout_stream_passes_chunks_without_delay() {
@@ -1395,10 +1786,8 @@ mod tests {
         let called = Arc::new(Mutex::new(None));
         let called_clone = called.clone();
 
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from("chunk1")),
-            Ok(Bytes::from("chunk2")),
-        ];
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from("chunk1")), Ok(Bytes::from("chunk2"))];
         let stream = futures::stream::iter(chunks);
         let mut metrics_stream = MetricsRecordingStream::new(stream, move |success: bool| {
             *called_clone.lock().unwrap() = Some(success);
@@ -1429,10 +1818,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_total_timeout_stream_yields_error_after_deadline() {
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from("chunk1")),
-            Ok(Bytes::from("chunk2")),
-        ];
+        let chunks: Vec<Result<Bytes, std::io::Error>> =
+            vec![Ok(Bytes::from("chunk1")), Ok(Bytes::from("chunk2"))];
         let stream = futures::stream::iter(chunks);
         let mut total_stream = TotalTimeoutStream::new(stream, 50);
 
@@ -1450,7 +1837,10 @@ mod tests {
     async fn test_total_timeout_stream_forwards_inner_errors() {
         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
             Ok(Bytes::from("chunk1")),
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "inner error")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "inner error",
+            )),
         ];
         let stream = futures::stream::iter(chunks);
         let mut total_stream = TotalTimeoutStream::new(stream, 5000);
@@ -1480,7 +1870,10 @@ mod tests {
 
         let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
             Ok(Bytes::from("chunk1")),
-            Err(std::io::Error::new(std::io::ErrorKind::Other, "stream error")),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "stream error",
+            )),
         ];
         let stream = futures::stream::iter(chunks);
         let mut metrics_stream = MetricsRecordingStream::new(stream, move |success: bool| {
@@ -1510,6 +1903,75 @@ mod tests {
         while let Some(_) = metrics_stream.next().await {}
 
         assert_eq!(*called.lock().unwrap(), Some(true));
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_codex_stream_handles_split_sse_line() {
+        let event = r#"data: {"type":"response.output_text.delta","delta":"hello"}
+
+data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output_tokens":3}}}
+
+"#;
+        let json = codex_aggregate_json(vec![
+            Ok(Bytes::from(&event[..20])),
+            Ok(Bytes::from(&event[20..55])),
+            Ok(Bytes::from(&event[55..])),
+        ])
+        .await;
+
+        assert_eq!(json["choices"][0]["message"]["content"], "hello");
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+        assert_eq!(json["usage"]["prompt_tokens"], 2);
+        assert_eq!(json["usage"]["completion_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_codex_stream_errors_on_failed_event() {
+        let counts = Arc::new(std::sync::Mutex::new(translator::StreamTokenCounts {
+            input_tokens: 0,
+            output_tokens: 0,
+        }));
+        let stream = futures::stream::iter(vec![Ok(Bytes::from(
+            r#"data: {"type":"response.failed","response":{"status_details":"do not expose token abc"}}
+
+"#,
+        ))]);
+
+        let err = match aggregate_codex_stream(stream, "codex-test", counts).await {
+            Ok(_) => panic!("expected codex aggregate error"),
+            Err(err) => err,
+        };
+        match err {
+            RequestError::ServerError(message) => {
+                assert_eq!(message, "codex upstream response failed");
+            }
+            _ => panic!("unexpected error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_codex_stream_collects_function_calls() {
+        let json = codex_aggregate_json(vec![Ok(Bytes::from(
+            r#"data: {"type":"response.output_text.delta","delta":"I'll call a tool."}
+
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{\"q\":\"rust\"}"}}
+
+data: {"type":"response.completed"}
+
+"#,
+        ))])
+        .await;
+
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["content"], "I'll call a tool.");
+        assert_eq!(message["tool_calls"][0]["id"], "call_1");
+        assert_eq!(message["tool_calls"][0]["type"], "function");
+        assert_eq!(message["tool_calls"][0]["function"]["name"], "lookup");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["arguments"],
+            r#"{"q":"rust"}"#
+        );
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]
@@ -1547,7 +2009,9 @@ mod tests {
             model_overrides: None,
         };
 
-        let (input_cost, output_cost) = provider.models.iter()
+        let (input_cost, output_cost) = provider
+            .models
+            .iter()
             .find(|m| m.id == "gpt-4")
             .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
             .unwrap_or((None, None));
@@ -1555,7 +2019,9 @@ mod tests {
         assert_eq!(input_cost, Some(30.0));
         assert_eq!(output_cost, Some(60.0));
 
-        let (input_cost, output_cost) = provider.models.iter()
+        let (input_cost, output_cost) = provider
+            .models
+            .iter()
             .find(|m| m.id == "gpt-3.5")
             .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
             .unwrap_or((None, None));
@@ -1563,7 +2029,9 @@ mod tests {
         assert_eq!(input_cost, Some(0.5));
         assert_eq!(output_cost, Some(1.5));
 
-        let (input_cost, output_cost) = provider.models.iter()
+        let (input_cost, output_cost) = provider
+            .models
+            .iter()
             .find(|m| m.id == "nonexistent")
             .map(|m| (m.input_cost_per_1m, m.output_cost_per_1m))
             .unwrap_or((None, None));

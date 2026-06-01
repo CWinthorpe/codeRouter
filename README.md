@@ -26,6 +26,7 @@ If you use multiple LLM providers or multiple accounts with the same provider, C
 ### Provider Management
 - **Multi-Provider Aggregation** — Add unlimited OpenAI-compatible and Anthropic-compatible providers behind a single local endpoint (`localhost:4141`)
 - **Model Discovery** — Automatically fetch available models and metadata (context windows, pricing) from provider APIs
+- **ChatGPT Codex Discovery** — Discover account-entitled Codex models via ChatGPT auth instead of stale preset model lists
 - **Per-Model Overrides** — Manually correct context sizes, pricing, or model names when provider APIs return incomplete data
 - **Secure Credential Storage** — API keys stored in the Linux Secret Service (libsecret), never in config files
 

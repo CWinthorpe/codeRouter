@@ -1,5 +1,5 @@
 /** Supported LLM API protocols. */
-export type Protocol = 'openai' | 'anthropic';
+export type Protocol = 'openai' | 'anthropic' | 'openai-codex';
 
 /** Status of a group entry, determining whether it can receive traffic. */
 export type EntryStatus = 'active' | 'cooldown' | 'manually_disabled' | 'quota_exhausted';

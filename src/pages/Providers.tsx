@@ -298,8 +298,14 @@ function ProviderCard({
   isTesting: boolean;
   isRefreshing: boolean;
 }) {
-  const protocolLabel = provider.protocol === 'anthropic' ? 'Anthropic-compatible' : 'OpenAI-compatible';
-  const protocolColor = provider.protocol === 'anthropic' ? 'bg-violet-600/20 text-violet-300' : 'bg-emerald-600/20 text-emerald-300';
+  const protocolLabel =
+    provider.protocol === 'anthropic' ? 'Anthropic-compatible'
+    : provider.protocol === 'openai-codex' ? 'Codex (ChatGPT)'
+    : 'OpenAI-compatible';
+  const protocolColor =
+    provider.protocol === 'anthropic' ? 'bg-violet-600/20 text-violet-300'
+    : provider.protocol === 'openai-codex' ? 'bg-amber-600/20 text-amber-300'
+    : 'bg-emerald-600/20 text-emerald-300';
 
   const lastRefresh = provider.models[0]?.last_refreshed;
   const modelCount = provider.models.length;
@@ -596,7 +602,7 @@ function ProviderModal({
     if (overrideMaxOutputTokens) entry.max_output_tokens = Number(overrideMaxOutputTokens);
     if (overrideInputCost) entry.input_cost_per_1m = Number(overrideInputCost);
     if (overrideOutputCost) entry.output_cost_per_1m = Number(overrideOutputCost);
-    if (overrideProtocol && overrideProtocol !== '__none__') entry.protocol = overrideProtocol as 'openai' | 'anthropic';
+    if (overrideProtocol && overrideProtocol !== '__none__') entry.protocol = overrideProtocol as 'openai' | 'anthropic' | 'openai-codex';
     setModelOverrides((prev) => [...prev, entry]);
     setOverrideModelId('');
     setOverrideContextWindow('');
@@ -629,7 +635,7 @@ function ProviderModal({
       return;
     }
     if (!isEditing && !apiKey.trim()) {
-      setError('API key is required for new providers.');
+      setError(protocol === 'openai-codex' ? 'Codex credential is required for new providers.' : 'API key is required for new providers.');
       return;
     }
     if (dailyTokenQuota) {
@@ -737,20 +743,21 @@ function ProviderModal({
 
           <div>
             <label className="mb-1 block text-sm font-medium text-zinc-300">Protocol Type</label>
-            <Select value={protocol} onValueChange={(v) => setProtocol(v as 'openai' | 'anthropic')}>
+            <Select value={protocol} onValueChange={(v) => setProtocol(v as 'openai' | 'anthropic' | 'openai-codex')}>
               <SelectTrigger className="w-full border-zinc-700 bg-zinc-800 text-zinc-100">
                 <SelectValue placeholder="Select protocol" />
               </SelectTrigger>
               <SelectContent className="bg-zinc-800 border-zinc-700">
                 <SelectItem value="openai" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">OpenAI-compatible</SelectItem>
                 <SelectItem value="anthropic" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Anthropic-compatible</SelectItem>
+                <SelectItem value="openai-codex" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">OpenAI Codex (ChatGPT)</SelectItem>
               </SelectContent>
             </Select>
           </div>
 
           <div>
             <label className="mb-1 block text-sm font-medium text-zinc-300">
-              API Key
+              {protocol === 'openai-codex' ? 'Codex auth JSON or access token' : 'API Key'}
               {isEditing && <span className="ml-2 text-xs text-zinc-500">(leave blank to keep existing)</span>}
             </label>
             <div className="relative">
@@ -759,7 +766,7 @@ function ProviderModal({
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
                 className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 pr-16 text-sm text-zinc-100 placeholder-zinc-500 focus:border-emerald-500 focus:outline-none focus:ring-1 focus:ring-emerald-500"
-                placeholder={isEditing ? 'Leave empty to keep existing key' : 'Enter API key'}
+                placeholder={protocol === 'openai-codex' ? 'Paste auth.json contents or access token' : isEditing ? 'Leave empty to keep existing key' : 'Enter API key'}
               />
               <button
                 type="button"
@@ -853,8 +860,8 @@ function ProviderModal({
                   <div key={m.id} className="mb-2 flex items-center gap-2">
                     <code className="text-xs text-zinc-400">{m.id}</code>
                     {m.protocol && (
-                      <Badge className={`rounded-full text-xs font-medium ${m.protocol === 'anthropic' ? 'bg-violet-600/20 text-violet-300' : 'bg-emerald-600/20 text-emerald-300'}`}>
-                        {m.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI'}
+                      <Badge className={`rounded-full text-xs font-medium ${m.protocol === 'anthropic' ? 'bg-violet-600/20 text-violet-300' : m.protocol === 'openai-codex' ? 'bg-amber-600/20 text-amber-300' : 'bg-emerald-600/20 text-emerald-300'}`}>
+                        {m.protocol === 'anthropic' ? 'Anthropic' : m.protocol === 'openai-codex' ? 'Codex' : 'OpenAI'}
                       </Badge>
                     )}
                     <span className="text-xs text-zinc-600">ctx: {m.context_window ?? 'auto'}</span>
@@ -917,6 +924,7 @@ function ProviderModal({
                       <SelectItem value="__none__" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Provider default</SelectItem>
                       <SelectItem value="openai" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">OpenAI-compatible</SelectItem>
                       <SelectItem value="anthropic" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">Anthropic-compatible</SelectItem>
+                      <SelectItem value="openai-codex" className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">OpenAI Codex</SelectItem>
                     </SelectContent>
                   </Select>
                   <button

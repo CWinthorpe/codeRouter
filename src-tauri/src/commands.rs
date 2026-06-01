@@ -5,6 +5,7 @@
 //! `AppState`, etc.) and sidecar lifecycle functions (`spawn_sidecar`,
 //! `kill_sidecar`).
 
+use chrono::NaiveDate;
 use coderouter_proxy::config::models::{AppConfig, Group, Provider};
 use coderouter_proxy::config::store;
 use coderouter_proxy::credentials::keychain;
@@ -13,7 +14,6 @@ use coderouter_proxy::metrics::queries;
 use coderouter_proxy::opencode::config_writer::{self, AgentMapping};
 use coderouter_proxy::proxy::router;
 use coderouter_proxy::proxy::ssrf;
-use chrono::NaiveDate;
 use reqwest::Client;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,9 @@ pub fn init_metrics_db() -> Result<(), String> {
 /// been initialized via [`init_metrics_db`].
 fn with_metrics_db<T, F: FnOnce(&Connection) -> Result<T, String>>(f: F) -> Result<T, String> {
     let guard = METRICS_DB.lock().map_err(|e| e.to_string())?;
-    let conn = guard.as_ref().ok_or_else(|| "Metrics database not initialized".to_string())?;
+    let conn = guard
+        .as_ref()
+        .ok_or_else(|| "Metrics database not initialized".to_string())?;
     f(conn)
 }
 
@@ -109,30 +111,31 @@ impl From<&Provider> for ProviderResponse {
             daily_token_quota: p.daily_token_quota,
             daily_request_quota: p.daily_request_quota,
             quota_reset_utc_hour: p.quota_reset_utc_hour,
-            model_overrides: p.model_overrides.as_ref().map(|v| v.iter().map(|m| ProviderModelResponse {
-                id: m.id.clone(),
-                context_window: m.context_window,
-                max_output_tokens: m.max_output_tokens,
-                input_cost_per_1m: m.input_cost_per_1m,
-                output_cost_per_1m: m.output_cost_per_1m,
-                last_refreshed: m.last_refreshed.clone(),
-                protocol: m.protocol.clone(),
-            }).collect()).unwrap_or_default(),
+            model_overrides: p
+                .model_overrides
+                .as_ref()
+                .map(|v| {
+                    v.iter()
+                        .map(|m| ProviderModelResponse {
+                            id: m.id.clone(),
+                            context_window: m.context_window,
+                            max_output_tokens: m.max_output_tokens,
+                            input_cost_per_1m: m.input_cost_per_1m,
+                            output_cost_per_1m: m.output_cost_per_1m,
+                            last_refreshed: m.last_refreshed.clone(),
+                            protocol: m.protocol.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             // When no auto-discovered models exist, fall back to model overrides
             // so the UI always has something to display.
             enabled: p.enabled,
             models: {
-                let auto: Vec<ProviderModelResponse> = p.models.iter().map(|m| ProviderModelResponse {
-                    id: m.id.clone(),
-                    context_window: m.context_window,
-                    max_output_tokens: m.max_output_tokens,
-                    input_cost_per_1m: m.input_cost_per_1m,
-                    output_cost_per_1m: m.output_cost_per_1m,
-                    last_refreshed: m.last_refreshed.clone(),
-                    protocol: m.protocol.clone(),
-                }).collect();
-                if auto.is_empty() {
-                    p.model_overrides.as_ref().map(|v| v.iter().map(|m| ProviderModelResponse {
+                let auto: Vec<ProviderModelResponse> = p
+                    .models
+                    .iter()
+                    .map(|m| ProviderModelResponse {
                         id: m.id.clone(),
                         context_window: m.context_window,
                         max_output_tokens: m.max_output_tokens,
@@ -140,7 +143,25 @@ impl From<&Provider> for ProviderResponse {
                         output_cost_per_1m: m.output_cost_per_1m,
                         last_refreshed: m.last_refreshed.clone(),
                         protocol: m.protocol.clone(),
-                    }).collect()).unwrap_or_default()
+                    })
+                    .collect();
+                if auto.is_empty() {
+                    p.model_overrides
+                        .as_ref()
+                        .map(|v| {
+                            v.iter()
+                                .map(|m| ProviderModelResponse {
+                                    id: m.id.clone(),
+                                    context_window: m.context_window,
+                                    max_output_tokens: m.max_output_tokens,
+                                    input_cost_per_1m: m.input_cost_per_1m,
+                                    output_cost_per_1m: m.output_cost_per_1m,
+                                    last_refreshed: m.last_refreshed.clone(),
+                                    protocol: m.protocol.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 } else {
                     auto
                 }
@@ -167,7 +188,10 @@ pub async fn get_providers() -> Result<Vec<ProviderResponse>, String> {
 /// become ready after a config write.
 async fn notify_sidecar_config_reload() {
     let config = store::load_app_config().unwrap_or_default();
-    let url = format!("http://{}:{}/internal/config/reload", config.proxy_host, config.proxy_port);
+    let url = format!(
+        "http://{}:{}/internal/config/reload",
+        config.proxy_host, config.proxy_port
+    );
     let client = Client::new();
 
     for attempt in 0..3 {
@@ -175,7 +199,12 @@ async fn notify_sidecar_config_reload() {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        match client.post(&url).timeout(std::time::Duration::from_secs(2)).send().await {
+        match client
+            .post(&url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
             Ok(_) => return,
             Err(e) => {
                 eprintln!("[notify-sidecar] attempt {} failed: {e}", attempt + 1);
@@ -201,8 +230,14 @@ async fn notify_sidecar_config_reload() {
 /// SSRF validation, persisted storage fails, or keychain storage fails.
 #[tauri::command]
 pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), String> {
-    if provider.protocol != "openai" && provider.protocol != "anthropic" {
-        return Err(format!("Invalid protocol '{}'. Must be 'openai' or 'anthropic'.", provider.protocol));
+    if provider.protocol != "openai"
+        && provider.protocol != "anthropic"
+        && provider.protocol != "openai-codex"
+    {
+        return Err(format!(
+            "Invalid protocol '{}'. Must be 'openai', 'anthropic', or 'openai-codex'.",
+            provider.protocol
+        ));
     }
 
     ssrf::validate_base_url(&provider.base_url)?;
@@ -210,7 +245,9 @@ pub async fn save_provider(provider: Provider, api_key: String) -> Result<(), St
     let mut providers = match store::load_providers() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("[save_provider] Warning: failed to load existing providers ({e}), starting fresh");
+            eprintln!(
+                "[save_provider] Warning: failed to load existing providers ({e}), starting fresh"
+            );
             Vec::new()
         }
     };
@@ -429,12 +466,30 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
             .get(&models_url)
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2024-06-01"),
+        "openai-codex" => {
+            let (access_token, account_id, id_token, _refresh) =
+                coderouter_proxy::proxy::codex::parse_codex_credential(&api_key);
+            let headers = coderouter_proxy::proxy::codex::build_codex_auth_headers(
+                &access_token,
+                account_id.as_deref(),
+                id_token.as_deref(),
+            );
+            let mut req = client.get(base_url).header("accept", "application/json");
+            for (k, v) in &headers {
+                req = req.header(k, v);
+            }
+            req
+        }
         _ => client
             .get(&models_url)
             .header("Authorization", format!("Bearer {}", api_key)),
     };
 
-    match request.timeout(std::time::Duration::from_secs(10)).send().await {
+    match request
+        .timeout(std::time::Duration::from_secs(10))
+        .send()
+        .await
+    {
         Ok(resp) => {
             let status = resp.status().as_u16();
             if resp.status().is_success() {
@@ -450,20 +505,43 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
                         .get(base_url)
                         .header("x-api-key", &api_key)
                         .header("anthropic-version", "2024-06-01"),
+                    "openai-codex" => {
+                        let (access_token, account_id, id_token, _refresh) =
+                            coderouter_proxy::proxy::codex::parse_codex_credential(&api_key);
+                        let headers = coderouter_proxy::proxy::codex::build_codex_auth_headers(
+                            &access_token,
+                            account_id.as_deref(),
+                            id_token.as_deref(),
+                        );
+                        let mut req = client.get(base_url).header("accept", "application/json");
+                        for (k, v) in &headers {
+                            req = req.header(k, v);
+                        }
+                        req
+                    }
                     _ => client
                         .get(base_url)
                         .header("Authorization", format!("Bearer {}", api_key)),
                 };
-                match base_request.timeout(std::time::Duration::from_secs(10)).send().await {
+                match base_request
+                    .timeout(std::time::Duration::from_secs(10))
+                    .send()
+                    .await
+                {
                     Ok(r) if r.status().as_u16() != 404 => Ok(TestConnectionResult {
                         success: true,
                         status_code: Some(r.status().as_u16()),
-                        message: format!("Base URL reachable (HTTP {}) — no /models endpoint", r.status().as_u16()),
+                        message: format!(
+                            "Base URL reachable (HTTP {}) — no /models endpoint",
+                            r.status().as_u16()
+                        ),
                     }),
                     _ => Ok(TestConnectionResult {
                         success: true,
                         status_code: Some(status),
-                        message: "Provider reachable — no /models endpoint (OK if using model overrides)".to_string(),
+                        message:
+                            "Provider reachable — no /models endpoint (OK if using model overrides)"
+                                .to_string(),
                     }),
                 }
             } else {
@@ -471,7 +549,11 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
                 Ok(TestConnectionResult {
                     success: false,
                     status_code: Some(status),
-                    message: format!("Connection failed (HTTP {}): {}", status, body.chars().take(200).collect::<String>()),
+                    message: format!(
+                        "Connection failed (HTTP {}): {}",
+                        status,
+                        body.chars().take(200).collect::<String>()
+                    ),
                 })
             }
         }
@@ -508,9 +590,11 @@ pub async fn refresh_provider_models(provider_id: String) -> Result<Vec<Provider
         .map_err(|e| format!("Failed to retrieve API key: {}", e))?;
 
     let client = Client::new();
-    let models = coderouter_proxy::models::refresher::fetch_models_for_provider(&provider, &api_key, &client)
-        .await
-        .map_err(|e| e.to_string())?;
+    let models = coderouter_proxy::models::refresher::fetch_models_for_provider(
+        &provider, &api_key, &client,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
 
     let mut all_providers = providers;
     if let Some(existing) = all_providers.iter_mut().find(|p| p.id == provider_id) {
@@ -534,18 +618,28 @@ pub async fn refresh_provider_models(provider_id: String) -> Result<Vec<Provider
 pub async fn get_router_status() -> Result<router::RouterStatusResponse, String> {
     let config = store::load_app_config().unwrap_or_default();
     let client = Client::new();
-    let url = format!("http://{}:{}/internal/router/status", config.proxy_host, config.proxy_port);
-    let resp = client.get(&url).send().await
+    let url = format!(
+        "http://{}:{}/internal/router/status",
+        config.proxy_host, config.proxy_port
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
         .map_err(|e| format!("Failed to connect to proxy: {}", e))?;
     if !resp.status().is_success() {
         return Err(format!("Proxy returned status {}", resp.status()));
     }
-    let body: serde_json::Value = resp.json().await
+    let body: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| format!("Failed to parse proxy response: {}", e))?;
     if body.get("status").and_then(|v| v.as_str()) != Some("ok") {
         return Err("Proxy returned error".to_string());
     }
-    let data = body.get("data").ok_or_else(|| "No data in proxy response".to_string())?;
+    let data = body
+        .get("data")
+        .ok_or_else(|| "No data in proxy response".to_string())?;
     let status: router::RouterStatusResponse = serde_json::from_value(data.clone())
         .map_err(|e| format!("Failed to parse router status: {}", e))?;
     Ok(status)
@@ -564,16 +658,27 @@ pub async fn get_router_status() -> Result<router::RouterStatusResponse, String>
 /// # Errors
 /// Returns an error string if the proxy is unreachable or returns an error.
 #[tauri::command]
-pub async fn set_entry_enabled(group_id: String, entry_index: usize, enabled: bool) -> Result<(), String> {
+pub async fn set_entry_enabled(
+    group_id: String,
+    entry_index: usize,
+    enabled: bool,
+) -> Result<(), String> {
     let config = store::load_app_config().unwrap_or_default();
     let client = Client::new();
-    let url = format!("http://{}:{}/internal/router/entry", config.proxy_host, config.proxy_port);
+    let url = format!(
+        "http://{}:{}/internal/router/entry",
+        config.proxy_host, config.proxy_port
+    );
     let body = serde_json::json!({
         "group_id": group_id,
         "entry_index": entry_index,
         "enabled": enabled,
     });
-    let resp = client.post(&url).json(&body).send().await
+    let resp = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
         .map_err(|e| format!("Failed to connect to proxy: {}", e))?;
     if !resp.status().is_success() {
         let err_text = resp.text().await.unwrap_or_default();
@@ -594,17 +699,20 @@ pub async fn set_entry_enabled(group_id: String, entry_index: usize, enabled: bo
 /// Returns an error string if the date format is invalid or the metrics
 /// database query fails.
 #[tauri::command]
-pub fn get_daily_summary(provider_id: String, date: String) -> Result<queries::DailySummary, String> {
+pub fn get_daily_summary(
+    provider_id: String,
+    date: String,
+) -> Result<queries::DailySummary, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map_err(|e| format!("Invalid date format (expected YYYY-MM-DD): {}", e))?;
     let providers = store::load_providers().unwrap_or_default();
-    let reset_hour = providers.iter()
+    let reset_hour = providers
+        .iter()
         .find(|p| p.id == provider_id)
         .map(|p| p.quota_reset_utc_hour)
         .unwrap_or(0);
     with_metrics_db(|conn| {
-        queries::get_daily_summary(conn, &provider_id, date, reset_hour)
-            .map_err(|e| e.to_string())
+        queries::get_daily_summary(conn, &provider_id, date, reset_hour).map_err(|e| e.to_string())
     })
 }
 
@@ -617,10 +725,7 @@ pub fn get_daily_summary(provider_id: String, date: String) -> Result<queries::D
 /// Returns an error string if the metrics database query fails.
 #[tauri::command]
 pub fn get_recent_requests(limit: usize) -> Result<Vec<queries::RequestRow>, String> {
-    with_metrics_db(|conn| {
-        queries::get_recent_requests(conn, limit)
-            .map_err(|e| e.to_string())
-    })
+    with_metrics_db(|conn| queries::get_recent_requests(conn, limit).map_err(|e| e.to_string()))
 }
 
 /// Returns daily aggregated usage for a provider.
@@ -634,15 +739,18 @@ pub fn get_recent_requests(limit: usize) -> Result<Vec<queries::RequestRow>, Str
 /// # Errors
 /// Returns an error string if the metrics database query fails.
 #[tauri::command]
-pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::DailyUsage>, String> {
+pub fn get_usage_by_day(
+    provider_id: String,
+    days: u32,
+) -> Result<Vec<queries::DailyUsage>, String> {
     let providers = store::load_providers().unwrap_or_default();
-    let reset_hour = providers.iter()
+    let reset_hour = providers
+        .iter()
         .find(|p| p.id == provider_id)
         .map(|p| p.quota_reset_utc_hour)
         .unwrap_or(0);
     with_metrics_db(|conn| {
-        queries::get_usage_by_day(conn, &provider_id, days, reset_hour)
-            .map_err(|e| e.to_string())
+        queries::get_usage_by_day(conn, &provider_id, days, reset_hour).map_err(|e| e.to_string())
     })
 }
 
@@ -658,16 +766,21 @@ pub fn get_usage_by_day(provider_id: String, days: u32) -> Result<Vec<queries::D
 /// # Errors
 /// Returns an error string if the metrics database query fails.
 #[tauri::command]
-pub fn get_usage_by_group(days: u32, provider_id: Option<String>) -> Result<Vec<queries::GroupUsage>, String> {
-    let reset_hour = provider_id.and_then(|pid| {
-        let providers = store::load_providers().ok()?;
-        providers.iter()
-            .find(|p| p.id == pid)
-            .map(|p| p.quota_reset_utc_hour)
-    }).unwrap_or(0);
+pub fn get_usage_by_group(
+    days: u32,
+    provider_id: Option<String>,
+) -> Result<Vec<queries::GroupUsage>, String> {
+    let reset_hour = provider_id
+        .and_then(|pid| {
+            let providers = store::load_providers().ok()?;
+            providers
+                .iter()
+                .find(|p| p.id == pid)
+                .map(|p| p.quota_reset_utc_hour)
+        })
+        .unwrap_or(0);
     with_metrics_db(|conn| {
-        queries::get_usage_by_group(conn, days, reset_hour)
-            .map_err(|e| e.to_string())
+        queries::get_usage_by_group(conn, days, reset_hour).map_err(|e| e.to_string())
     })
 }
 
@@ -683,10 +796,7 @@ pub fn get_usage_by_group(days: u32, provider_id: Option<String>) -> Result<Vec<
 /// Returns an error string if the metrics database query fails.
 #[tauri::command]
 pub fn get_usage_by_model(days: u32) -> Result<Vec<queries::ModelUsage>, String> {
-    with_metrics_db(|conn| {
-        queries::get_usage_by_model(conn, days, 0)
-            .map_err(|e| e.to_string())
-    })
+    with_metrics_db(|conn| queries::get_usage_by_model(conn, days, 0).map_err(|e| e.to_string()))
 }
 
 /// Returns daily cost breakdown per model for chart rendering.
@@ -699,8 +809,7 @@ pub fn get_usage_by_model(days: u32) -> Result<Vec<queries::ModelUsage>, String>
 #[tauri::command]
 pub fn get_daily_usage_by_model(days: u32) -> Result<Vec<queries::DailyModelUsage>, String> {
     with_metrics_db(|conn| {
-        queries::get_daily_usage_by_model(conn, days, 0)
-            .map_err(|e| e.to_string())
+        queries::get_daily_usage_by_model(conn, days, 0).map_err(|e| e.to_string())
     })
 }
 
@@ -773,9 +882,17 @@ impl From<AgentMapping> for OpenCodeAgentMapping {
 async fn build_entry_statuses() -> std::collections::HashMap<String, String> {
     let mut map = std::collections::HashMap::new();
     let config = store::load_app_config().unwrap_or_default();
-    let url = format!("http://{}:{}/internal/router/status", config.proxy_host, config.proxy_port);
+    let url = format!(
+        "http://{}:{}/internal/router/status",
+        config.proxy_host, config.proxy_port
+    );
     let client = Client::new();
-    let resp = match client.get(&url).timeout(std::time::Duration::from_secs(2)).send().await {
+    let resp = match client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return map,
     };
@@ -807,7 +924,9 @@ async fn build_entry_statuses() -> std::collections::HashMap<String, String> {
 /// otherwise the default location is resolved automatically.
 #[tauri::command]
 pub fn get_opencode_config_path() -> Option<String> {
-    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let stored = store::load_app_config()
+        .ok()
+        .and_then(|c| c.opencode_config_path);
     config_writer::resolve_opencode_config_path(stored.as_deref())
         .map(|p| p.to_string_lossy().to_string())
 }
@@ -821,8 +940,7 @@ pub fn get_opencode_config_path() -> Option<String> {
 /// Returns an error string if the path cannot be saved.
 #[tauri::command]
 pub fn set_opencode_config_path(path: String) -> Result<(), String> {
-    config_writer::save_opencode_config_path(&path)
-        .map_err(|e| e.to_string())
+    config_writer::save_opencode_config_path(&path).map_err(|e| e.to_string())
 }
 
 /// Injects the CodeRouter provider into the OpenCode configuration file.
@@ -839,7 +957,9 @@ pub fn set_opencode_config_path(path: String) -> Result<(), String> {
 /// is unreachable, or the config file cannot be written.
 #[tauri::command]
 pub async fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
-    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let stored = store::load_app_config()
+        .ok()
+        .and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
@@ -847,8 +967,14 @@ pub async fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
     let providers = store::load_providers().unwrap_or_default();
     let entry_statuses = build_entry_statuses().await;
 
-    config_writer::inject_provider(&config_path, &groups, &providers, proxy_port, &entry_statuses)
-        .map_err(|e| e.to_string())
+    config_writer::inject_provider(
+        &config_path,
+        &groups,
+        &providers,
+        proxy_port,
+        &entry_statuses,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Removes the CodeRouter provider from the OpenCode configuration file.
@@ -858,12 +984,13 @@ pub async fn inject_opencode_provider(proxy_port: u16) -> Result<(), String> {
 /// cannot be modified.
 #[tauri::command]
 pub fn remove_opencode_provider() -> Result<(), String> {
-    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let stored = store::load_app_config()
+        .ok()
+        .and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
-    config_writer::remove_provider(&config_path)
-        .map_err(|e| e.to_string())
+    config_writer::remove_provider(&config_path).map_err(|e| e.to_string())
 }
 
 /// Writes agent-specific model overrides into the OpenCode configuration.
@@ -876,12 +1003,13 @@ pub fn remove_opencode_provider() -> Result<(), String> {
 /// cannot be modified.
 #[tauri::command]
 pub fn set_opencode_agent_models(mapping: OpenCodeAgentMapping) -> Result<(), String> {
-    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let stored = store::load_app_config()
+        .ok()
+        .and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
-    config_writer::set_agent_models(&config_path, &mapping.into())
-        .map_err(|e| e.to_string())
+    config_writer::set_agent_models(&config_path, &mapping.into()).map_err(|e| e.to_string())
 }
 
 /// Removes all agent-specific model overrides from the OpenCode configuration.
@@ -891,12 +1019,13 @@ pub fn set_opencode_agent_models(mapping: OpenCodeAgentMapping) -> Result<(), St
 /// cannot be modified.
 #[tauri::command]
 pub fn remove_opencode_agent_models() -> Result<(), String> {
-    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let stored = store::load_app_config()
+        .ok()
+        .and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
-    config_writer::remove_agent_models(&config_path)
-        .map_err(|e| e.to_string())
+    config_writer::remove_agent_models(&config_path).map_err(|e| e.to_string())
 }
 
 /// Reads the current agent-to-model mapping from the OpenCode configuration.
@@ -906,7 +1035,9 @@ pub fn remove_opencode_agent_models() -> Result<(), String> {
 /// cannot be parsed.
 #[tauri::command]
 pub fn get_opencode_agent_models() -> Result<OpenCodeAgentMapping, String> {
-    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let stored = store::load_app_config()
+        .ok()
+        .and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
@@ -926,15 +1057,24 @@ pub fn get_opencode_agent_models() -> Result<OpenCodeAgentMapping, String> {
 /// # Errors
 /// Returns an error string if the config cannot be generated.
 #[tauri::command]
-pub async fn preview_opencode_config(proxy_port: u16, mapping: Option<OpenCodeAgentMapping>) -> Result<String, String> {
+pub async fn preview_opencode_config(
+    proxy_port: u16,
+    mapping: Option<OpenCodeAgentMapping>,
+) -> Result<String, String> {
     let groups = store::load_groups().unwrap_or_default();
     let providers = store::load_providers().unwrap_or_default();
     let entry_statuses = build_entry_statuses().await;
 
     let agent_mapping = mapping.map(|m| m.into());
 
-    config_writer::preview_opencode_config(&groups, &providers, proxy_port, agent_mapping.as_ref(), &entry_statuses)
-        .map_err(|e| e.to_string())
+    config_writer::preview_opencode_config(
+        &groups,
+        &providers,
+        proxy_port,
+        agent_mapping.as_ref(),
+        &entry_statuses,
+    )
+    .map_err(|e| e.to_string())
 }
 
 /// Checks whether a given group alias is referenced in the OpenCode config.
@@ -960,11 +1100,15 @@ pub fn is_group_referenced_in_opencode(group_alias: String) -> bool {
 /// # Errors
 /// Returns an error string if the date format is invalid or the query fails.
 #[tauri::command]
-pub fn get_latency_percentiles(provider_id: String, date: String) -> Result<Option<queries::LatencyPercentiles>, String> {
+pub fn get_latency_percentiles(
+    provider_id: String,
+    date: String,
+) -> Result<Option<queries::LatencyPercentiles>, String> {
     let date = NaiveDate::parse_from_str(&date, "%Y-%m-%d")
         .map_err(|e| format!("Invalid date format (expected YYYY-MM-DD): {}", e))?;
     let providers = store::load_providers().unwrap_or_default();
-    let reset_hour = providers.iter()
+    let reset_hour = providers
+        .iter()
         .find(|p| p.id == provider_id)
         .map(|p| p.quota_reset_utc_hour)
         .unwrap_or(0);
@@ -987,13 +1131,13 @@ pub fn get_latency_percentiles(provider_id: String, date: String) -> Result<Opti
 #[tauri::command]
 pub fn get_cost_summary(provider_id: String, days: u32) -> Result<f64, String> {
     let providers = store::load_providers().unwrap_or_default();
-    let reset_hour = providers.iter()
+    let reset_hour = providers
+        .iter()
         .find(|p| p.id == provider_id)
         .map(|p| p.quota_reset_utc_hour)
         .unwrap_or(0);
     with_metrics_db(|conn| {
-        queries::get_cost_summary(conn, &provider_id, days, reset_hour)
-            .map_err(|e| e.to_string())
+        queries::get_cost_summary(conn, &provider_id, days, reset_hour).map_err(|e| e.to_string())
     })
 }
 
@@ -1013,7 +1157,9 @@ pub fn get_app_version() -> String {
 /// cannot be modified.
 #[tauri::command]
 pub fn remove_coderouter_from_opencode() -> Result<(), String> {
-    let stored = store::load_app_config().ok().and_then(|c| c.opencode_config_path);
+    let stored = store::load_app_config()
+        .ok()
+        .and_then(|c| c.opencode_config_path);
     let config_path = config_writer::resolve_opencode_config_path(stored.as_deref())
         .ok_or_else(|| "Could not determine OpenCode config path".to_string())?;
 
@@ -1066,7 +1212,11 @@ async fn reinject_opencode_provider_if_enabled() {
     let entry_statuses = build_entry_statuses().await;
 
     let _ = config_writer::inject_provider(
-        &config_path, &groups, &providers, app_config.proxy_port, &entry_statuses,
+        &config_path,
+        &groups,
+        &providers,
+        app_config.proxy_port,
+        &entry_statuses,
     );
 }
 
@@ -1088,14 +1238,18 @@ pub async fn check_proxy_health() -> Result<HealthCheckResult, String> {
     // Timeout prevents the UI from hanging when the proxy is unresponsive
     let controller = tokio::time::timeout(std::time::Duration::from_secs(3), async {
         client.get(&url).send().await
-    }).await;
+    })
+    .await;
 
     match controller {
         Ok(Ok(resp)) if resp.status().is_success() => {
             let body: serde_json::Value = resp.json().await.unwrap_or_default();
             Ok(HealthCheckResult {
                 running: true,
-                status: body.get("status").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                status: body
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
                 uptime_seconds: body.get("uptime_seconds").and_then(|v| v.as_u64()),
             })
         }
@@ -1160,7 +1314,10 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     let update = updater.check().await.map_err(|e| e.to_string())?;
     match update {
         Some(update) => {
-            update.download_and_install(|_, _| {}, || {}).await.map_err(|e| e.to_string())?;
+            update
+                .download_and_install(|_, _| {}, || {})
+                .await
+                .map_err(|e| e.to_string())?;
             app.restart();
             #[allow(unreachable_code)]
             Ok(())
@@ -1253,13 +1410,11 @@ pub fn spawn_sidecar() -> Result<Child, String> {
     let sidecar_path = if cfg!(debug_assertions) {
         // Debug: look for the sidecar binary next to the crate manifest
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        let dev_path = std::path::Path::new(manifest_dir)
-            .join(format!("sidecar/{target_suffix}"));
+        let dev_path = std::path::Path::new(manifest_dir).join(format!("sidecar/{target_suffix}"));
         if dev_path.exists() {
             dev_path
         } else {
-            let fallback = std::path::Path::new(manifest_dir)
-                .join("sidecar/coderouter-proxy");
+            let fallback = std::path::Path::new(manifest_dir).join("sidecar/coderouter-proxy");
             if fallback.exists() {
                 fallback
             } else {
@@ -1269,8 +1424,8 @@ pub fn spawn_sidecar() -> Result<Child, String> {
     } else {
         // Release: check AppImage layout first, then fall back
         if let Ok(appdir) = std::env::var("APPDIR") {
-            let appimage_sidecar = std::path::Path::new(&appdir)
-                .join(format!("usr/bin/sidecar/{target_suffix}"));
+            let appimage_sidecar =
+                std::path::Path::new(&appdir).join(format!("usr/bin/sidecar/{target_suffix}"));
             if appimage_sidecar.exists() {
                 appimage_sidecar
             } else {
@@ -1379,9 +1534,9 @@ impl From<BashPermission> for BashPermissionResponse {
     fn from(p: BashPermission) -> Self {
         match p {
             BashPermission::Simple(level) => BashPermissionResponse::Simple(level.into()),
-            BashPermission::Commands(map) => {
-                BashPermissionResponse::Commands(map.into_iter().map(|(k, v)| (k, v.into())).collect())
-            }
+            BashPermission::Commands(map) => BashPermissionResponse::Commands(
+                map.into_iter().map(|(k, v)| (k, v.into())).collect(),
+            ),
         }
     }
 }
@@ -1417,7 +1572,9 @@ impl From<AgentPermissions> for AgentPermissionsResponse {
             edit: p.edit.map(|l| l.into()),
             bash: p.bash.map(|b| b.into()),
             webfetch: p.webfetch.map(|l| l.into()),
-            task: p.task.map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
+            task: p
+                .task
+                .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
         }
     }
 }
@@ -1428,7 +1585,9 @@ impl From<AgentPermissionsResponse> for AgentPermissions {
             edit: p.edit.map(|l| l.into()),
             bash: p.bash.map(|b| b.into()),
             webfetch: p.webfetch.map(|l| l.into()),
-            task: p.task.map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
+            task: p
+                .task
+                .map(|m| m.into_iter().map(|(k, v)| (k, v.into())).collect()),
         }
     }
 }
@@ -1485,9 +1644,17 @@ pub struct CustomAgentResponse {
     pub color: Option<String>,
     #[serde(default, rename = "topP", skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
-    #[serde(default, rename = "permissions", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "permissions",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub permission: Option<AgentPermissionsResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none", rename = "reasoningEffort")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "reasoningEffort"
+    )]
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub additional: HashMap<String, serde_json::Value>,
@@ -1551,7 +1718,11 @@ pub struct TemplateAgentResponse {
     pub color: Option<String>,
     #[serde(default, rename = "topP", skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f64>,
-    #[serde(default, rename = "permissions", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "permissions",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub permission: Option<AgentPermissionsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -1610,7 +1781,9 @@ pub async fn list_custom_agents() -> Result<Vec<CustomAgentResponse>, String> {
 
 /// Creates a new custom agent from the given configuration.
 #[tauri::command]
-pub async fn create_custom_agent(agent: CustomAgentResponse) -> Result<CustomAgentResponse, String> {
+pub async fn create_custom_agent(
+    agent: CustomAgentResponse,
+) -> Result<CustomAgentResponse, String> {
     tokio::task::spawn_blocking(move || {
         let agent: CustomAgent = agent.into();
         let path = custom_agents::create_agent(&agent).map_err(|e| e.to_string())?;
@@ -1624,7 +1797,10 @@ pub async fn create_custom_agent(agent: CustomAgentResponse) -> Result<CustomAge
 
 /// Updates an existing custom agent by name.
 #[tauri::command]
-pub async fn update_custom_agent(name: String, agent: CustomAgentResponse) -> Result<CustomAgentResponse, String> {
+pub async fn update_custom_agent(
+    name: String,
+    agent: CustomAgentResponse,
+) -> Result<CustomAgentResponse, String> {
     tokio::task::spawn_blocking(move || {
         let agent: CustomAgent = agent.into();
         let path = custom_agents::update_agent(&name, &agent).map_err(|e| e.to_string())?;
@@ -1649,7 +1825,10 @@ pub async fn delete_custom_agent(name: String) -> Result<(), String> {
 /// Returns the built-in agent templates available for selection.
 #[tauri::command]
 pub fn get_agent_templates() -> Result<Vec<AgentTemplateResponse>, String> {
-    Ok(custom_agents::get_templates().into_iter().map(|t| t.into()).collect())
+    Ok(custom_agents::get_templates()
+        .into_iter()
+        .map(|t| t.into())
+        .collect())
 }
 
 /// Request body for AI enhancement.
@@ -1675,7 +1854,9 @@ pub struct AgentEnhanceResponse {
 /// Sends a system prompt to the proxy asking it to improve the given text
 /// or provide configuration suggestions.
 #[tauri::command]
-pub async fn enhance_agent_text(request: AgentEnhanceRequest) -> Result<AgentEnhanceResponse, String> {
+pub async fn enhance_agent_text(
+    request: AgentEnhanceRequest,
+) -> Result<AgentEnhanceResponse, String> {
     if request.model_group.trim().is_empty() {
         return Err("model_group must not be empty".to_string());
     }
@@ -1710,7 +1891,9 @@ Return ONLY the JSON object, no explanations."#
 
     let user_content = request.text;
 
-    let model = request.model_group.strip_prefix("coderouter/")
+    let model = request
+        .model_group
+        .strip_prefix("coderouter/")
         .unwrap_or(&request.model_group);
 
     let body = serde_json::json!({
@@ -1735,7 +1918,11 @@ Return ONLY the JSON object, no explanations."#
     if !resp.status().is_success() {
         let status = resp.status();
         let err_text = resp.text().await.unwrap_or_default();
-        return Err(format!("Proxy returned {}: {}", status, err_text.chars().take(200).collect::<String>()));
+        return Err(format!(
+            "Proxy returned {}: {}",
+            status,
+            err_text.chars().take(200).collect::<String>()
+        ));
     }
 
     let json: serde_json::Value = resp

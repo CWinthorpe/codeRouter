@@ -1,18 +1,19 @@
 //! Upstream HTTP request construction and dispatch.
 //!
-//! Builds `reqwest` requests for OpenAI and Anthropic providers, handles
-//! protocol-specific headers and body translation, and sends requests with
-//! an optional latency timeout.
+//! Builds `reqwest` requests for OpenAI, Anthropic, and Codex providers,
+//! handles protocol-specific headers and body translation, and sends
+//! requests with an optional latency timeout.
 
 use reqwest::Client;
 use serde_json::Value;
 
 /// Builds a `reqwest::RequestBuilder` for a chat-completion request.
 ///
-/// If `is_anthropic` is true, translates the OpenAI-format body to
-/// Anthropic `/messages` format and attaches Anthropic auth headers.
-/// Otherwise, injects the `upstream_model` into the JSON body and uses
-/// a standard `Bearer` token header.
+/// - `is_anthropic`: translates to Anthropic `/messages` format.
+/// - `codex_tokens`: if `Some((account_id, id_token))`, translates to Codex
+///   `/responses` format and attaches Codex auth headers. The `api_key` is
+///   the access_token.
+/// - Otherwise, injects `upstream_model` and uses a standard `Bearer` token.
 pub fn build_upstream_request(
     client: &Client,
     body: &Value,
@@ -20,13 +21,20 @@ pub fn build_upstream_request(
     upstream_model: &str,
     url: &str,
     is_anthropic: bool,
+    codex_tokens: Option<(Option<&str>, Option<&str>)>,
 ) -> reqwest::RequestBuilder {
     let mut req = client.post(url);
 
-    if is_anthropic {
-        use crate::proxy::translator;
-        let anthropic_req = translator::openai_to_anthropic(body, upstream_model);
-        let anthropic_headers = translator::anthropic_headers(api_key);
+    if let Some((account_id, id_token)) = codex_tokens {
+        let codex_req = crate::proxy::codex::openai_to_codex_request(body, upstream_model);
+        let headers = crate::proxy::codex::build_codex_auth_headers(api_key, account_id, id_token);
+        for (key, value) in &headers {
+            req = req.header(key, value);
+        }
+        req = req.json(&codex_req);
+    } else if is_anthropic {
+        let anthropic_req = crate::proxy::translator::openai_to_anthropic(body, upstream_model);
+        let anthropic_headers = crate::proxy::translator::anthropic_headers(api_key);
         for (key, value) in &anthropic_headers {
             req = req.header(key, value);
         }
@@ -43,8 +51,8 @@ pub fn build_upstream_request(
 
 /// Builds a `reqwest::RequestBuilder` for a legacy `/completions` request.
 ///
-/// For Anthropic providers, converts the `prompt` field into a single-user
-/// `messages` array since Anthropic has no `/completions` endpoint.
+/// For Anthropic and Codex providers, converts the `prompt` field into a
+/// single-user `messages` array since neither has a `/completions` endpoint.
 pub fn build_completion_request(
     client: &Client,
     body: &Value,
@@ -64,7 +72,10 @@ pub fn build_completion_request(
         if let Some(model) = body.get("model").and_then(|v| v.as_str()) {
             anthropic_body.insert("model".to_string(), Value::String(model.to_string()));
         } else {
-            anthropic_body.insert("model".to_string(), Value::String(upstream_model.to_string()));
+            anthropic_body.insert(
+                "model".to_string(),
+                Value::String(upstream_model.to_string()),
+            );
         }
         if let Some(prompt) = body.get("prompt") {
             let messages = vec![serde_json::json!({
@@ -74,7 +85,10 @@ pub fn build_completion_request(
             anthropic_body.insert("messages".to_string(), Value::Array(messages));
         }
         if let Some(max_tokens) = body.get("max_tokens").and_then(|v| v.as_u64()) {
-            anthropic_body.insert("max_tokens".to_string(), Value::Number(serde_json::Number::from(max_tokens)));
+            anthropic_body.insert(
+                "max_tokens".to_string(),
+                Value::Number(serde_json::Number::from(max_tokens)),
+            );
         }
         req = req.json(&anthropic_body);
     } else {
