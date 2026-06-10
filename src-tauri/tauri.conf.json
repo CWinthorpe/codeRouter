@@ -1,7 +1,7 @@
 {
   "identifier": "dev.coderouter.app",
   "productName": "CodeRouter",
-  "version": "0.1.36",
+  "version": "0.1.37",
   "build": {
     "beforeBuildCommand": "npm run build",
     "beforeDevCommand": "npm run dev",

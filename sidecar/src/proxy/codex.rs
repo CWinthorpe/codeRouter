@@ -16,7 +16,7 @@ const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_DEVICE_EXPIRES_IN_SECONDS: u64 = 15 * 60;
 pub const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.135.0";
-const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+const CODEX_ORIGINATOR: &str = "opencode";
 
 // ── Codex auth types ──
 
@@ -45,25 +45,22 @@ pub fn parse_codex_credential(
 ) -> (String, Option<String>, Option<String>, Option<String>) {
     if credential.trim().starts_with('{') {
         if let Ok(auth) = serde_json::from_str::<CodexAuth>(credential) {
-            // Also extract account_id from id_token JWT claims if available
-            let (acct_from_jwt, _) = decode_id_token_claims(auth.tokens.id_token.as_deref());
-            let account_id = auth.tokens.account_id.or(acct_from_jwt);
-            return (
-                auth.tokens.access_token,
-                account_id,
-                auth.tokens.id_token,
-                auth.tokens.refresh_token,
-            );
+            let access_token = auth.tokens.access_token;
+            let id_token = auth.tokens.id_token;
+            let refresh_token = auth.tokens.refresh_token;
+            let (acct_from_id, _) = decode_id_token_claims(id_token.as_deref());
+            let (acct_from_access, _) = decode_id_token_claims(Some(&access_token));
+            let account_id = auth.tokens.account_id.or(acct_from_id).or(acct_from_access);
+            return (access_token, account_id, id_token, refresh_token);
         }
         if let Ok(tokens) = serde_json::from_str::<CodexTokens>(credential) {
-            let (acct_from_jwt, _) = decode_id_token_claims(tokens.id_token.as_deref());
-            let account_id = tokens.account_id.or(acct_from_jwt);
-            return (
-                tokens.access_token,
-                account_id,
-                tokens.id_token,
-                tokens.refresh_token,
-            );
+            let access_token = tokens.access_token;
+            let id_token = tokens.id_token;
+            let refresh_token = tokens.refresh_token;
+            let (acct_from_id, _) = decode_id_token_claims(id_token.as_deref());
+            let (acct_from_access, _) = decode_id_token_claims(Some(&access_token));
+            let account_id = tokens.account_id.or(acct_from_id).or(acct_from_access);
+            return (access_token, account_id, id_token, refresh_token);
         }
         // Fallback: raw JSON string extraction
         if let Ok(value) = serde_json::from_str::<Value>(credential) {
@@ -90,9 +87,9 @@ pub fn parse_codex_credential(
                 .or_else(|| value.pointer("/tokens/id_token"))
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
-            // Also try JWT claims for account_id
-            let (acct_from_jwt, _) = decode_id_token_claims(id.as_deref());
-            let account_id = account.or(acct_from_jwt);
+            let (acct_from_id, _) = decode_id_token_claims(id.as_deref());
+            let (acct_from_access, _) = decode_id_token_claims(Some(access));
+            let account_id = account.or(acct_from_id).or(acct_from_access);
             return (access.to_string(), account_id, id, refresh);
         }
     }
@@ -101,7 +98,7 @@ pub fn parse_codex_credential(
     (credential.to_string(), None, None, None)
 }
 
-/// Decodes the id_token JWT payload and returns `(chatgpt_account_id, is_fedramp)`.
+/// Decodes a Codex JWT payload and returns `(chatgpt_account_id, is_fedramp)`.
 ///
 /// Checks both top-level `fedramp` and the nested `https://api.openai.com/auth`
 /// namespace used by Codex JWTs.
@@ -126,7 +123,10 @@ fn decode_id_token_claims(id_token: Option<&str>) -> (Option<String>, bool) {
     let mut account_id = None;
     let mut is_fedramp = false;
 
-    // Top-level claims (simple form)
+    if let Some(acct) = value.get("chatgpt_account_id").and_then(|v| v.as_str()) {
+        account_id = Some(acct.to_string());
+    }
+
     if let Some(fr) = value.get("fedramp").and_then(|v| v.as_bool()) {
         is_fedramp = fr;
     }
@@ -144,6 +144,16 @@ fn decode_id_token_claims(id_token: Option<&str>) -> (Option<String>, bool) {
         }
     }
 
+    if account_id.is_none() {
+        account_id = value
+            .get("organizations")
+            .and_then(|v| v.as_array())
+            .and_then(|items| items.first())
+            .and_then(|item| item.get("id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+    }
+
     (account_id, is_fedramp)
 }
 
@@ -157,9 +167,8 @@ pub fn check_fedramp(id_token: &str) -> bool {
 ///
 /// Headers:
 /// - `Authorization: Bearer <access_token>`
-/// - `version: <package version>`
-/// - Codex client identity headers (`originator`, `user-agent`)
-/// - `ChatGPT-Account-ID: <account_id>` when present
+/// - Codex client identity headers (`originator`, `User-Agent`)
+/// - `ChatGPT-Account-Id: <account_id>` when present
 /// - `X-OpenAI-Fedramp: true` when the id token claims FedRAMP
 pub fn build_codex_auth_headers(
     access_token: &str,
@@ -173,13 +182,12 @@ pub fn build_codex_auth_headers(
         ),
         ("content-type".to_string(), "application/json".to_string()),
         ("originator".to_string(), CODEX_ORIGINATOR.to_string()),
-        ("user-agent".to_string(), codex_user_agent()),
-        ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
+        ("User-Agent".to_string(), codex_user_agent()),
     ];
 
     if let Some(aid) = account_id {
         if !aid.is_empty() {
-            headers.push(("ChatGPT-Account-ID".to_string(), aid.to_string()));
+            headers.push(("ChatGPT-Account-Id".to_string(), aid.to_string()));
         }
     }
 
@@ -201,11 +209,21 @@ pub fn codex_client_version() -> String {
 
 fn codex_user_agent() -> String {
     format!(
-        "{}/{} coderouter/{}",
+        "{}/{} ({} {}; {})",
         CODEX_ORIGINATOR,
-        codex_client_version(),
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        platform_release(),
+        std::env::consts::ARCH
     )
+}
+
+fn platform_release() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/osrelease")
+        .map(|s| s.trim().to_string())
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub fn new_codex_request_id() -> String {
@@ -213,17 +231,7 @@ pub fn new_codex_request_id() -> String {
 }
 
 pub fn build_codex_responses_headers(request_id: &str) -> Vec<(String, String)> {
-    vec![
-        ("accept".to_string(), "text/event-stream".to_string()),
-        ("x-client-request-id".to_string(), request_id.to_string()),
-        ("session-id".to_string(), request_id.to_string()),
-        ("thread-id".to_string(), request_id.to_string()),
-        ("x-codex-window-id".to_string(), codex_window_id(request_id)),
-    ]
-}
-
-fn codex_window_id(request_id: &str) -> String {
-    format!("{request_id}:0")
+    vec![("session-id".to_string(), request_id.to_string())]
 }
 
 // ── Device auth ──
@@ -305,6 +313,7 @@ pub async fn start_device_auth(
     );
     let resp = client
         .post(url)
+        .header("User-Agent", codex_user_agent())
         .json(&serde_json::json!({ "client_id": CODEX_CLIENT_ID }))
         .send()
         .await?;
@@ -336,6 +345,7 @@ pub async fn poll_device_auth(
     );
     let resp = client
         .post(url)
+        .header("User-Agent", codex_user_agent())
         .json(&serde_json::json!({
             "device_auth_id": device_auth_id,
             "user_code": user_code,
@@ -379,6 +389,7 @@ async fn exchange_device_authorization_code(
     );
     let resp = client
         .post(token_endpoint)
+        .header("User-Agent", codex_user_agent())
         .form(&[
             ("grant_type", "authorization_code"),
             ("code", code.authorization_code.as_str()),
@@ -479,15 +490,14 @@ pub async fn refresh_access_token(
     client: &reqwest::Client,
     refresh_token: &str,
 ) -> Result<(String, Option<String>, Option<String>), Box<dyn std::error::Error + Send + Sync>> {
-    let payload = serde_json::json!({
-        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token,
-    });
-
     let resp = client
         .post("https://auth.openai.com/oauth/token")
-        .json(&payload)
+        .header("User-Agent", codex_user_agent())
+        .form(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", CODEX_CLIENT_ID),
+        ])
         .send()
         .await?;
 
@@ -560,9 +570,9 @@ pub async fn resolve_codex_credential(
 /// Converts an OpenAI chat-completion request body into a Codex Responses API request.
 ///
 /// Mapping rules:
-/// - `system` / `developer` messages → single `instructions` string.
-/// - `user` messages → `message` items with `input_text` content.
-/// - `assistant` text messages → `message` items with `output_text` content.
+/// - `system` / `developer` messages → a `system` input item.
+/// - `user` messages → `user` input items with `input_text` content.
+/// - `assistant` text messages → `assistant` input items with `output_text` content.
 /// - `tool` result messages → `function_call_output` items.
 /// - Assistant `tool_calls` → `function_call` items.
 /// - Chat `tools` → Responses function tools.
@@ -597,15 +607,21 @@ pub fn openai_to_codex_request_with_id(
                 }
             }
             "user" => {
-                let content = extract_text_content(msg);
                 let item = serde_json::json!({
-                    "type": "message",
                     "role": "user",
-                    "content": [{ "type": "input_text", "text": content }]
+                    "content": lower_user_content(msg)
                 });
                 input_items.push(item);
             }
             "assistant" => {
+                let content = extract_text_content(msg);
+                if !content.is_empty() {
+                    let item = serde_json::json!({
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": content }]
+                    });
+                    input_items.push(item);
+                }
                 if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                     for tc in tool_calls {
                         let func = tc.get("function");
@@ -615,8 +631,8 @@ pub fn openai_to_codex_request_with_id(
                             .unwrap_or("");
                         let arguments = func
                             .and_then(|f| f.get("arguments"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("{}");
+                            .map(json_value_as_string)
+                            .unwrap_or_else(|| "{}".to_string());
                         let call_id = tc
                             .get("id")
                             .and_then(|v| v.as_str())
@@ -630,15 +646,6 @@ pub fn openai_to_codex_request_with_id(
                         });
                         input_items.push(item);
                     }
-                }
-                let content = extract_text_content(msg);
-                if !content.is_empty() {
-                    let item = serde_json::json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": content }]
-                    });
-                    input_items.push(item);
                 }
             }
             "tool" => {
@@ -659,37 +666,81 @@ pub fn openai_to_codex_request_with_id(
         }
     }
 
-    let instructions = if instructions_parts.is_empty() {
-        None
-    } else {
-        Some(instructions_parts.join("\n\n"))
-    };
+    if !instructions_parts.is_empty() {
+        input_items.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": instructions_parts.join("\n\n")
+            }),
+        );
+    }
 
-    let mut body = serde_json::json!({
-        "model": upstream_model,
-        "input": input_items,
-        "tools": [],
-        "tool_choice": "auto",
-        "parallel_tool_calls": false,
-        "store": false,
-        "stream": true,
-        "include": [],
-        "prompt_cache_key": request_id,
-        "client_metadata": {
-            "x-codex-installation-id": request_id,
-            "x-codex-window-id": codex_window_id(request_id),
-        },
-    });
+    let mut body = serde_json::Map::new();
+    body.insert(
+        "model".to_string(),
+        Value::String(upstream_model.to_string()),
+    );
+    body.insert("input".to_string(), Value::Array(input_items));
+    body.insert("stream".to_string(), Value::Bool(true));
+    body.insert("store".to_string(), Value::Bool(false));
+    body.insert(
+        "prompt_cache_key".to_string(),
+        Value::String(request_id.to_string()),
+    );
 
-    if let Some(instructions) = instructions {
-        body["instructions"] = Value::String(instructions);
+    if uses_openai_gpt5_defaults(upstream_model) {
+        body.insert(
+            "reasoning".to_string(),
+            serde_json::json!({ "effort": "medium", "summary": "auto" }),
+        );
+        body.insert(
+            "include".to_string(),
+            serde_json::json!(["reasoning.encrypted_content"]),
+        );
+
+        if uses_openai_gpt5_text_verbosity(upstream_model) {
+            body.insert(
+                "text".to_string(),
+                serde_json::json!({ "verbosity": "low" }),
+            );
+        }
+    }
+
+    if let Some(instructions) = openai_body.get("instructions").and_then(|v| v.as_str()) {
+        body.insert(
+            "instructions".to_string(),
+            Value::String(instructions.to_string()),
+        );
     }
 
     // Pass through reasoning / reasoning_effort
     if let Some(reasoning) = openai_body.get("reasoning") {
-        body["reasoning"] = reasoning.clone();
+        body.insert("reasoning".to_string(), reasoning.clone());
     } else if let Some(effort) = openai_body.get("reasoning_effort").and_then(|v| v.as_str()) {
-        body["reasoning"] = serde_json::json!({ "effort": effort });
+        let mut reasoning = serde_json::Map::new();
+        reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+        if openai_body
+            .get("reasoning_summary")
+            .and_then(|v| v.as_str())
+            == Some("auto")
+            || uses_openai_gpt5_defaults(upstream_model)
+        {
+            reasoning.insert("summary".to_string(), Value::String("auto".to_string()));
+        }
+        body.insert("reasoning".to_string(), Value::Object(reasoning));
+    }
+
+    if let Some(include) = openai_body.get("include") {
+        if include.as_array().is_some_and(|items| !items.is_empty()) {
+            body.insert("include".to_string(), include.clone());
+        } else {
+            body.remove("include");
+        }
+    }
+
+    if let Some(text) = openai_body.get("text").filter(|v| v.is_object()) {
+        body.insert("text".to_string(), text.clone());
     }
 
     // Tools: chat → codex function tools
@@ -699,63 +750,142 @@ pub fn openai_to_codex_request_with_id(
             .filter_map(|t| {
                 if t.get("type").and_then(|v| v.as_str()) == Some("function") {
                     let func = t.get("function")?;
-                    Some(serde_json::json!({
-                        "type": "function",
-                        "name": func.get("name"),
-                        "description": func.get("description"),
-                        "parameters": func.get("parameters"),
-                        "strict": func.get("strict"),
-                    }))
+                    let name = func.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if name.is_empty() {
+                        return None;
+                    }
+                    let mut tool = serde_json::Map::new();
+                    tool.insert("type".to_string(), Value::String("function".to_string()));
+                    tool.insert("name".to_string(), Value::String(name.to_string()));
+                    tool.insert(
+                        "description".to_string(),
+                        Value::String(
+                            func.get("description")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ),
+                    );
+                    tool.insert(
+                        "parameters".to_string(),
+                        func.get("parameters").cloned().unwrap_or_else(
+                            || serde_json::json!({ "type": "object", "properties": {} }),
+                        ),
+                    );
+                    if let Some(strict) = func.get("strict").and_then(|v| v.as_bool()) {
+                        tool.insert("strict".to_string(), Value::Bool(strict));
+                    }
+                    Some(Value::Object(tool))
                 } else {
                     None
                 }
             })
             .collect();
         if !codex_tools.is_empty() {
-            body["tools"] = Value::Array(codex_tools);
+            body.insert("tools".to_string(), Value::Array(codex_tools));
         }
     }
 
-    // parallel_tool_calls
-    if let Some(ptc) = openai_body
-        .get("parallel_tool_calls")
-        .and_then(|v| v.as_bool())
-    {
-        body["parallel_tool_calls"] = Value::Bool(ptc);
-    } else {
-        body["parallel_tool_calls"] = Value::Bool(false);
+    if let Some(tool_choice) = lower_tool_choice(openai_body.get("tool_choice")) {
+        body.insert("tool_choice".to_string(), tool_choice);
     }
 
-    // tool_choice — pass through if a simple string, ignore object forms
-    if let Some(tc) = openai_body.get("tool_choice").and_then(|v| v.as_str()) {
-        body["tool_choice"] = Value::String(tc.to_string());
-    } else {
-        body["tool_choice"] = Value::String("auto".to_string());
-    }
-
-    // Common params
     if let Some(temp) = openai_body.get("temperature") {
-        body["temperature"] = temp.clone();
+        body.insert("temperature".to_string(), temp.clone());
     }
     if let Some(top_p) = openai_body.get("top_p") {
-        body["top_p"] = top_p.clone();
+        body.insert("top_p".to_string(), top_p.clone());
     }
-    if let Some(max_tokens) = openai_body.get("max_tokens") {
-        body["max_output_tokens"] = max_tokens.clone();
-    } else if let Some(max_completion) = openai_body.get("max_completion_tokens") {
-        body["max_output_tokens"] = max_completion.clone();
+    if let Some(store) = openai_body.get("store").and_then(|v| v.as_bool()) {
+        body.insert("store".to_string(), Value::Bool(store));
     }
-    if let Some(stop) = openai_body.get("stop") {
-        body["stop"] = stop.clone();
-    }
-    if let Some(seed) = openai_body.get("seed") {
-        body["seed"] = seed.clone();
-    }
-    if let Some(user) = openai_body.get("user") {
-        body["user"] = user.clone();
+    if let Some(prompt_cache_key) = openai_body.get("prompt_cache_key").and_then(|v| v.as_str()) {
+        body.insert(
+            "prompt_cache_key".to_string(),
+            Value::String(prompt_cache_key.to_string()),
+        );
     }
 
-    body
+    Value::Object(body)
+}
+
+fn uses_openai_gpt5_defaults(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    id.contains("gpt-5") && !id.contains("gpt-5-chat") && !id.contains("gpt-5-pro")
+}
+
+fn uses_openai_gpt5_text_verbosity(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    id.contains("gpt-5.") && !id.contains("codex") && !id.contains("-chat")
+}
+
+fn json_value_as_string(value: &Value) -> String {
+    value
+        .as_str()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string()))
+}
+
+fn lower_user_content(msg: &Value) -> Vec<Value> {
+    let Some(content) = msg.get("content") else {
+        return vec![serde_json::json!({ "type": "input_text", "text": "" })];
+    };
+
+    if let Some(text) = content.as_str() {
+        return vec![serde_json::json!({ "type": "input_text", "text": text })];
+    }
+
+    if let Some(parts) = content.as_array() {
+        let lowered: Vec<Value> = parts
+            .iter()
+            .filter_map(|part| match part.get("type").and_then(|v| v.as_str()) {
+                Some("text") | Some("input_text") => part
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .map(|text| serde_json::json!({ "type": "input_text", "text": text })),
+                Some("image_url") | Some("input_image") => extract_image_url(part)
+                    .map(|url| serde_json::json!({ "type": "input_image", "image_url": url })),
+                _ => None,
+            })
+            .collect();
+        if !lowered.is_empty() {
+            return lowered;
+        }
+    }
+
+    vec![serde_json::json!({
+        "type": "input_text",
+        "text": extract_text_content(msg)
+    })]
+}
+
+fn extract_image_url(part: &Value) -> Option<String> {
+    let image = part.get("image_url")?;
+    if let Some(url) = image.as_str() {
+        return Some(url.to_string());
+    }
+    image
+        .get("url")
+        .and_then(|v| v.as_str())
+        .map(|url| url.to_string())
+}
+
+fn lower_tool_choice(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    if let Some(choice) = value.as_str() {
+        return Some(Value::String(choice.to_string()));
+    }
+
+    if value.get("type").and_then(|v| v.as_str()) == Some("function") {
+        let name = value
+            .get("function")
+            .and_then(|v| v.get("name"))
+            .or_else(|| value.get("name"))
+            .and_then(|v| v.as_str())?;
+        return Some(serde_json::json!({ "type": "function", "name": name }));
+    }
+
+    None
 }
 
 fn extract_text_content(msg: &Value) -> String {
@@ -1202,6 +1332,38 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_json_with_top_level_jwt_account_id() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"chatgpt_account_id":"acct-top"}"#);
+        let id_token = format!("h.{payload}.s");
+        let json = serde_json::json!({
+            "tokens": {
+                "access_token": "at-top",
+                "id_token": id_token
+            }
+        });
+
+        let (_, account, _, _) = parse_codex_credential(&json.to_string());
+        assert_eq!(account, Some("acct-top".to_string()));
+    }
+
+    #[test]
+    fn test_parse_json_with_organization_account_id() {
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(r#"{"organizations":[{"id":"org-account"}]}"#);
+        let id_token = format!("h.{payload}.s");
+        let json = serde_json::json!({
+            "tokens": {
+                "access_token": "at-org",
+                "id_token": id_token
+            }
+        });
+
+        let (_, account, _, _) = parse_codex_credential(&json.to_string());
+        assert_eq!(account, Some("org-account".to_string()));
+    }
+
+    #[test]
     fn test_parse_json_account_id_from_both_sources() {
         // auth.json top-level account_id takes precedence over JWT claim
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -1273,19 +1435,16 @@ mod tests {
             .any(|(k, v)| k == "Authorization" && v == "Bearer access-token"));
         assert!(headers
             .iter()
-            .any(|(k, v)| k == "ChatGPT-Account-ID" && v == "account-id"));
+            .any(|(k, v)| k == "ChatGPT-Account-Id" && v == "account-id"));
         assert!(headers
             .iter()
             .any(|(k, v)| k == "content-type" && v == "application/json"));
         assert!(headers
             .iter()
-            .any(|(k, v)| k == "version" && v == env!("CARGO_PKG_VERSION")));
-        assert!(headers
-            .iter()
             .any(|(k, v)| k == "originator" && v == CODEX_ORIGINATOR));
         assert!(headers
             .iter()
-            .any(|(k, v)| k == "user-agent" && v.contains("coderouter/")));
+            .any(|(k, v)| k == "User-Agent" && v.starts_with("opencode/")));
         assert!(!headers.iter().any(|(k, _)| k == "X-OpenAI-Fedramp"));
     }
 
@@ -1294,16 +1453,8 @@ mod tests {
         let headers = build_codex_responses_headers("request-123");
         assert!(headers
             .iter()
-            .any(|(k, v)| k == "accept" && v == "text/event-stream"));
-        assert!(headers
-            .iter()
             .any(|(k, v)| k == "session-id" && v == "request-123"));
-        assert!(headers
-            .iter()
-            .any(|(k, v)| k == "thread-id" && v == "request-123"));
-        assert!(headers
-            .iter()
-            .any(|(k, v)| k == "x-codex-window-id" && v == "request-123:0"));
+        assert_eq!(headers.len(), 1);
     }
 
     #[test]
@@ -1323,7 +1474,7 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(k, v)| k == "Authorization" && v == "Bearer at"));
-        assert!(!headers.iter().any(|(k, _)| k == "ChatGPT-Account-ID"));
+        assert!(!headers.iter().any(|(k, _)| k == "ChatGPT-Account-Id"));
     }
 
     // ── JWT expiry tests ──
@@ -1444,23 +1595,21 @@ mod tests {
         assert_eq!(result["model"], "gpt-5-codex");
         assert_eq!(result["stream"], true);
         assert_eq!(result["store"], false);
-        assert_eq!(result["include"].as_array().unwrap().len(), 0);
-        assert_eq!(result["tools"].as_array().unwrap().len(), 0);
-        assert_eq!(result["tool_choice"], "auto");
-        assert_eq!(result["parallel_tool_calls"], false);
+        assert_eq!(result["include"][0], "reasoning.encrypted_content");
+        assert_eq!(result["reasoning"]["effort"], "medium");
+        assert_eq!(result["reasoning"]["summary"], "auto");
+        assert!(result.get("tools").is_none());
+        assert!(result.get("tool_choice").is_none());
+        assert!(result.get("parallel_tool_calls").is_none());
         assert_eq!(result["prompt_cache_key"], "request-123");
-        assert_eq!(
-            result["client_metadata"]["x-codex-installation-id"],
-            "request-123"
-        );
-        assert_eq!(
-            result["client_metadata"]["x-codex-window-id"],
-            "request-123:0"
-        );
-        assert_eq!(result["instructions"], "You are helpful.");
-        assert!(result["input"].as_array().unwrap().len() == 1);
-        assert_eq!(result["input"][0]["role"], "user");
-        assert_eq!(result["max_output_tokens"], 100);
+        assert!(result.get("client_metadata").is_none());
+        assert!(result.get("instructions").is_none());
+        assert_eq!(result["input"].as_array().unwrap().len(), 2);
+        assert_eq!(result["input"][0]["role"], "system");
+        assert_eq!(result["input"][0]["content"], "You are helpful.");
+        assert_eq!(result["input"][1]["role"], "user");
+        assert_eq!(result["input"][1]["content"][0]["text"], "Hello");
+        assert!(result.get("max_output_tokens").is_none());
         assert_eq!(result["temperature"], 0.7);
     }
 
@@ -1475,12 +1624,11 @@ mod tests {
                     "description": "Get weather",
                     "parameters": {"type": "object", "properties": {}}
                 }
-            }],
-            "parallel_tool_calls": false
+            }]
         });
 
         let result = openai_to_codex_request(&openai_req, "model");
-        assert_eq!(result["parallel_tool_calls"], false);
+        assert!(result.get("parallel_tool_calls").is_none());
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");

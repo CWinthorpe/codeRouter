@@ -492,14 +492,24 @@ pub async fn test_provider_connection(provider_id: String) -> Result<TestConnect
             .header("x-api-key", &api_key)
             .header("anthropic-version", "2024-06-01"),
         "openai-codex" => {
-            let (access_token, account_id, id_token, _refresh) =
-                coderouter_proxy::proxy::codex::parse_codex_credential(&api_key);
+            let (access_token, account_id, id_token) =
+                coderouter_proxy::proxy::codex::resolve_codex_credential(
+                    &client,
+                    &api_key,
+                    &provider.credential_key,
+                )
+                .await
+                .map_err(|e| format!("Failed to prepare Codex credential: {e}"))?;
             let headers = coderouter_proxy::proxy::codex::build_codex_auth_headers(
                 &access_token,
                 account_id.as_deref(),
                 id_token.as_deref(),
             );
-            let mut req = client.get(base_url).header("accept", "application/json");
+            let client_version = coderouter_proxy::proxy::codex::codex_client_version();
+            let mut req = client
+                .get(&models_url)
+                .query(&[("client_version", client_version.as_str())])
+                .header("accept", "application/json");
             for (k, v) in &headers {
                 req = req.header(k, v);
             }
