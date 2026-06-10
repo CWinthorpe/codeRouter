@@ -133,8 +133,7 @@ export default function OpenCodeSetup() {
     setPreviewLoading(true);
     try {
       const m = mappingForPreview();
-      const hasAnyMapping = m.build || m.plan || m.general || m.explore || m.compaction || m.title || m.summary || m.small_model;
-      const json = await previewOpencodeConfig(proxyPort, hasAnyMapping ? m : null);
+      const json = await previewOpencodeConfig(proxyPort, m);
       setPreviewJson(json);
     } catch {
       setPreviewJson('Failed to load preview');
@@ -214,9 +213,9 @@ export default function OpenCodeSetup() {
     }
   }, [providerEnabled, proxyPort, addToast]);
 
-  /** Updates a single agent→group mapping key, converting empty strings to null. */
+  /** Updates a single agent→group mapping key, converting defaults to null. */
   const handleMappingChange = useCallback((key: keyof OpenCodeAgentMapping, value: string) => {
-    setMapping((prev) => ({ ...prev, [key]: value || null }));
+    setMapping((prev) => ({ ...prev, [key]: value === '__none__' || !value ? null : value }));
   }, []);
 
   const handleReasoningChange = useCallback((agentKey: string, value: string) => {
@@ -385,7 +384,7 @@ export default function OpenCodeSetup() {
             {AGENT_KEYS.map((key) => (
               <div key={key} className="flex items-center gap-3">
                 <label className="w-40 shrink-0 text-sm text-zinc-300">{AGENT_LABELS[key]}</label>
-                <Select value={mapping[key] ?? ''} onValueChange={(v) => handleMappingChange(key, v === '__none__' ? '' : v)}>
+                <Select value={mapping[key] ?? '__none__'} onValueChange={(v) => handleMappingChange(key, v)}>
                   <SelectTrigger className="flex-1 border-zinc-700 bg-zinc-800 text-zinc-100">
                     <SelectValue />
                   </SelectTrigger>
@@ -418,7 +417,7 @@ export default function OpenCodeSetup() {
                 Small/Fast model
                 <span className="ml-1 text-zinc-500">(titles, summaries)</span>
               </label>
-              <Select value={mapping.small_model ?? ''} onValueChange={(v) => handleMappingChange('small_model', v === '__none__' ? '' : v)}>
+              <Select value={mapping.small_model ?? '__none__'} onValueChange={(v) => handleMappingChange('small_model', v)}>
                 <SelectTrigger className="flex-1 border-zinc-700 bg-zinc-800 text-zinc-100">
                   <SelectValue />
                 </SelectTrigger>

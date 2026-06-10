@@ -570,7 +570,7 @@ pub async fn resolve_codex_credential(
 /// Converts an OpenAI chat-completion request body into a Codex Responses API request.
 ///
 /// Mapping rules:
-/// - `system` / `developer` messages → a `system` input item.
+/// - `system` / `developer` messages → top-level `instructions`.
 /// - `user` messages → `user` input items with `input_text` content.
 /// - `assistant` text messages → `assistant` input items with `output_text` content.
 /// - `tool` result messages → `function_call_output` items.
@@ -666,16 +666,6 @@ pub fn openai_to_codex_request_with_id(
         }
     }
 
-    if !instructions_parts.is_empty() {
-        input_items.insert(
-            0,
-            serde_json::json!({
-                "role": "system",
-                "content": instructions_parts.join("\n\n")
-            }),
-        );
-    }
-
     let mut body = serde_json::Map::new();
     body.insert(
         "model".to_string(),
@@ -707,12 +697,19 @@ pub fn openai_to_codex_request_with_id(
         }
     }
 
-    if let Some(instructions) = openai_body.get("instructions").and_then(|v| v.as_str()) {
-        body.insert(
-            "instructions".to_string(),
-            Value::String(instructions.to_string()),
-        );
+    if let Some(instructions) = openai_body
+        .get("instructions")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+    {
+        instructions_parts.insert(0, instructions.to_string());
     }
+    let instructions = if instructions_parts.is_empty() {
+        "You are a helpful assistant.".to_string()
+    } else {
+        instructions_parts.join("\n\n")
+    };
+    body.insert("instructions".to_string(), Value::String(instructions));
 
     // Pass through reasoning / reasoning_effort
     if let Some(reasoning) = openai_body.get("reasoning") {
@@ -937,6 +934,7 @@ pub struct CodexToOpenAIStream<S> {
     state: CodexStreamState,
     token_counts: Arc<Mutex<StreamTokenCounts>>,
     has_sent_role: bool,
+    pending_event_type: Option<String>,
 }
 
 enum CodexStreamState {
@@ -958,21 +956,36 @@ where
             state: CodexStreamState::Waiting,
             token_counts,
             has_sent_role: false,
+            pending_event_type: None,
         }
+    }
+
+    fn translate_sse_data(&mut self, data: &str) -> Result<Option<String>, std::io::Error> {
+        let owned;
+        let data = if let Some(event_type) = self.pending_event_type.take() {
+            owned = apply_sse_event_type(data, &event_type);
+            owned.as_str()
+        } else {
+            data
+        };
+        self.translate_event(data)
     }
 
     /// Translates a single Codex SSE event.
     ///
     /// Returns `Ok(Some(sse_text))` for normal output, `Ok(None)` for
     /// skip-able events, and `Err(...)` on upstream errors (`response.failed`
-    /// / `response.incomplete`).
+    /// / `error`).
     fn translate_event(&mut self, data: &str) -> Result<Option<String>, std::io::Error> {
         let event: Value = match serde_json::from_str(data) {
             Ok(e) => e,
             Err(_) => return Ok(None),
         };
 
-        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let mut event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if event_type.is_empty() && event.get("delta").and_then(|v| v.as_str()).is_some() {
+            event_type = "response.output_text.delta";
+        }
 
         match event_type {
             "response.output_text.delta" => {
@@ -1062,7 +1075,7 @@ where
                 Ok(None)
             }
 
-            "response.completed" => {
+            "response.completed" | "response.incomplete" => {
                 // Usage is nested under `event.response.usage` in Codex Responses
                 let usage = event
                     .get("response")
@@ -1078,18 +1091,21 @@ where
                     }
                 }
 
-                let mut output =
-                    build_openai_chunk(&self.chat_id, &self.group_alias, None, None, Some("stop"));
+                let finish_reason = codex_finish_reason(&event);
+                let mut output = build_openai_chunk(
+                    &self.chat_id,
+                    &self.group_alias,
+                    None,
+                    None,
+                    Some(finish_reason),
+                );
                 output.push_str("data: [DONE]\n\n");
+                self.state = CodexStreamState::Done;
                 Ok(Some(output))
             }
 
-            "response.failed" | "response.incomplete" => {
-                let detail = event
-                    .get("response")
-                    .and_then(|r| r.get("status_details"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(event_type);
+            "response.failed" | "error" => {
+                let detail = codex_error_message(&event, event_type);
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!("codex upstream error: {detail}"),
@@ -1098,6 +1114,59 @@ where
 
             _ => Ok(None),
         }
+    }
+}
+
+fn codex_finish_reason(event: &Value) -> &'static str {
+    match event
+        .get("response")
+        .and_then(|r| r.get("incomplete_details"))
+        .and_then(|d| d.get("reason"))
+        .and_then(|v| v.as_str())
+    {
+        Some("max_output_tokens") => "length",
+        Some("content_filter") => "content_filter",
+        _ => "stop",
+    }
+}
+
+fn codex_error_message(event: &Value, fallback: &str) -> String {
+    let nested = event.get("response").and_then(|r| r.get("error"));
+    let message = event
+        .get("message")
+        .or_else(|| nested.and_then(|e| e.get("message")))
+        .or_else(|| event.get("response").and_then(|r| r.get("status_details")))
+        .and_then(|v| v.as_str());
+    let code = event
+        .get("code")
+        .or_else(|| nested.and_then(|e| e.get("code")))
+        .and_then(|v| v.as_str());
+
+    match (code, message) {
+        (Some(code), Some(message)) if !code.is_empty() && !message.is_empty() => {
+            format!("{code}: {message}")
+        }
+        (_, Some(message)) if !message.is_empty() => message.to_string(),
+        (Some(code), _) if !code.is_empty() => code.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn apply_sse_event_type(data: &str, event_type: &str) -> String {
+    match serde_json::from_str::<Value>(data) {
+        Ok(Value::Object(mut obj)) => {
+            obj.entry("type".to_string())
+                .or_insert_with(|| Value::String(event_type.to_string()));
+            serde_json::to_string(&Value::Object(obj)).unwrap_or_else(|_| data.to_string())
+        }
+        Ok(Value::String(text)) if event_type.contains("delta") => {
+            serde_json::json!({ "type": event_type, "delta": text }).to_string()
+        }
+        Ok(value) => serde_json::json!({ "type": event_type, "data": value }).to_string(),
+        Err(_) if event_type.contains("delta") => {
+            serde_json::json!({ "type": event_type, "delta": data }).to_string()
+        }
+        Err(_) => serde_json::json!({ "type": event_type, "data": data }).to_string(),
     }
 }
 
@@ -1166,6 +1235,14 @@ where
                         let line = String::from_utf8_lossy(&line_bytes);
                         let line = line.strip_suffix('\r').unwrap_or(&line).trim();
 
+                        if let Some(event_type) = line
+                            .strip_prefix("event: ")
+                            .or_else(|| line.strip_prefix("event:"))
+                        {
+                            self.pending_event_type = Some(event_type.trim().to_string());
+                            continue;
+                        }
+
                         let data = if line.starts_with("data: ") {
                             Some(&line[6..])
                         } else if line.starts_with("data:") {
@@ -1176,7 +1253,7 @@ where
 
                         if let Some(data) = data {
                             if !data.is_empty() {
-                                match self.translate_event(data) {
+                                match self.translate_sse_data(data) {
                                     Ok(Some(output)) => {
                                         return Poll::Ready(Some(Ok(Bytes::from(output))));
                                     }
@@ -1196,25 +1273,31 @@ where
                 Poll::Ready(None) => {
                     if !self.buffer.is_empty() {
                         let remaining = String::from_utf8_lossy(&self.buffer);
-                        let remaining = remaining.trim().to_string();
-                        let data = if remaining.starts_with("data: ") {
-                            Some(&remaining[6..])
-                        } else if remaining.starts_with("data:") {
-                            Some(&remaining[5..])
-                        } else {
-                            None
-                        };
+                        let remaining = remaining.to_string();
+                        self.buffer.clear();
+                        let mut output = String::new();
 
-                        if let Some(data) = data {
-                            if !data.is_empty() {
-                                match self.translate_event(data) {
-                                    Ok(Some(output)) => {
-                                        self.buffer.clear();
-                                        return Poll::Ready(Some(Ok(Bytes::from(output))));
-                                    }
+                        for line in remaining.lines() {
+                            let line = line.strip_suffix('\r').unwrap_or(line).trim();
+                            if let Some(event_type) = line
+                                .strip_prefix("event: ")
+                                .or_else(|| line.strip_prefix("event:"))
+                            {
+                                self.pending_event_type = Some(event_type.trim().to_string());
+                                continue;
+                            }
+
+                            let data = if let Some(data) = line.strip_prefix("data: ") {
+                                Some(data)
+                            } else {
+                                line.strip_prefix("data:")
+                            };
+
+                            if let Some(data) = data.filter(|data| !data.is_empty()) {
+                                match self.translate_sse_data(data) {
+                                    Ok(Some(chunk)) => output.push_str(&chunk),
                                     Ok(None) => {}
                                     Err(e) => {
-                                        self.buffer.clear();
                                         self.state = CodexStreamState::Errored(
                                             std::io::Error::new(e.kind(), e.to_string()),
                                         );
@@ -1223,10 +1306,32 @@ where
                                 }
                             }
                         }
-                        self.buffer.clear();
+
+                        if !output.is_empty() {
+                            return Poll::Ready(Some(Ok(Bytes::from(output))));
+                        }
                     }
                     self.state = CodexStreamState::Done;
-                    return Poll::Ready(None);
+                    let mut output = String::new();
+                    if !self.has_sent_role {
+                        output.push_str(&build_openai_chunk(
+                            &self.chat_id,
+                            &self.group_alias,
+                            Some("assistant"),
+                            None,
+                            None,
+                        ));
+                        self.has_sent_role = true;
+                    }
+                    output.push_str(&build_openai_chunk(
+                        &self.chat_id,
+                        &self.group_alias,
+                        None,
+                        None,
+                        Some("stop"),
+                    ));
+                    output.push_str("data: [DONE]\n\n");
+                    return Poll::Ready(Some(Ok(Bytes::from(output))));
                 }
                 Poll::Pending => return Poll::Pending,
             }
@@ -1603,14 +1708,22 @@ mod tests {
         assert!(result.get("parallel_tool_calls").is_none());
         assert_eq!(result["prompt_cache_key"], "request-123");
         assert!(result.get("client_metadata").is_none());
-        assert!(result.get("instructions").is_none());
-        assert_eq!(result["input"].as_array().unwrap().len(), 2);
-        assert_eq!(result["input"][0]["role"], "system");
-        assert_eq!(result["input"][0]["content"], "You are helpful.");
-        assert_eq!(result["input"][1]["role"], "user");
-        assert_eq!(result["input"][1]["content"][0]["text"], "Hello");
+        assert_eq!(result["instructions"], "You are helpful.");
+        assert_eq!(result["input"].as_array().unwrap().len(), 1);
+        assert_eq!(result["input"][0]["role"], "user");
+        assert_eq!(result["input"][0]["content"][0]["text"], "Hello");
         assert!(result.get("max_output_tokens").is_none());
         assert_eq!(result["temperature"], 0.7);
+    }
+
+    #[test]
+    fn test_openai_to_codex_request_defaults_instructions() {
+        let openai_req = serde_json::json!({
+            "messages": [{"role": "user", "content": "test"}]
+        });
+
+        let result = openai_to_codex_request(&openai_req, "model");
+        assert_eq!(result["instructions"], "You are a helpful assistant.");
     }
 
     #[test]
@@ -1683,6 +1796,23 @@ mod tests {
     }
 
     #[test]
+    fn test_codex_stream_translation_delta_without_type() {
+        let mut streamer = make_streamer();
+        let data = r#"{"delta":"Hello"}"#;
+        let result = streamer.translate_event(data).unwrap().unwrap();
+        assert!(result.contains("chat.completion.chunk"));
+        assert!(result.contains("Hello"));
+    }
+
+    #[test]
+    fn test_apply_sse_event_type_adds_missing_type() {
+        let typed = apply_sse_event_type(r#"{"delta":"Hello"}"#, "response.output_text.delta");
+        let value: Value = serde_json::from_str(&typed).unwrap();
+        assert_eq!(value["type"], "response.output_text.delta");
+        assert_eq!(value["delta"], "Hello");
+    }
+
+    #[test]
     fn test_codex_stream_translation_completed_nested_usage() {
         // Usage under `event.response.usage` — the real Codex shape
         let mut streamer = make_streamer();
@@ -1719,14 +1849,11 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_stream_translation_incomplete_is_error() {
+    fn test_codex_stream_translation_incomplete_finishes_with_length() {
         let mut streamer = make_streamer();
-        let data = r#"{"type":"response.incomplete"}"#;
-        let result = streamer.translate_event(data);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("response.incomplete"));
+        let data = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
+        let result = streamer.translate_event(data).unwrap().unwrap();
+        assert!(result.contains("[DONE]"));
+        assert!(result.contains("\"finish_reason\":\"length\""));
     }
 }

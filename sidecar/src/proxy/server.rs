@@ -442,6 +442,7 @@ async fn route_request(
 
     let max_retries = group.entries.len();
     let mut skip_indices = HashSet::new();
+    let mut last_error: Option<String> = None;
 
     // Failover loop: try each eligible entry in priority order until one succeeds
     for _attempt in 0..max_retries {
@@ -583,6 +584,7 @@ async fn route_request(
             }
             Err(UpstreamError::Timeout) => {
                 eprintln!("request timed out for provider {}", provider.id);
+                last_error = Some(format!("provider {} timed out", provider.id));
                 {
                     let mut rs = state.router_state.lock().unwrap();
                     let _ = router::record_latency_timeout(
@@ -774,6 +776,7 @@ async fn route_request(
                 return Ok(resp);
             }
             Err(RequestError::RateLimited) => {
+                last_error = Some(format!("provider {} was rate limited", provider.id));
                 if group.failover_config.on_429 {
                     let mut rs = state.router_state.lock().unwrap();
                     router::record_429(&mut rs, &provider.id, entry_index, 60);
@@ -782,6 +785,7 @@ async fn route_request(
                 continue;
             }
             Err(RequestError::QuotaExhausted) => {
+                last_error = Some(format!("provider {} quota exhausted", provider.id));
                 if group.failover_config.on_quota_exhausted {
                     let mut rs = state.router_state.lock().unwrap();
                     router::record_quota_exhausted(&mut rs, &provider.id, entry_index);
@@ -789,7 +793,12 @@ async fn route_request(
                 skip_indices.insert(entry_index);
                 continue;
             }
-            Err(RequestError::Network(_msg)) => {
+            Err(RequestError::Network(msg)) => {
+                last_error = Some(format!(
+                    "provider {} network error: {}",
+                    provider.id,
+                    sanitize_upstream_error(&msg)
+                ));
                 {
                     let mut rs = state.router_state.lock().unwrap();
                     router::record_consecutive_error(
@@ -804,7 +813,12 @@ async fn route_request(
                 skip_indices.insert(entry_index);
                 continue;
             }
-            Err(RequestError::ServerError(_msg)) => {
+            Err(RequestError::ServerError(msg)) => {
+                last_error = Some(format!(
+                    "provider {} upstream error: {}",
+                    provider.id,
+                    sanitize_upstream_error(&msg)
+                ));
                 {
                     let mut rs = state.router_state.lock().unwrap();
                     router::record_consecutive_error(
@@ -823,8 +837,59 @@ async fn route_request(
     }
 
     // All entries exhausted — return 503
-    let exhausted_body = router::build_exhausted_response(&model);
+    let mut exhausted_body = router::build_exhausted_response(&model);
+    let detail = last_error
+        .unwrap_or_else(|| "no eligible provider entries were active for this model".to_string());
+    eprintln!("all providers exhausted for model {model}: {detail}");
+    {
+        if let Some(error) = exhausted_body
+            .get_mut("error")
+            .and_then(|v| v.as_object_mut())
+        {
+            if let Some(Value::String(message)) = error.get_mut("message") {
+                message.push_str(" Last error: ");
+                message.push_str(&detail);
+            }
+            error.insert("last_error".to_string(), Value::String(detail));
+        }
+    }
     Ok((StatusCode::SERVICE_UNAVAILABLE, Json(exhausted_body)).into_response())
+}
+
+fn sanitize_upstream_error(message: &str) -> String {
+    let mut out = String::new();
+    let mut redact_next = false;
+
+    for part in message.split_whitespace() {
+        let lower = part.to_ascii_lowercase();
+        let redacted = if redact_next
+            || lower.starts_with("bearer")
+            || lower.starts_with("sk-")
+            || looks_like_jwt(part)
+        {
+            redact_next = false;
+            "[redacted]"
+        } else {
+            redact_next = lower.ends_with("token") || lower.ends_with("authorization");
+            part
+        };
+
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(redacted);
+        if out.len() >= 600 {
+            out.truncate(600);
+            out.push_str("...");
+            break;
+        }
+    }
+
+    out
+}
+
+fn looks_like_jwt(value: &str) -> bool {
+    value.len() > 80 && value.matches('.').count() >= 2
 }
 
 /// Errors that can occur while processing a proxied request.
@@ -1086,6 +1151,7 @@ where
     use futures::StreamExt;
     let mut content = String::new();
     let mut tool_calls = Vec::new();
+    let mut finish_reason = "stop".to_string();
     let mut buffer = String::new();
     let mut stream = std::pin::pin!(stream);
 
@@ -1093,6 +1159,7 @@ where
         data: &str,
         content: &mut String,
         tool_calls: &mut Vec<Value>,
+        finish_reason: &mut String,
         token_counts: &Arc<std::sync::Mutex<translator::StreamTokenCounts>>,
     ) -> Result<(), RequestError> {
         if data.is_empty() || data == "[DONE]" {
@@ -1104,10 +1171,22 @@ where
         };
 
         match event.get("type").and_then(|v| v.as_str()).unwrap_or("") {
-            "response.failed" | "response.incomplete" => {
+            "response.failed" | "error" => {
                 return Err(RequestError::ServerError(
                     "codex upstream response failed".to_string(),
                 ));
+            }
+            "response.incomplete" => {
+                *finish_reason = match event
+                    .get("response")
+                    .and_then(|r| r.get("incomplete_details"))
+                    .and_then(|d| d.get("reason"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some("max_output_tokens") => "length".to_string(),
+                    Some("content_filter") => "content_filter".to_string(),
+                    _ => "stop".to_string(),
+                };
             }
             "response.output_item.done" => {
                 if let Some(item) = event.get("item") {
@@ -1173,6 +1252,7 @@ where
                             data,
                             &mut content,
                             &mut tool_calls,
+                            &mut finish_reason,
                             &token_counts,
                         )?;
                     }
@@ -1190,7 +1270,13 @@ where
             .strip_prefix("data: ")
             .or_else(|| line.strip_prefix("data:"));
         if let Some(data) = line {
-            handle_codex_aggregate_event(data, &mut content, &mut tool_calls, &token_counts)?;
+            handle_codex_aggregate_event(
+                data,
+                &mut content,
+                &mut tool_calls,
+                &mut finish_reason,
+                &token_counts,
+            )?;
         }
     }
 
@@ -1214,7 +1300,7 @@ where
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": content},
-                "finish_reason": "stop"
+                "finish_reason": finish_reason
             }],
             "usage": {
                 "prompt_tokens": prompt_tokens,
@@ -1947,6 +2033,21 @@ data: {"type":"response.completed","response":{"usage":{"input_tokens":2,"output
             }
             _ => panic!("unexpected error"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_aggregate_codex_stream_incomplete_finishes_with_length() {
+        let json = codex_aggregate_json(vec![Ok(Bytes::from(
+            r#"data: {"type":"response.output_text.delta","delta":"hello"}
+
+data: {"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}
+
+"#,
+        ))])
+        .await;
+
+        assert_eq!(json["choices"][0]["message"]["content"], "hello");
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
     }
 
     #[tokio::test]

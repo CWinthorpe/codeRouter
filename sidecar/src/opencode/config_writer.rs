@@ -297,9 +297,11 @@ pub fn remove_provider(config_path: &Path) -> Result<()> {
 
 /// Writes agent model assignments into the OpenCode configuration.
 ///
-/// Each non-`None` field in `mapping` is written as `agent.<role>.model =
-/// "coderouter/<alias>"`. The `small_model` field is written as a top-level
-/// `"small_model"` key. Existing keys in each agent object are preserved.
+/// Each agent field in `mapping` is applied to the matching `agent.<role>`
+/// object. `Some(alias)` writes `model = "coderouter/<alias>"`; `None`
+/// removes the existing CodeRouter-managed model override for that role so it
+/// falls back to OpenCode's default. The `small_model` field is handled the
+/// same way at the top level. Existing unrelated keys are preserved.
 ///
 /// # Arguments
 /// * `config_path` - Path to the OpenCode JSON config file.
@@ -309,7 +311,14 @@ pub fn remove_provider(config_path: &Path) -> Result<()> {
 /// Returns an error if the config cannot be read or written.
 pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()> {
     let mut config = read_config(config_path)?;
+    apply_agent_mapping(&mut config, mapping);
 
+    write_config(config_path, &config)?;
+    let _ = save_opencode_cache(config_path);
+    Ok(())
+}
+
+fn apply_agent_mapping(config: &mut serde_json::Value, mapping: &AgentMapping) {
     let agent_map = [
         ("build", &mapping.build),
         ("plan", &mapping.plan),
@@ -320,33 +329,15 @@ pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()
         ("summary", &mapping.summary),
     ];
 
-    // For each mapped agent role, merge the model assignment into the existing
-    // agent config object, preserving sibling keys like "tools" or "prompt".
     for (agent_name, model_alias) in &agent_map {
-        if let Some(alias) = model_alias {
-            let obj = config.as_object_mut().unwrap();
-            let agents = obj
-                .entry("agent".to_string())
-                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-            if let serde_json::Value::Object(agents_map) = agents {
-                let agent_config = agents_map
-                    .entry(agent_name.to_string())
-                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-                if let serde_json::Value::Object(config_map) = agent_config {
-                    config_map.insert(
-                        "model".to_string(),
-                        json_str(&format!("coderouter/{}", alias)),
-                    );
-                    if let Some(re) = mapping.reasoning_efforts.get(*agent_name) {
-                        config_map.insert(
-                            "reasoningEffort".to_string(),
-                            json_str(re),
-                        );
-                    }
-                }
-            }
+        match model_alias {
+            Some(alias) => set_agent_model(
+                config,
+                agent_name,
+                alias,
+                mapping.reasoning_efforts.get(*agent_name),
+            ),
+            None => remove_coderouter_agent_override(config, agent_name),
         }
     }
 
@@ -356,11 +347,82 @@ pub fn set_agent_models(config_path: &Path, mapping: &AgentMapping) -> Result<()
             "small_model".to_string(),
             json_str(&format!("coderouter/{}", small)),
         );
+    } else {
+        remove_coderouter_small_model(config);
+    }
+}
+
+fn set_agent_model(
+    config: &mut serde_json::Value,
+    agent_name: &str,
+    alias: &str,
+    reasoning_effort: Option<&String>,
+) {
+    let obj = config.as_object_mut().unwrap();
+    let agents = obj
+        .entry("agent".to_string())
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+    if let serde_json::Value::Object(agents_map) = agents {
+        let agent_config = agents_map
+            .entry(agent_name.to_string())
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+
+        if let serde_json::Value::Object(config_map) = agent_config {
+            config_map.insert(
+                "model".to_string(),
+                json_str(&format!("coderouter/{}", alias)),
+            );
+            if let Some(re) = reasoning_effort {
+                config_map.insert("reasoningEffort".to_string(), json_str(re));
+            } else {
+                config_map.remove("reasoningEffort");
+            }
+        }
+    }
+}
+
+fn remove_coderouter_agent_override(config: &mut serde_json::Value, agent_name: &str) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let Some(serde_json::Value::Object(agents)) = obj.get_mut("agent") else {
+        return;
+    };
+    let mut remove_agent_entry = false;
+
+    if let Some(serde_json::Value::Object(agent_config)) = agents.get_mut(agent_name) {
+        let is_coderouter_model = agent_config
+            .get("model")
+            .and_then(|v| v.as_str())
+            .is_some_and(|model| model.starts_with("coderouter/"));
+
+        if is_coderouter_model {
+            agent_config.remove("model");
+            agent_config.remove("reasoningEffort");
+            remove_agent_entry = agent_config.is_empty();
+        }
     }
 
-    write_config(config_path, &config)?;
-    let _ = save_opencode_cache(config_path);
-    Ok(())
+    if remove_agent_entry {
+        agents.remove(agent_name);
+    }
+    if agents.is_empty() {
+        obj.remove("agent");
+    }
+}
+
+fn remove_coderouter_small_model(config: &mut serde_json::Value) {
+    let Some(obj) = config.as_object_mut() else {
+        return;
+    };
+    let is_coderouter_small_model = obj
+        .get("small_model")
+        .and_then(|v| v.as_str())
+        .is_some_and(|model| model.starts_with("coderouter/"));
+    if is_coderouter_small_model {
+        obj.remove("small_model");
+    }
 }
 
 /// Removes all CodeRouter-managed agent model assignments from the OpenCode config.
@@ -541,54 +603,7 @@ pub fn preview_opencode_config(
     }
 
     if let Some(mapping) = mapping {
-        let agent_map = [
-            ("build", &mapping.build),
-            ("plan", &mapping.plan),
-            ("general", &mapping.general),
-            ("explore", &mapping.explore),
-            ("compaction", &mapping.compaction),
-            ("title", &mapping.title),
-            ("summary", &mapping.summary),
-        ];
-
-        // For each mapped agent role, merge the model assignment into the
-        // preview config object (same logic as set_agent_models).
-        for (agent_name, model_alias) in &agent_map {
-            if let Some(alias) = model_alias {
-                let obj = config.as_object_mut().unwrap();
-                let agents = obj
-                    .entry("agent".to_string())
-                    .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-                if let serde_json::Value::Object(agents_map) = agents {
-                    let agent_config = agents_map
-                        .entry(agent_name.to_string())
-                        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
-
-                    if let serde_json::Value::Object(config_map) = agent_config {
-                        config_map.insert(
-                            "model".to_string(),
-                            json_str(&format!("coderouter/{}", alias)),
-                        );
-                        if let Some(re) = mapping.reasoning_efforts.get(*agent_name) {
-                            config_map.insert(
-                                "reasoningEffort".to_string(),
-                                json_str(re),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-
-        // small_model lives at the top level, not inside the agent block.
-        if let Some(ref small) = mapping.small_model {
-            let obj = config.as_object_mut().unwrap();
-            obj.insert(
-                "small_model".to_string(),
-                json_str(&format!("coderouter/{}", small)),
-            );
-        }
+        apply_agent_mapping(&mut config, mapping);
     }
 
     serde_json::to_string_pretty(&config).map_err(|e| e.into())
@@ -763,8 +778,12 @@ pub fn get_current_agent_mapping(config_path: &Path) -> Result<AgentMapping> {
             if let serde_json::Value::Object(config_map) = agent_config {
                 if let Some(serde_json::Value::String(model)) = config_map.get("model") {
                     if model.starts_with("coderouter/") {
-                        if let Some(serde_json::Value::String(re)) = config_map.get("reasoningEffort") {
-                            mapping.reasoning_efforts.insert(agent_name.clone(), re.clone());
+                        if let Some(serde_json::Value::String(re)) =
+                            config_map.get("reasoningEffort")
+                        {
+                            mapping
+                                .reasoning_efforts
+                                .insert(agent_name.clone(), re.clone());
                         }
                     }
                 }
@@ -1174,6 +1193,105 @@ mod tests {
             config.get("small_model").unwrap(),
             "coderouter/fast-model-router"
         );
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_set_agent_models_default_removes_coderouter_overrides() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let existing_config = serde_json::json!({
+            "small_model": "coderouter/fast-model-router",
+            "agent": {
+                "build": {
+                    "model": "coderouter/glm-5-router",
+                    "reasoningEffort": "high",
+                    "tools": { "write": true }
+                },
+                "plan": {
+                    "model": "coderouter/fast-model-router",
+                    "reasoningEffort": "medium"
+                },
+                "general": {
+                    "model": "openai/gpt-4",
+                    "reasoningEffort": "low"
+                }
+            }
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&existing_config).unwrap(),
+        )
+        .unwrap();
+
+        set_agent_models(&config_path, &AgentMapping::default()).unwrap();
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let agent = config.get("agent").unwrap().as_object().unwrap();
+        let build_agent = agent.get("build").unwrap().as_object().unwrap();
+
+        assert!(build_agent.get("model").is_none());
+        assert!(build_agent.get("reasoningEffort").is_none());
+        assert!(build_agent.get("tools").is_some());
+        assert!(agent.get("plan").is_none());
+        assert_eq!(
+            agent.get("general").unwrap().get("model").unwrap(),
+            "openai/gpt-4"
+        );
+        assert_eq!(
+            agent
+                .get("general")
+                .unwrap()
+                .get("reasoningEffort")
+                .unwrap(),
+            "low"
+        );
+        assert!(config.get("small_model").is_none());
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_set_agent_models_default_reasoning_removes_stale_reasoning() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let existing_config = serde_json::json!({
+            "agent": {
+                "build": {
+                    "model": "coderouter/old-model",
+                    "reasoningEffort": "high"
+                }
+            }
+        });
+        fs::write(
+            &config_path,
+            serde_json::to_string_pretty(&existing_config).unwrap(),
+        )
+        .unwrap();
+
+        let mapping = AgentMapping {
+            build: Some("glm-5-router".to_string()),
+            ..Default::default()
+        };
+
+        set_agent_models(&config_path, &mapping).unwrap();
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let build_agent = config
+            .get("agent")
+            .unwrap()
+            .get("build")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        assert_eq!(build_agent.get("model").unwrap(), "coderouter/glm-5-router");
+        assert!(build_agent.get("reasoningEffort").is_none());
 
         cleanup_test_dir(&test_dir);
     }
