@@ -26,8 +26,14 @@ pub fn build_upstream_request(
     let mut req = client.post(url);
 
     if let Some((account_id, id_token)) = codex_tokens {
-        let codex_req = crate::proxy::codex::openai_to_codex_request(body, upstream_model);
-        let headers = crate::proxy::codex::build_codex_auth_headers(api_key, account_id, id_token);
+        let request_id = crate::proxy::codex::new_codex_request_id();
+        let codex_req =
+            crate::proxy::codex::openai_to_codex_request_with_id(body, upstream_model, &request_id);
+        let mut headers =
+            crate::proxy::codex::build_codex_auth_headers(api_key, account_id, id_token);
+        headers.extend(crate::proxy::codex::build_codex_responses_headers(
+            &request_id,
+        ));
         for (key, value) in &headers {
             req = req.header(key, value);
         }

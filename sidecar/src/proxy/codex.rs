@@ -15,6 +15,8 @@ use serde_json::Value;
 const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_DEVICE_EXPIRES_IN_SECONDS: u64 = 15 * 60;
+pub const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.135.0";
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 
 // ── Codex auth types ──
 
@@ -156,6 +158,7 @@ pub fn check_fedramp(id_token: &str) -> bool {
 /// Headers:
 /// - `Authorization: Bearer <access_token>`
 /// - `version: <package version>`
+/// - Codex client identity headers (`originator`, `user-agent`)
 /// - `ChatGPT-Account-ID: <account_id>` when present
 /// - `X-OpenAI-Fedramp: true` when the id token claims FedRAMP
 pub fn build_codex_auth_headers(
@@ -169,6 +172,8 @@ pub fn build_codex_auth_headers(
             format!("Bearer {access_token}"),
         ),
         ("content-type".to_string(), "application/json".to_string()),
+        ("originator".to_string(), CODEX_ORIGINATOR.to_string()),
+        ("user-agent".to_string(), codex_user_agent()),
         ("version".to_string(), env!("CARGO_PKG_VERSION").to_string()),
     ];
 
@@ -185,6 +190,40 @@ pub fn build_codex_auth_headers(
     }
 
     headers
+}
+
+pub fn codex_client_version() -> String {
+    std::env::var("CODEROUTER_CODEX_CLIENT_VERSION")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CODEX_CLIENT_VERSION.to_string())
+}
+
+fn codex_user_agent() -> String {
+    format!(
+        "{}/{} coderouter/{}",
+        CODEX_ORIGINATOR,
+        codex_client_version(),
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+pub fn new_codex_request_id() -> String {
+    uuid_short()
+}
+
+pub fn build_codex_responses_headers(request_id: &str) -> Vec<(String, String)> {
+    vec![
+        ("accept".to_string(), "text/event-stream".to_string()),
+        ("x-client-request-id".to_string(), request_id.to_string()),
+        ("session-id".to_string(), request_id.to_string()),
+        ("thread-id".to_string(), request_id.to_string()),
+        ("x-codex-window-id".to_string(), codex_window_id(request_id)),
+    ]
+}
+
+fn codex_window_id(request_id: &str) -> String {
+    format!("{request_id}:0")
 }
 
 // ── Device auth ──
@@ -529,6 +568,15 @@ pub async fn resolve_codex_credential(
 /// - Chat `tools` → Responses function tools.
 /// - Always forces `stream: true`.
 pub fn openai_to_codex_request(openai_body: &Value, upstream_model: &str) -> Value {
+    let request_id = new_codex_request_id();
+    openai_to_codex_request_with_id(openai_body, upstream_model, &request_id)
+}
+
+pub fn openai_to_codex_request_with_id(
+    openai_body: &Value,
+    upstream_model: &str,
+    request_id: &str,
+) -> Value {
     let messages = openai_body
         .get("messages")
         .and_then(|v| v.as_array())
@@ -620,7 +668,17 @@ pub fn openai_to_codex_request(openai_body: &Value, upstream_model: &str) -> Val
     let mut body = serde_json::json!({
         "model": upstream_model,
         "input": input_items,
+        "tools": [],
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "store": false,
         "stream": true,
+        "include": [],
+        "prompt_cache_key": request_id,
+        "client_metadata": {
+            "x-codex-installation-id": request_id,
+            "x-codex-window-id": codex_window_id(request_id),
+        },
     });
 
     if let Some(instructions) = instructions {
@@ -665,7 +723,7 @@ pub fn openai_to_codex_request(openai_body: &Value, upstream_model: &str) -> Val
     {
         body["parallel_tool_calls"] = Value::Bool(ptc);
     } else {
-        body["parallel_tool_calls"] = Value::Bool(true);
+        body["parallel_tool_calls"] = Value::Bool(false);
     }
 
     // tool_choice — pass through if a simple string, ignore object forms
@@ -1222,7 +1280,30 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(k, v)| k == "version" && v == env!("CARGO_PKG_VERSION")));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "originator" && v == CODEX_ORIGINATOR));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "user-agent" && v.contains("coderouter/")));
         assert!(!headers.iter().any(|(k, _)| k == "X-OpenAI-Fedramp"));
+    }
+
+    #[test]
+    fn test_build_codex_responses_headers() {
+        let headers = build_codex_responses_headers("request-123");
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "accept" && v == "text/event-stream"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "session-id" && v == "request-123"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "thread-id" && v == "request-123"));
+        assert!(headers
+            .iter()
+            .any(|(k, v)| k == "x-codex-window-id" && v == "request-123:0"));
     }
 
     #[test]
@@ -1358,10 +1439,24 @@ mod tests {
             "temperature": 0.7
         });
 
-        let result = openai_to_codex_request(&openai_req, "gpt-5-codex");
+        let result = openai_to_codex_request_with_id(&openai_req, "gpt-5-codex", "request-123");
 
         assert_eq!(result["model"], "gpt-5-codex");
         assert_eq!(result["stream"], true);
+        assert_eq!(result["store"], false);
+        assert_eq!(result["include"].as_array().unwrap().len(), 0);
+        assert_eq!(result["tools"].as_array().unwrap().len(), 0);
+        assert_eq!(result["tool_choice"], "auto");
+        assert_eq!(result["parallel_tool_calls"], false);
+        assert_eq!(result["prompt_cache_key"], "request-123");
+        assert_eq!(
+            result["client_metadata"]["x-codex-installation-id"],
+            "request-123"
+        );
+        assert_eq!(
+            result["client_metadata"]["x-codex-window-id"],
+            "request-123:0"
+        );
         assert_eq!(result["instructions"], "You are helpful.");
         assert!(result["input"].as_array().unwrap().len() == 1);
         assert_eq!(result["input"][0]["role"], "user");

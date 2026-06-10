@@ -20,9 +20,6 @@ use crate::config::store::{
 };
 use crate::credentials::keychain::get_credential;
 
-// Matches the current public @openai/codex release at implementation time; the
-// Codex backend gates model visibility by compatible client versions.
-const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.135.0";
 const DEFAULT_CODEX_MAX_OUTPUT_TOKENS: u64 = 128_000;
 
 /// Result type alias for model refresh operations, boxing errors for flexibility across IO and HTTP failures.
@@ -257,10 +254,7 @@ async fn fetch_codex_models(
 
     let base_url = provider.base_url.trim_end_matches('/');
     let models_url = format!("{base_url}/models");
-    let client_version = std::env::var("CODEROUTER_CODEX_CLIENT_VERSION")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_CODEX_CLIENT_VERSION.to_string());
+    let client_version = crate::proxy::codex::codex_client_version();
 
     let mut request = client
         .get(&models_url)
