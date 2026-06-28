@@ -787,11 +787,13 @@ pub fn openai_to_codex_request_with_id(
         body.insert("tool_choice".to_string(), tool_choice);
     }
 
-    if let Some(temp) = openai_body.get("temperature") {
-        body.insert("temperature".to_string(), temp.clone());
-    }
-    if let Some(top_p) = openai_body.get("top_p") {
-        body.insert("top_p".to_string(), top_p.clone());
+    if supports_codex_sampling_params(upstream_model) {
+        if let Some(temp) = openai_body.get("temperature") {
+            body.insert("temperature".to_string(), temp.clone());
+        }
+        if let Some(top_p) = openai_body.get("top_p") {
+            body.insert("top_p".to_string(), top_p.clone());
+        }
     }
     if let Some(store) = openai_body.get("store").and_then(|v| v.as_bool()) {
         body.insert("store".to_string(), Value::Bool(store));
@@ -814,6 +816,10 @@ fn uses_openai_gpt5_defaults(model: &str) -> bool {
 fn uses_openai_gpt5_text_verbosity(model: &str) -> bool {
     let id = model.to_ascii_lowercase();
     id.contains("gpt-5.") && !id.contains("codex") && !id.contains("-chat")
+}
+
+fn supports_codex_sampling_params(model: &str) -> bool {
+    !model.to_ascii_lowercase().contains("gpt-5.")
 }
 
 fn json_value_as_string(value: &Value) -> String {
@@ -1714,6 +1720,20 @@ mod tests {
         assert_eq!(result["input"][0]["content"][0]["text"], "Hello");
         assert!(result.get("max_output_tokens").is_none());
         assert_eq!(result["temperature"], 0.7);
+    }
+
+    #[test]
+    fn test_openai_to_codex_request_drops_sampling_for_gpt_5_dot_models() {
+        let openai_req = serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello"}],
+            "temperature": 0.2,
+            "top_p": 0.9
+        });
+
+        let result = openai_to_codex_request(&openai_req, "gpt-5.5");
+
+        assert!(result.get("temperature").is_none());
+        assert!(result.get("top_p").is_none());
     }
 
     #[test]

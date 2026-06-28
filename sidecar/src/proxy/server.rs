@@ -1342,16 +1342,28 @@ async fn response_to_json_value(response: Response, group_alias: &str) -> Result
 }
 
 fn extract_assistant_text(json: &Value) -> Option<String> {
-    json.get("choices")
+    let messages: Vec<&Value> = json
+        .get("choices")
         .and_then(|v| v.as_array())?
         .iter()
-        .filter_map(|choice| {
-            choice
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .map(content_value_to_text)
-        })
+        .filter_map(|choice| choice.get("message"))
+        .collect();
+
+    messages
+        .iter()
+        .filter_map(|message| message.get("content").map(content_value_to_text))
         .find(|content| !content.trim().is_empty())
+        .or_else(|| {
+            messages
+                .iter()
+                .filter_map(|message| {
+                    message
+                        .get("reasoning_content")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                })
+                .find(|content| !content.trim().is_empty())
+        })
 }
 
 fn app_error_message(error: AppError) -> String {
@@ -2635,6 +2647,42 @@ data: {"type":"response.completed"}
         assert_eq!(request["reasoning_effort"], "high");
         assert_eq!(request["reasoning"]["effort"], "high");
         assert_eq!(request["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn test_extract_assistant_text_uses_reasoning_content_fallback() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "reasoning-only output"
+                }
+            }]
+        });
+
+        assert_eq!(
+            extract_assistant_text(&json).as_deref(),
+            Some("reasoning-only output")
+        );
+    }
+
+    #[test]
+    fn test_extract_assistant_text_prefers_content_over_reasoning_content() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "final output",
+                    "reasoning_content": "hidden reasoning"
+                }
+            }]
+        });
+
+        assert_eq!(
+            extract_assistant_text(&json).as_deref(),
+            Some("final output")
+        );
     }
 
     #[test]
