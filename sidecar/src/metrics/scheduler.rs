@@ -150,7 +150,7 @@ fn run_quota_reset(state: &SharedRouterState, groups: &[Group]) {
 
     for group in groups {
         for (idx, entry) in group.entries.iter().enumerate() {
-            let key = router::entry_key(&entry.provider_id, idx as u32);
+            let key = router::entry_key(&group.id, &entry.provider_id, idx as u32);
             let entry_state = match guard.entries.get_mut(&key) {
                 // Manually-disabled entries must not be auto-reset.
                 Some(s) if s.status != EntryStatus::ManuallyDisabled => s,
@@ -212,7 +212,7 @@ async fn run_cooldown_check(
 
         for group in groups {
             for (idx, entry) in group.entries.iter().enumerate() {
-                let key = router::entry_key(&entry.provider_id, idx as u32);
+                let key = router::entry_key(&group.id, &entry.provider_id, idx as u32);
                 let entry_state = match guard.entries.get(&key) {
                     // Only probe entries that are in cooldown.
                     Some(s) if s.status == EntryStatus::Cooldown => s,
@@ -414,7 +414,11 @@ pub fn set_entry_enabled(
 
     {
         let mut guard = state.lock().map_err(|e| e.to_string())?;
-        let key = router::entry_key(&group.entries[entry_index].provider_id, entry_index as u32);
+        let key = router::entry_key(
+            &group.id,
+            &group.entries[entry_index].provider_id,
+            entry_index as u32,
+        );
         let entry_state = guard
             .entries
             .get_mut(&key)

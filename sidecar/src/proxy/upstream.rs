@@ -46,8 +46,7 @@ pub fn build_upstream_request(
         }
         req = req.json(&anthropic_req);
     } else {
-        let mut body = body.clone();
-        body["model"] = Value::String(upstream_model.to_string());
+        let body = build_openai_compatible_body(body, upstream_model, url);
         req = req.json(&body);
         req = req.header("Authorization", format!("Bearer {api_key}"));
     }
@@ -98,13 +97,33 @@ pub fn build_completion_request(
         }
         req = req.json(&anthropic_body);
     } else {
-        let mut body = body.clone();
-        body["model"] = Value::String(upstream_model.to_string());
+        let body = build_openai_compatible_body(body, upstream_model, url);
         req = req.json(&body);
         req = req.header("Authorization", format!("Bearer {api_key}"));
     }
 
     req
+}
+
+fn build_openai_compatible_body(body: &Value, upstream_model: &str, url: &str) -> Value {
+    let mut body = body.clone();
+    body["model"] = Value::String(upstream_model.to_string());
+
+    if requires_default_sampling(upstream_model, url) {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("temperature");
+            obj.remove("top_p");
+        }
+    }
+
+    body
+}
+
+fn requires_default_sampling(model: &str, url: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let url = url.to_ascii_lowercase();
+    url.contains("opencode.ai/zen/go")
+        && (model.contains("kimi-k2.7") || model.contains("kimi-k2-7"))
 }
 
 /// Sends a request with an optional wall-clock latency timeout.
@@ -151,4 +170,69 @@ pub fn create_client(_timeout_secs: u64) -> Result<Client, reqwest::Error> {
     Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_openai_body_drops_sampling_for_kimi_k2_7() {
+        let body = serde_json::json!({
+            "model": "kimi-k2-7",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.3,
+            "top_p": 0.9
+        });
+
+        let result = build_openai_compatible_body(
+            &body,
+            "kimi-k2.7-code",
+            "https://opencode.ai/zen/go/v1/chat/completions",
+        );
+
+        assert_eq!(result["model"], "kimi-k2.7-code");
+        assert!(result.get("temperature").is_none());
+        assert!(result.get("top_p").is_none());
+    }
+
+    #[test]
+    fn test_openai_body_preserves_sampling_for_other_models() {
+        let body = serde_json::json!({
+            "model": "glm-5-2",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.3,
+            "top_p": 0.9
+        });
+
+        let result = build_openai_compatible_body(
+            &body,
+            "glm-5.2",
+            "https://opencode.ai/zen/go/v1/chat/completions",
+        );
+
+        assert_eq!(result["model"], "glm-5.2");
+        assert_eq!(result["temperature"], 0.3);
+        assert_eq!(result["top_p"], 0.9);
+    }
+
+    #[test]
+    fn test_openai_body_preserves_sampling_for_non_opencode_kimi() {
+        let body = serde_json::json!({
+            "model": "kimi-k2-7",
+            "messages": [{"role": "user", "content": "hello"}],
+            "temperature": 0.3,
+            "top_p": 0.9
+        });
+
+        let result = build_openai_compatible_body(
+            &body,
+            "kimi-k2-7-code",
+            "https://api.venice.ai/api/v1/chat/completions",
+        );
+
+        assert_eq!(result["model"], "kimi-k2-7-code");
+        assert_eq!(result["temperature"], 0.3);
+        assert_eq!(result["top_p"], 0.9);
+    }
 }

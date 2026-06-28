@@ -107,9 +107,14 @@ pub struct RouterState {
 /// Thread-safe wrapper around [`RouterState`].
 pub type SharedRouterState = Arc<Mutex<RouterState>>;
 
-/// Builds the lookup key for an entry: `"{provider_id}:{entry_index}"`.
-pub fn entry_key(provider_id: &str, entry_index: u32) -> String {
-    format!("{provider_id}:{entry_index}")
+/// Builds the lookup key for an entry: `"{provider_id}:{group_id}:{entry_index}"`.
+///
+/// The provider prefix is kept first so provider-level quota updates can still
+/// touch every entry for a provider, while the group id prevents different
+/// groups from sharing cooldown/error state when they use the same provider and
+/// entry index.
+pub fn entry_key(group_id: &str, provider_id: &str, entry_index: u32) -> String {
+    format!("{provider_id}:{group_id}:{entry_index}")
 }
 
 /// Initialises a fresh `RouterState` from the given groups and providers.
@@ -121,7 +126,7 @@ pub fn init_router_state(groups: &[Group], providers: &[Provider]) -> SharedRout
     for group in groups {
         for (idx, entry) in group.entries.iter().enumerate() {
             if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id) {
-                let key = entry_key(&entry.provider_id, idx as u32);
+                let key = entry_key(&group.id, &entry.provider_id, idx as u32);
                 let mut entry_state = EntryState::new(provider);
                 if !entry.enabled {
                     entry_state.status = EntryStatus::ManuallyDisabled;
@@ -223,7 +228,7 @@ pub fn select_entry<'a>(
             if !entry.enabled {
                 return false;
             }
-            let key = entry_key(&entry.provider_id, *idx as u32);
+            let key = entry_key(&group.id, &entry.provider_id, *idx as u32);
             if let Some(entry_state) = state.entries.get_mut(&key) {
                 if entry_state.status == EntryStatus::Cooldown {
                     let cooldown_expired = entry_state
@@ -307,7 +312,7 @@ pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusR
     let mut entries = Vec::new();
     for group in groups {
         for (idx, entry) in group.entries.iter().enumerate() {
-            let key = entry_key(&entry.provider_id, idx as u32);
+            let key = entry_key(&group.id, &entry.provider_id, idx as u32);
             let entry_state = state
                 .entries
                 .get(&key)
@@ -354,8 +359,31 @@ pub fn get_router_status(groups: &[Group], state: &RouterState) -> RouterStatusR
 ///   for the specific entry.
 /// - If `on_quota_exhausted` is true and the quota is now exceeded, sets the
 ///   status to `QuotaExhausted`.
-pub fn record_success(
+#[cfg(test)]
+fn record_success(
     state: &mut RouterState,
+    provider_id: &str,
+    entry_index: u32,
+    tokens_used: u64,
+    effective_quota: Option<u64>,
+    effective_request_quota: Option<u64>,
+    on_quota_exhausted: bool,
+) {
+    record_success_for_group(
+        state,
+        "test-group",
+        provider_id,
+        entry_index,
+        tokens_used,
+        effective_quota,
+        effective_request_quota,
+        on_quota_exhausted,
+    )
+}
+
+pub fn record_success_for_group(
+    state: &mut RouterState,
+    group_id: &str,
     provider_id: &str,
     entry_index: u32,
     tokens_used: u64,
@@ -370,7 +398,7 @@ pub fn record_success(
             entry_state.daily_requests_used += 1;
         }
     }
-    let key = entry_key(provider_id, entry_index);
+    let key = entry_key(group_id, provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.consecutive_errors = 0;
         if entry_state.status == EntryStatus::Cooldown {
@@ -399,13 +427,30 @@ pub fn record_success(
 /// `base_backoff_seconds`; subsequent 429s double the backoff up to a
 /// maximum of 3600 s. Resets to `base_backoff_seconds` if the entry was
 /// not previously in cooldown.
-pub fn record_429(
+#[cfg(test)]
+fn record_429(
     state: &mut RouterState,
     provider_id: &str,
     entry_index: u32,
     base_backoff_seconds: i64,
 ) {
-    let key = entry_key(provider_id, entry_index);
+    record_429_for_group(
+        state,
+        "test-group",
+        provider_id,
+        entry_index,
+        base_backoff_seconds,
+    )
+}
+
+pub fn record_429_for_group(
+    state: &mut RouterState,
+    group_id: &str,
+    provider_id: &str,
+    entry_index: u32,
+    base_backoff_seconds: i64,
+) {
+    let key = entry_key(group_id, provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         let was_in_cooldown = entry_state.status == EntryStatus::Cooldown;
         let current_backoff = entry_state
@@ -424,8 +469,18 @@ pub fn record_429(
 }
 
 /// Marks an entry as quota-exhausted (no cooldown expiry).
-pub fn record_quota_exhausted(state: &mut RouterState, provider_id: &str, entry_index: u32) {
-    let key = entry_key(provider_id, entry_index);
+#[cfg(test)]
+fn record_quota_exhausted(state: &mut RouterState, provider_id: &str, entry_index: u32) {
+    record_quota_exhausted_for_group(state, "test-group", provider_id, entry_index)
+}
+
+pub fn record_quota_exhausted_for_group(
+    state: &mut RouterState,
+    group_id: &str,
+    provider_id: &str,
+    entry_index: u32,
+) {
+    let key = entry_key(group_id, provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.status = EntryStatus::QuotaExhausted;
         entry_state.cooldown_until = None;
@@ -438,7 +493,8 @@ pub fn record_quota_exhausted(state: &mut RouterState, provider_id: &str, entry_
 /// When `trigger_enabled` is true and the error count reaches `threshold`,
 /// the entry is put into `Cooldown` for `cooldown_ms` and the counter is
 /// reset. This prevents hammering a failing upstream.
-pub fn record_consecutive_error(
+#[cfg(test)]
+fn record_consecutive_error(
     state: &mut RouterState,
     provider_id: &str,
     entry_index: u32,
@@ -446,7 +502,27 @@ pub fn record_consecutive_error(
     trigger_enabled: bool,
     cooldown_ms: u64,
 ) {
-    let key = entry_key(provider_id, entry_index);
+    record_consecutive_error_for_group(
+        state,
+        "test-group",
+        provider_id,
+        entry_index,
+        threshold,
+        trigger_enabled,
+        cooldown_ms,
+    )
+}
+
+pub fn record_consecutive_error_for_group(
+    state: &mut RouterState,
+    group_id: &str,
+    provider_id: &str,
+    entry_index: u32,
+    threshold: u32,
+    trigger_enabled: bool,
+    cooldown_ms: u64,
+) {
+    let key = entry_key(group_id, provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.consecutive_errors += 1;
         if trigger_enabled && entry_state.consecutive_errors >= threshold {
@@ -467,13 +543,24 @@ pub fn record_consecutive_error(
 /// # Errors
 ///
 /// Returns `"entry state not found"` if the entry key is missing.
-pub fn record_latency_timeout(
+#[cfg(test)]
+fn record_latency_timeout(
     state: &mut RouterState,
     provider_id: &str,
     entry_index: u32,
     cooldown_ms: u64,
 ) -> Result<(), &'static str> {
-    let key = entry_key(provider_id, entry_index);
+    record_latency_timeout_for_group(state, "test-group", provider_id, entry_index, cooldown_ms)
+}
+
+pub fn record_latency_timeout_for_group(
+    state: &mut RouterState,
+    group_id: &str,
+    provider_id: &str,
+    entry_index: u32,
+    cooldown_ms: u64,
+) -> Result<(), &'static str> {
+    let key = entry_key(group_id, provider_id, entry_index);
     if let Some(entry_state) = state.entries.get_mut(&key) {
         entry_state.status = EntryStatus::Cooldown;
         entry_state.cooldown_until =
@@ -551,6 +638,13 @@ mod tests {
         }
     }
 
+    fn group_with_id(id: &str, entries: Vec<GroupEntry>) -> Group {
+        let mut group = test_group_with_entries(entries);
+        group.id = id.to_string();
+        group.alias = id.to_string();
+        group
+    }
+
     #[test]
     fn test_select_entry_returns_lowest_priority() {
         let providers = vec![test_provider("p1", None), test_provider("p2", None)];
@@ -594,6 +688,40 @@ mod tests {
     }
 
     #[test]
+    fn test_entry_state_is_scoped_by_group() {
+        let providers = vec![test_provider("opencode-go", None)];
+        let group_a = group_with_id("deepseek-v4-pro", vec![make_entry("opencode-go", 1, true)]);
+        let group_b = group_with_id("kimi-k2-7", vec![make_entry("opencode-go", 1, true)]);
+        let state = init_router_state(&[group_a.clone(), group_b.clone()], &providers);
+
+        {
+            let mut s = state.lock().unwrap();
+            record_429_for_group(&mut s, &group_a.id, "opencode-go", 0, 60);
+        }
+
+        let mut state = state.lock().unwrap();
+        let skip = std::collections::HashSet::new();
+        assert!(select_entry(&group_a, &mut state, &providers, &skip).is_none());
+        let (entry, idx) = select_entry(&group_b, &mut state, &providers, &skip).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(entry.provider_id, "opencode-go");
+
+        let status = get_router_status(&[group_a, group_b], &state);
+        let a = status
+            .entries
+            .iter()
+            .find(|entry| entry.group_id == "deepseek-v4-pro")
+            .unwrap();
+        let b = status
+            .entries
+            .iter()
+            .find(|entry| entry.group_id == "kimi-k2-7")
+            .unwrap();
+        assert_eq!(a.status, "cooldown");
+        assert_eq!(b.status, "active");
+    }
+
+    #[test]
     fn test_select_entry_skips_quota_exhausted() {
         let providers = vec![test_provider("p1", Some(100))];
         let entries = vec![make_entry("p1", 1, true)];
@@ -622,7 +750,7 @@ mod tests {
             record_success(&mut s, "p1", 0, 50, None, None, false);
         }
         let state = state.lock().unwrap();
-        let entry = state.entries.get("p1:0").unwrap();
+        let entry = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
         assert_eq!(entry.consecutive_errors, 0);
         assert_eq!(entry.daily_tokens_used, 50);
     }
@@ -638,7 +766,7 @@ mod tests {
             record_429(&mut s, "p1", 0, 60);
         }
         let state = state.lock().unwrap();
-        let entry = state.entries.get("p1:0").unwrap();
+        let entry = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
         assert_eq!(entry.status, EntryStatus::Cooldown);
         assert!(entry.cooldown_until.is_some());
     }
@@ -656,7 +784,7 @@ mod tests {
             record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
         }
         let state = state.lock().unwrap();
-        let entry = state.entries.get("p1:0").unwrap();
+        let entry = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
         assert_eq!(entry.status, EntryStatus::Cooldown);
         assert_eq!(entry.consecutive_errors, 0);
     }
@@ -672,7 +800,7 @@ mod tests {
             record_quota_exhausted(&mut s, "p1", 0);
         }
         let state = state.lock().unwrap();
-        let entry = state.entries.get("p1:0").unwrap();
+        let entry = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
         assert_eq!(entry.status, EntryStatus::QuotaExhausted);
     }
 
@@ -688,7 +816,7 @@ mod tests {
             assert!(result.is_ok());
         }
         let state = state.lock().unwrap();
-        let entry = state.entries.get("p1:0").unwrap();
+        let entry = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
         assert_eq!(entry.status, EntryStatus::Cooldown);
     }
 
@@ -742,11 +870,11 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::Cooldown);
             assert!(entry.cooldown_until.is_some());
             record_success(&mut s, "p1", 0, 50, None, None, false);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert!(entry.cooldown_until.is_none());
         }
@@ -761,7 +889,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.cooldown_duration_seconds, Some(60));
         }
     }
@@ -776,7 +904,7 @@ mod tests {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
             record_429(&mut s, "p1", 0, 60);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.cooldown_duration_seconds, Some(120));
         }
     }
@@ -790,10 +918,10 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert!(entry.cooldown_until.is_some());
             record_quota_exhausted(&mut s, "p1", 0);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::QuotaExhausted);
             assert!(entry.cooldown_until.is_none());
         }
@@ -808,11 +936,11 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_success(&mut s, "p1", 0, 60, Some(100), None, true);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert_eq!(entry.daily_tokens_used, 60);
             record_success(&mut s, "p1", 0, 50, Some(100), None, true);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::QuotaExhausted);
             assert_eq!(entry.daily_tokens_used, 110);
         }
@@ -827,7 +955,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_success(&mut s, "p1", 0, 150, Some(100), None, false);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert_eq!(entry.daily_tokens_used, 150);
         }
@@ -844,11 +972,11 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_success(&mut s, "p1", 0, 10, None, Some(2), true);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert_eq!(entry.daily_requests_used, 1);
             record_success(&mut s, "p1", 0, 10, None, Some(2), true);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::QuotaExhausted);
             assert_eq!(entry.daily_requests_used, 2);
         }
@@ -884,8 +1012,8 @@ mod tests {
             record_success(&mut s, "p1", 0, 50, None, None, false);
         }
         let state = state.lock().unwrap();
-        let entry0 = state.entries.get("p1:0").unwrap();
-        let entry1 = state.entries.get("p1:1").unwrap();
+        let entry0 = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
+        let entry1 = state.entries.get(&entry_key(&group.id, "p1", 1)).unwrap();
         assert_eq!(entry0.daily_tokens_used, 50);
         assert_eq!(entry0.daily_requests_used, 1);
         assert_eq!(entry0.consecutive_errors, 0);
@@ -907,8 +1035,8 @@ mod tests {
             record_success(&mut s, "p1", 0, 10, None, Some(5), false);
         }
         let state = state.lock().unwrap();
-        let entry0 = state.entries.get("p1:0").unwrap();
-        let entry1 = state.entries.get("p1:1").unwrap();
+        let entry0 = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
+        let entry1 = state.entries.get(&entry_key(&group.id, "p1", 1)).unwrap();
         assert_eq!(entry0.daily_requests_used, 1);
         assert_eq!(entry1.daily_requests_used, 1);
     }
@@ -928,8 +1056,8 @@ mod tests {
             record_success(&mut s, "p1", 0, 100, Some(100), None, true);
         }
         let state = state.lock().unwrap();
-        let entry0 = state.entries.get("p1:0").unwrap();
-        let entry1 = state.entries.get("p1:1").unwrap();
+        let entry0 = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
+        let entry1 = state.entries.get(&entry_key(&group.id, "p1", 1)).unwrap();
         assert_eq!(entry0.status, EntryStatus::QuotaExhausted);
         assert_eq!(entry1.status, EntryStatus::Active);
     }
@@ -943,7 +1071,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.cooldown_reason, Some(CooldownReason::RateLimited));
         }
     }
@@ -959,7 +1087,7 @@ mod tests {
             record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
             record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
             record_consecutive_error(&mut s, "p1", 0, 3, true, 600000);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(
                 entry.cooldown_reason,
                 Some(CooldownReason::ConsecutiveErrors)
@@ -976,7 +1104,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_latency_timeout(&mut s, "p1", 0, 60000).unwrap();
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.cooldown_reason, Some(CooldownReason::LatencyTimeout));
         }
     }
@@ -990,7 +1118,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_quota_exhausted(&mut s, "p1", 0);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.cooldown_reason, Some(CooldownReason::QuotaExhausted));
         }
     }
@@ -1004,11 +1132,11 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::Cooldown);
             assert_eq!(entry.cooldown_reason, Some(CooldownReason::RateLimited));
             record_success(&mut s, "p1", 0, 50, None, None, false);
-            let entry = s.entries.get("p1:0").unwrap();
+            let entry = s.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.status, EntryStatus::Active);
             assert_eq!(entry.cooldown_reason, None);
         }
@@ -1023,7 +1151,7 @@ mod tests {
         {
             let mut s = state.lock().unwrap();
             record_429(&mut s, "p1", 0, 60);
-            let entry = s.entries.get_mut("p1:0").unwrap();
+            let entry = s.entries.get_mut(&entry_key(&group.id, "p1", 0)).unwrap();
             assert_eq!(entry.cooldown_reason, Some(CooldownReason::RateLimited));
             entry.cooldown_until = Some(Utc::now() - chrono::Duration::seconds(1));
         }
@@ -1031,7 +1159,7 @@ mod tests {
         let skip = std::collections::HashSet::new();
         let result = select_entry(&group, &mut state, &providers, &skip);
         assert!(result.is_some());
-        let entry = state.entries.get("p1:0").unwrap();
+        let entry = state.entries.get(&entry_key(&group.id, "p1", 0)).unwrap();
         assert_eq!(entry.status, EntryStatus::Active);
         assert_eq!(entry.cooldown_reason, None);
     }

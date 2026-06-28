@@ -330,7 +330,8 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
                     if resolved_context.is_some() && resolved_max_output.is_some() {
                         break;
                     }
-                    let key = format!("{}:{}", entry.provider_id, idx);
+                    let key =
+                        router::entry_key(&metadata_group.id, &entry.provider_id, *idx as u32);
                     let is_active = router_state
                         .entries
                         .get(&key)
@@ -382,7 +383,7 @@ fn group_has_available_entry(
         if !entry.enabled {
             return false;
         }
-        let key = format!("{}:{}", entry.provider_id, idx);
+        let key = router::entry_key(&group.id, &entry.provider_id, idx as u32);
         if let Some(entry_state) = router_state.entries.get(&key) {
             if entry_state.status != router::EntryStatus::Active {
                 return false;
@@ -660,8 +661,9 @@ async fn route_failover_request(
                 last_error = Some(format!("provider {} timed out", provider.id));
                 {
                     let mut rs = state.router_state.lock().unwrap();
-                    let _ = router::record_latency_timeout(
+                    let _ = router::record_latency_timeout_for_group(
                         &mut rs,
+                        &group.id,
                         &provider.id,
                         entry_index,
                         group.failover_config.latency_timeout_cooldown_ms,
@@ -680,6 +682,7 @@ async fn route_failover_request(
             Ok(StreamProcessResult::Streaming(raw_stream, token_counts)) => {
                 let provider_id = provider.id.clone();
                 let model_id = entry.model_id.clone();
+                let group_id_str = group.id.clone();
                 let group_alias_str = group.alias.clone();
                 let router_state = state.router_state.clone();
                 let metrics_recorder = state.metrics_recorder.clone();
@@ -742,8 +745,9 @@ async fn route_failover_request(
 
                             if tokens_used > 0 {
                                 let mut rs = router_state.lock().unwrap();
-                                router::record_success(
+                                router::record_success_for_group(
                                     &mut rs,
+                                    &group_id_str,
                                     &provider_id,
                                     entry_index_clone,
                                     tokens_used,
@@ -772,8 +776,9 @@ async fn route_failover_request(
                             }
 
                             let mut rs = router_state.lock().unwrap();
-                            router::record_consecutive_error(
+                            router::record_consecutive_error_for_group(
                                 &mut rs,
+                                &group_id_str,
                                 &provider_id,
                                 entry_index_clone,
                                 consecutive_error_threshold,
@@ -806,8 +811,9 @@ async fn route_failover_request(
                         .iter()
                         .find(|p| p.id == entry.provider_id)
                         .and_then(|p| p.daily_request_quota);
-                    router::record_success(
+                    router::record_success_for_group(
                         &mut rs,
+                        &group.id,
                         &provider.id,
                         entry_index,
                         tokens_used,
@@ -852,7 +858,7 @@ async fn route_failover_request(
                 last_error = Some(format!("provider {} was rate limited", provider.id));
                 if group.failover_config.on_429 {
                     let mut rs = state.router_state.lock().unwrap();
-                    router::record_429(&mut rs, &provider.id, entry_index, 60);
+                    router::record_429_for_group(&mut rs, &group.id, &provider.id, entry_index, 60);
                 }
                 skip_indices.insert(entry_index);
                 continue;
@@ -861,7 +867,12 @@ async fn route_failover_request(
                 last_error = Some(format!("provider {} quota exhausted", provider.id));
                 if group.failover_config.on_quota_exhausted {
                     let mut rs = state.router_state.lock().unwrap();
-                    router::record_quota_exhausted(&mut rs, &provider.id, entry_index);
+                    router::record_quota_exhausted_for_group(
+                        &mut rs,
+                        &group.id,
+                        &provider.id,
+                        entry_index,
+                    );
                 }
                 skip_indices.insert(entry_index);
                 continue;
@@ -874,8 +885,9 @@ async fn route_failover_request(
                 ));
                 {
                     let mut rs = state.router_state.lock().unwrap();
-                    router::record_consecutive_error(
+                    router::record_consecutive_error_for_group(
                         &mut rs,
+                        &group.id,
                         &provider.id,
                         entry_index,
                         group.failover_config.consecutive_error_threshold,
@@ -894,8 +906,9 @@ async fn route_failover_request(
                 ));
                 {
                     let mut rs = state.router_state.lock().unwrap();
-                    router::record_consecutive_error(
+                    router::record_consecutive_error_for_group(
                         &mut rs,
+                        &group.id,
                         &provider.id,
                         entry_index,
                         group.failover_config.consecutive_error_threshold,
@@ -2094,7 +2107,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::V
     let mut failover_states = Vec::new();
     for group in groups.iter() {
         for (idx, entry) in group.entries.iter().enumerate() {
-            let key = format!("{}:{}", entry.provider_id, idx);
+            let key = router::entry_key(&group.id, &entry.provider_id, idx as u32);
             let entry_state = router_state.entries.get(&key);
             let status = entry_state
                 .map(|es| format!("{:?}", es.status).to_lowercase())
