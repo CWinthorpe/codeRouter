@@ -24,6 +24,7 @@ import { saveGroup, deleteGroup, getGroups, setEntryEnabled, isGroupReferencedIn
 import { useGroupStatusPoll } from '../hooks/useGroupStatusPoll';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import type { Group, GroupEntry, FailoverConfig, Provider, EntryStatusResponse, AggregationConfig } from '../types';
 
 /** Default failover configuration applied to new groups. */
@@ -39,6 +40,16 @@ const DEFAULT_FAILOVER: FailoverConfig = {
   maxResponseDurationMs: 1200000,
 };
 
+const REASONING_OPTIONS = [
+  { value: '__none__', label: '— default —' },
+  { value: 'none', label: 'None' },
+  { value: 'low', label: 'Low' },
+  { value: 'medium', label: 'Medium' },
+  { value: 'high', label: 'High' },
+  { value: 'xhigh', label: 'Extra High' },
+  { value: 'max', label: 'Max' },
+] as const;
+
 /** Creates a fresh default aggregation config for MoA-capable groups. */
 function defaultAggregationConfig(): AggregationConfig {
   return {
@@ -47,6 +58,8 @@ function defaultAggregationConfig(): AggregationConfig {
     aggregatorGroupId: null,
     referenceTemperature: null,
     aggregatorTemperature: null,
+    referenceReasoningEfforts: {},
+    aggregatorReasoningEffort: null,
     requireAllReferences: false,
   };
 }
@@ -639,6 +652,31 @@ function SearchableSelect({ options, value, onChange, placeholder, disabled }: {
   );
 }
 
+function ReasoningEffortSelect({
+  value,
+  onChange,
+  className = 'w-full',
+}: {
+  value?: string | null;
+  onChange: (value: string | null) => void;
+  className?: string;
+}) {
+  return (
+    <Select value={value ?? '__none__'} onValueChange={(v) => onChange(v === '__none__' ? null : v)}>
+      <SelectTrigger className={`${className} border-zinc-700 bg-zinc-800 text-zinc-100`}>
+        <SelectValue />
+      </SelectTrigger>
+      <SelectContent className="border-zinc-700 bg-zinc-800">
+        {REASONING_OPTIONS.map((option) => (
+          <SelectItem key={option.value} value={option.value} className="text-zinc-100 focus:bg-zinc-700 focus:text-zinc-100">
+            {option.label}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  );
+}
+
 /**
  * Modal form for creating or editing a model group. Supports drag-and-drop
  * priority reordering of entries, per-entry quota overrides, enable/disable
@@ -665,7 +703,7 @@ function GroupForm({
     group?.failoverConfig ?? { ...DEFAULT_FAILOVER },
   );
   const [aggregationConfig, setAggregationConfig] = useState<AggregationConfig>(
-    group?.aggregationConfig ?? defaultAggregationConfig(),
+    { ...defaultAggregationConfig(), ...(group?.aggregationConfig ?? {}) },
   );
   const [aliasError, setAliasError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -706,11 +744,29 @@ function GroupForm({
   const toggleReferenceGroup = useCallback((groupId: string) => {
     setAggregationConfig((config) => {
       const exists = config.referenceGroupIds.includes(groupId);
+      const referenceReasoningEfforts = { ...(config.referenceReasoningEfforts ?? {}) };
+      if (exists) delete referenceReasoningEfforts[groupId];
       return {
         ...config,
         referenceGroupIds: exists
           ? config.referenceGroupIds.filter((id) => id !== groupId)
           : [...config.referenceGroupIds, groupId],
+        referenceReasoningEfforts: Object.keys(referenceReasoningEfforts).length > 0 ? referenceReasoningEfforts : undefined,
+      };
+    });
+  }, []);
+
+  const setReferenceReasoningEffort = useCallback((groupId: string, effort: string | null) => {
+    setAggregationConfig((config) => {
+      const referenceReasoningEfforts = { ...(config.referenceReasoningEfforts ?? {}) };
+      if (effort) {
+        referenceReasoningEfforts[groupId] = effort;
+      } else {
+        delete referenceReasoningEfforts[groupId];
+      }
+      return {
+        ...config,
+        referenceReasoningEfforts: Object.keys(referenceReasoningEfforts).length > 0 ? referenceReasoningEfforts : undefined,
       };
     });
   }, []);
@@ -841,13 +897,20 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
       return;
     }
     const moaEnabled = aggregationConfig.enabled;
+    const referenceGroupIds = aggregationConfig.referenceGroupIds.filter((id) => id !== currentGroupId);
+    const referenceReasoningEfforts = Object.fromEntries(
+      Object.entries(aggregationConfig.referenceReasoningEfforts ?? {})
+        .filter(([groupId]) => referenceGroupIds.includes(groupId)),
+    );
     const finalAggregationConfig: AggregationConfig | undefined = moaEnabled
       ? {
           ...aggregationConfig,
-          referenceGroupIds: aggregationConfig.referenceGroupIds.filter((id) => id !== currentGroupId),
+          referenceGroupIds,
           aggregatorGroupId: aggregationConfig.aggregatorGroupId || null,
           referenceTemperature: aggregationConfig.referenceTemperature ?? null,
           aggregatorTemperature: aggregationConfig.aggregatorTemperature ?? null,
+          referenceReasoningEfforts: Object.keys(referenceReasoningEfforts).length > 0 ? referenceReasoningEfforts : undefined,
+          aggregatorReasoningEffort: aggregationConfig.aggregatorReasoningEffort ?? null,
         }
       : undefined;
 
@@ -996,27 +1059,36 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                     </p>
                   ) : (
                     <div className="grid max-h-40 grid-cols-1 gap-2 overflow-auto rounded-md border border-zinc-800 p-2 sm:grid-cols-2">
-                      {moaCandidateGroups.map((candidate) => (
-                        <label
-                          key={candidate.id}
-                          className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800"
-                        >
-                          <input
-                            type="checkbox"
-                            checked={aggregationConfig.referenceGroupIds.includes(candidate.id)}
-                            onChange={() => toggleReferenceGroup(candidate.id)}
-                            className="h-4 w-4 rounded border-zinc-700 bg-zinc-800 text-purple-600 focus:ring-purple-500"
-                          />
-                          <span className="min-w-0 truncate">
-                            {candidate.displayName} <span className="text-xs text-zinc-500">({candidate.alias})</span>
-                          </span>
-                        </label>
-                      ))}
+                      {moaCandidateGroups.map((candidate) => {
+                        const selected = aggregationConfig.referenceGroupIds.includes(candidate.id);
+                        return (
+                          <div key={candidate.id} className="flex items-center gap-2 rounded-md px-2 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800">
+                            <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2">
+                              <input
+                                type="checkbox"
+                                checked={selected}
+                                onChange={() => toggleReferenceGroup(candidate.id)}
+                                className="h-4 w-4 rounded border-zinc-700 bg-zinc-800 text-purple-600 focus:ring-purple-500"
+                              />
+                              <span className="min-w-0 truncate">
+                                {candidate.displayName} <span className="text-xs text-zinc-500">({candidate.alias})</span>
+                              </span>
+                            </label>
+                            {selected && (
+                              <ReasoningEffortSelect
+                                value={aggregationConfig.referenceReasoningEfforts?.[candidate.id]}
+                                onChange={(value) => setReferenceReasoningEffort(candidate.id, value)}
+                                className="h-8 w-32 text-xs"
+                              />
+                            )}
+                          </div>
+                        );
+                      })}
                     </div>
                   )}
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <div>
                     <label className="mb-1 block text-xs font-medium text-zinc-400">Reference Temperature</label>
                     <input
@@ -1047,6 +1119,13 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                       min="0"
                       max="2"
                       step="0.1"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-zinc-400">Aggregator Reasoning</label>
+                    <ReasoningEffortSelect
+                      value={aggregationConfig.aggregatorReasoningEffort}
+                      onChange={(value) => setAggregationConfig((config) => ({ ...config, aggregatorReasoningEffort: value }))}
                     />
                   </div>
                 </div>

@@ -106,6 +106,10 @@ export interface AggregationConfig {
   referenceTemperature?: number | null;
   /** Optional temperature override for the aggregator call. */
   aggregatorTemperature?: number | null;
+  /** Optional reasoning effort override per reference group ID. */
+  referenceReasoningEfforts?: Record<string, string>;
+  /** Optional reasoning effort override for the final aggregator call. */
+  aggregatorReasoningEffort?: string | null;
   /** Fail the request if any reference group fails. */
   requireAllReferences: boolean;
 }

@@ -6,6 +6,9 @@
 //! directly to the on-disk JSON files.
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+const ALLOWED_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 
 /// Describes a single model offered by a provider.
 ///
@@ -157,9 +160,31 @@ pub struct AggregationConfig {
     /// Optional temperature override for the aggregator call.
     #[serde(default, rename = "aggregatorTemperature")]
     pub aggregator_temperature: Option<f64>,
+    /// Optional reasoning effort override per reference group ID.
+    #[serde(
+        default,
+        rename = "referenceReasoningEfforts",
+        skip_serializing_if = "HashMap::is_empty"
+    )]
+    pub reference_reasoning_efforts: HashMap<String, String>,
+    /// Optional reasoning effort override for the final aggregator call.
+    #[serde(
+        default,
+        rename = "aggregatorReasoningEffort",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aggregator_reasoning_effort: Option<String>,
     /// If true, any reference failure fails the full MoA request.
     #[serde(default, rename = "requireAllReferences")]
     pub require_all_references: bool,
+}
+
+fn validate_reasoning_effort(effort: &str) -> bool {
+    ALLOWED_REASONING_EFFORTS.contains(&effort)
+}
+
+fn allowed_reasoning_efforts_label() -> &'static str {
+    "none, low, medium, high, xhigh, max"
 }
 
 /// Controls when and how the proxy fails over to the next [`GroupEntry`].
@@ -279,6 +304,29 @@ pub fn validate_group_aggregation(groups: &[Group]) -> Result<(), String> {
         let Some(config) = group.aggregation_config.as_ref().filter(|c| c.enabled) else {
             continue;
         };
+
+        if let Some(effort) = config.aggregator_reasoning_effort.as_deref() {
+            if !validate_reasoning_effort(effort) {
+                return Err(format!(
+                    "MoA group '{}' has invalid aggregator reasoning effort '{}' (allowed: {})",
+                    group.alias,
+                    effort,
+                    allowed_reasoning_efforts_label()
+                ));
+            }
+        }
+
+        for (reference_group_id, effort) in &config.reference_reasoning_efforts {
+            if !validate_reasoning_effort(effort) {
+                return Err(format!(
+                    "MoA group '{}' has invalid reasoning effort '{}' for reference group '{}' (allowed: {})",
+                    group.alias,
+                    effort,
+                    reference_group_id,
+                    allowed_reasoning_efforts_label()
+                ));
+            }
+        }
 
         if config.reference_group_ids.is_empty() {
             return Err(format!(
@@ -462,7 +510,50 @@ mod tests {
         assert!(config.aggregator_group_id.is_none());
         assert!(config.reference_temperature.is_none());
         assert!(config.aggregator_temperature.is_none());
+        assert!(config.reference_reasoning_efforts.is_empty());
+        assert!(config.aggregator_reasoning_effort.is_none());
         assert!(!config.require_all_references);
+    }
+
+    #[test]
+    fn test_validate_group_aggregation_rejects_invalid_reference_reasoning_effort() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("ref".to_string()),
+                reference_reasoning_efforts: HashMap::from([(
+                    "ref".to_string(),
+                    "extreme".to_string(),
+                )]),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![moa, group("ref", None)];
+
+        assert!(validate_group_aggregation(&groups)
+            .unwrap_err()
+            .contains("invalid reasoning effort"));
+    }
+
+    #[test]
+    fn test_validate_group_aggregation_rejects_invalid_aggregator_reasoning_effort() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("ref".to_string()),
+                aggregator_reasoning_effort: Some("extreme".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![moa, group("ref", None)];
+
+        assert!(validate_group_aggregation(&groups)
+            .unwrap_err()
+            .contains("invalid aggregator reasoning effort"));
     }
 
     #[test]

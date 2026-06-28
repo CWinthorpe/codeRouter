@@ -944,16 +944,6 @@ async fn route_moa_request(
         ));
     }
 
-    if body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    {
-        return Err(AppError::BadRequest(
-            "Mixture of Agents streaming is not supported yet; send stream:false".to_string(),
-        ));
-    }
-
     let groups = {
         let guard = state
             .groups
@@ -1008,11 +998,22 @@ async fn route_moa_request(
     }
 
     let reference_temperature = config.reference_temperature;
+    let reference_reasoning_efforts = config.reference_reasoning_efforts.clone();
     let reference_results: Vec<Result<MoaReferenceOutput, String>> =
         futures::stream::iter(reference_groups.into_iter().map(|reference_group| {
             let body = body.clone();
+            let reasoning_effort = reference_reasoning_efforts
+                .get(&reference_group.id)
+                .cloned();
             async move {
-                run_moa_reference_request(state, body, reference_group, reference_temperature).await
+                run_moa_reference_request(
+                    state,
+                    body,
+                    reference_group,
+                    reference_temperature,
+                    reasoning_effort,
+                )
+                .await
             }
         }))
         .buffer_unordered(MAX_MOA_REFERENCE_CONCURRENCY)
@@ -1053,6 +1054,7 @@ async fn route_moa_request(
         &aggregator_group.alias,
         &references,
         config.aggregator_temperature,
+        config.aggregator_reasoning_effort.as_deref(),
     )
     .map_err(AppError::BadRequest)?;
 
@@ -1078,10 +1080,16 @@ async fn run_moa_reference_request(
     body: Value,
     reference_group: Group,
     reference_temperature: Option<f64>,
+    reasoning_effort: Option<String>,
 ) -> Result<MoaReferenceOutput, String> {
     let alias = reference_group.alias.clone();
     let display_name = reference_group.display_name.clone();
-    let request_body = build_moa_reference_request(&body, &alias, reference_temperature)?;
+    let request_body = build_moa_reference_request(
+        &body,
+        &alias,
+        reference_temperature,
+        reasoning_effort.as_deref(),
+    )?;
     let response = route_failover_request(
         state,
         request_body,
@@ -1107,6 +1115,7 @@ fn build_moa_reference_request(
     body: &Value,
     reference_alias: &str,
     temperature: Option<f64>,
+    reasoning_effort: Option<&str>,
 ) -> Result<Value, String> {
     let messages = body
         .get("messages")
@@ -1143,6 +1152,7 @@ fn build_moa_reference_request(
         obj.remove(key);
     }
     set_temperature(obj, temperature)?;
+    apply_reasoning_effort(obj, reasoning_effort);
 
     Ok(request)
 }
@@ -1169,6 +1179,7 @@ fn build_moa_aggregator_request(
     aggregator_alias: &str,
     references: &[MoaReferenceOutput],
     temperature: Option<f64>,
+    reasoning_effort: Option<&str>,
 ) -> Result<Value, String> {
     let mut request = body.clone();
     let obj = request
@@ -1178,8 +1189,8 @@ fn build_moa_aggregator_request(
         "model".to_string(),
         Value::String(aggregator_alias.to_string()),
     );
-    obj.insert("stream".to_string(), Value::Bool(false));
     set_temperature(obj, temperature)?;
+    apply_reasoning_effort(obj, reasoning_effort);
 
     let summary = build_moa_reference_summary(references);
     let messages = obj
@@ -1193,6 +1204,27 @@ fn build_moa_aggregator_request(
     append_text_to_message_content(&mut messages[user_index], &summary)?;
 
     Ok(request)
+}
+
+fn apply_reasoning_effort(
+    obj: &mut serde_json::Map<String, Value>,
+    reasoning_effort: Option<&str>,
+) {
+    let Some(reasoning_effort) = reasoning_effort else {
+        return;
+    };
+
+    obj.insert(
+        "reasoning_effort".to_string(),
+        Value::String(reasoning_effort.to_string()),
+    );
+
+    if let Some(Value::Object(reasoning)) = obj.get_mut("reasoning") {
+        reasoning.insert(
+            "effort".to_string(),
+            Value::String(reasoning_effort.to_string()),
+        );
+    }
 }
 
 fn build_moa_reference_summary(references: &[MoaReferenceOutput]) -> String {
@@ -2570,7 +2602,7 @@ data: {"type":"response.completed"}
             ]
         });
 
-        let request = build_moa_reference_request(&body, "reference", Some(0.2)).unwrap();
+        let request = build_moa_reference_request(&body, "reference", Some(0.2), None).unwrap();
 
         assert_eq!(request["model"], "reference");
         assert_eq!(request["stream"], false);
@@ -2586,6 +2618,23 @@ data: {"type":"response.completed"}
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "answer so far");
         assert!(messages[2].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_moa_reference_request_applies_reasoning_effort() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "reasoning": {"summary": "auto", "effort": "low"},
+            "messages": [{"role": "user", "content": "question"}]
+        });
+
+        let request = build_moa_reference_request(&body, "reference", None, Some("high")).unwrap();
+
+        assert_eq!(request["model"], "reference");
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["reasoning_effort"], "high");
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["reasoning"]["summary"], "auto");
     }
 
     #[test]
@@ -2613,10 +2662,11 @@ data: {"type":"response.completed"}
         ];
 
         let request =
-            build_moa_aggregator_request(&body, "aggregator", &references, Some(0.4)).unwrap();
+            build_moa_aggregator_request(&body, "aggregator", &references, Some(0.4), None)
+                .unwrap();
 
         assert_eq!(request["model"], "aggregator");
-        assert_eq!(request["stream"], false);
+        assert!(request.get("stream").is_none());
         assert_eq!(request["temperature"], 0.4);
         assert!(request.get("tools").is_some());
         assert_eq!(request["messages"][0]["content"], "first question");
@@ -2628,6 +2678,46 @@ data: {"type":"response.completed"}
         assert!(latest_user.contains("reference answer"));
         assert!(latest_user.contains("Deep (deep)"));
         assert!(latest_user.contains("second answer"));
+    }
+
+    #[test]
+    fn test_moa_aggregator_request_preserves_stream_true() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "stream": true,
+            "messages": [{"role": "user", "content": "question"}]
+        });
+        let references = vec![MoaReferenceOutput {
+            group_alias: "ref".to_string(),
+            display_name: "Ref".to_string(),
+            content: "output".to_string(),
+        }];
+
+        let request =
+            build_moa_aggregator_request(&body, "aggregator", &references, None, None).unwrap();
+
+        assert_eq!(request["model"], "aggregator");
+        assert_eq!(request["stream"], true);
+    }
+
+    #[test]
+    fn test_moa_aggregator_request_preserves_stream_false() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "stream": false,
+            "messages": [{"role": "user", "content": "question"}]
+        });
+        let references = vec![MoaReferenceOutput {
+            group_alias: "ref".to_string(),
+            display_name: "Ref".to_string(),
+            content: "output".to_string(),
+        }];
+
+        let request =
+            build_moa_aggregator_request(&body, "aggregator", &references, None, None).unwrap();
+
+        assert_eq!(request["model"], "aggregator");
+        assert_eq!(request["stream"], false);
     }
 
     #[test]
@@ -2645,12 +2735,38 @@ data: {"type":"response.completed"}
             content: "output".to_string(),
         }];
 
-        let request = build_moa_aggregator_request(&body, "aggregator", &references, None).unwrap();
+        let request =
+            build_moa_aggregator_request(&body, "aggregator", &references, None, None).unwrap();
         let parts = request["messages"][0]["content"].as_array().unwrap();
 
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[1]["type"], "text");
         assert!(parts[1]["text"].as_str().unwrap().contains("output"));
+    }
+
+    #[test]
+    fn test_moa_aggregator_request_applies_reasoning_effort_and_preserves_stream_true() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "stream": true,
+            "reasoning": {"summary": "auto"},
+            "messages": [{"role": "user", "content": "question"}]
+        });
+        let references = vec![MoaReferenceOutput {
+            group_alias: "ref".to_string(),
+            display_name: "Ref".to_string(),
+            content: "output".to_string(),
+        }];
+
+        let request =
+            build_moa_aggregator_request(&body, "aggregator", &references, None, Some("max"))
+                .unwrap();
+
+        assert_eq!(request["model"], "aggregator");
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["reasoning_effort"], "max");
+        assert_eq!(request["reasoning"]["effort"], "max");
+        assert_eq!(request["reasoning"]["summary"], "auto");
     }
 
     #[test]
