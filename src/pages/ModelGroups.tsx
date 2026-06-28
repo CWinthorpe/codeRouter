@@ -24,7 +24,7 @@ import { saveGroup, deleteGroup, getGroups, setEntryEnabled, isGroupReferencedIn
 import { useGroupStatusPoll } from '../hooks/useGroupStatusPoll';
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
 import { Progress } from '@/components/ui/progress';
-import type { Group, GroupEntry, FailoverConfig, Provider, EntryStatusResponse } from '../types';
+import type { Group, GroupEntry, FailoverConfig, Provider, EntryStatusResponse, AggregationConfig } from '../types';
 
 /** Default failover configuration applied to new groups. */
 const DEFAULT_FAILOVER: FailoverConfig = {
@@ -38,6 +38,18 @@ const DEFAULT_FAILOVER: FailoverConfig = {
   consecutiveErrorCooldownMs: 600000,
   maxResponseDurationMs: 1200000,
 };
+
+/** Creates a fresh default aggregation config for MoA-capable groups. */
+function defaultAggregationConfig(): AggregationConfig {
+  return {
+    enabled: false,
+    referenceGroupIds: [],
+    aggregatorGroupId: null,
+    referenceTemperature: null,
+    aggregatorTemperature: null,
+    requireAllReferences: false,
+  };
+}
 
 /** Formats a number with locale-aware separators, or '—' for undefined. */
 function formatNumber(n?: number): string {
@@ -250,6 +262,7 @@ export default function ModelGroups() {
             <GroupCard
               key={group.id}
               group={group}
+              groups={groups}
               providers={providers}
               isExpanded={expandedCards.has(group.id)}
               onToggleExpand={() => toggleExpand(group.id)}
@@ -263,6 +276,7 @@ export default function ModelGroups() {
       {showForm && (
         <GroupForm
           group={editingGroup}
+          groups={groups}
           providers={providers}
           onSave={async (group) => {
             await saveGroup(group);
@@ -294,6 +308,7 @@ export default function ModelGroups() {
  */
 function GroupCard({
   group,
+  groups,
   providers,
   isExpanded,
   onToggleExpand,
@@ -301,6 +316,7 @@ function GroupCard({
   onDelete,
 }: {
   group: Group;
+  groups: Group[];
   providers: Provider[];
   isExpanded: boolean;
   onToggleExpand: () => void;
@@ -308,6 +324,8 @@ function GroupCard({
   onDelete: () => void;
 }) {
   const statusData = useGroupStatusPoll(group.id);
+  const aggregationConfig = group.aggregationConfig;
+  const isMoa = aggregationConfig?.enabled ?? false;
 
   const healthSummary = useMemo(() => {
     const summary = { active: 0, cooldown: 0, quotaExhausted: 0, manuallyDisabled: 0 };
@@ -350,6 +368,15 @@ function GroupCard({
     [providers],
   );
 
+  const moaSummary = useMemo(() => {
+    if (!aggregationConfig?.enabled) return null;
+    const aggregator = groups.find((g) => g.id === aggregationConfig.aggregatorGroupId);
+    const references = aggregationConfig.referenceGroupIds
+      .map((id) => groups.find((g) => g.id === id)?.alias ?? id)
+      .join(', ');
+    return `MoA: ${aggregationConfig.referenceGroupIds.length} reference${aggregationConfig.referenceGroupIds.length === 1 ? '' : 's'} → ${aggregator?.alias ?? 'missing aggregator'}${references ? ` (${references})` : ''}`;
+  }, [aggregationConfig, groups]);
+
   return (
     <div className="rounded-lg border border-zinc-800 bg-zinc-900/60">
       <div className="flex items-start gap-4 p-5">
@@ -359,6 +386,11 @@ function GroupCard({
             <code className="rounded bg-zinc-800 px-2 py-0.5 text-xs font-mono text-zinc-400">
               {group.alias}
             </code>
+            {isMoa && (
+              <span className="rounded-full bg-purple-600/20 px-2 py-0.5 text-xs font-medium text-purple-300">
+                MoA
+              </span>
+            )}
           </div>
 
           <div className="mt-3 flex items-center gap-6 text-sm text-zinc-400">
@@ -370,6 +402,8 @@ function GroupCard({
               </span>
             )}
           </div>
+
+          {moaSummary && <p className="mt-2 text-xs text-purple-300">{moaSummary}</p>}
 
           <div className="mt-2 flex items-center gap-3 text-xs">
             <HealthBadge label="Active" count={healthSummary.active} color="text-green-400" />
@@ -612,11 +646,13 @@ function SearchableSelect({ options, value, onChange, placeholder, disabled }: {
  */
 function GroupForm({
   group,
+  groups,
   providers,
   onSave,
   onClose,
 }: {
   group: Group | null;
+  groups: Group[];
   providers: Provider[];
   onSave: (group: Group) => Promise<void>;
   onClose: () => void;
@@ -627,6 +663,9 @@ function GroupForm({
   const [entries, setEntries] = useState<GroupEntry[]>(group?.entries ?? []);
   const [failoverConfig, setFailoverConfig] = useState<FailoverConfig>(
     group?.failoverConfig ?? { ...DEFAULT_FAILOVER },
+  );
+  const [aggregationConfig, setAggregationConfig] = useState<AggregationConfig>(
+    group?.aggregationConfig ?? defaultAggregationConfig(),
   );
   const [aliasError, setAliasError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -657,6 +696,24 @@ function GroupForm({
     () => providers.find((p) => p.id === addProviderId),
     [providers, addProviderId],
   );
+
+  const currentGroupId = isEditing ? group!.id : alias;
+  const moaCandidateGroups = useMemo(
+    () => groups.filter((g) => g.id !== currentGroupId && !(g.aggregationConfig?.enabled ?? false)),
+    [groups, currentGroupId],
+  );
+
+  const toggleReferenceGroup = useCallback((groupId: string) => {
+    setAggregationConfig((config) => {
+      const exists = config.referenceGroupIds.includes(groupId);
+      return {
+        ...config,
+        referenceGroupIds: exists
+          ? config.referenceGroupIds.filter((id) => id !== groupId)
+          : [...config.referenceGroupIds, groupId],
+      };
+    });
+  }, []);
 
   /** Validates the group alias: must be non-empty and contain only lowercase alphanumerics and hyphens. */
   const validateAlias = useCallback((value: string) => {
@@ -783,9 +840,41 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
       setSaveError('Display name is required.');
       return;
     }
-    if (entries.length === 0) {
+    const moaEnabled = aggregationConfig.enabled;
+    const finalAggregationConfig: AggregationConfig | undefined = moaEnabled
+      ? {
+          ...aggregationConfig,
+          referenceGroupIds: aggregationConfig.referenceGroupIds.filter((id) => id !== currentGroupId),
+          aggregatorGroupId: aggregationConfig.aggregatorGroupId || null,
+          referenceTemperature: aggregationConfig.referenceTemperature ?? null,
+          aggregatorTemperature: aggregationConfig.aggregatorTemperature ?? null,
+        }
+      : undefined;
+
+    if (!moaEnabled && entries.length === 0) {
       setSaveError('At least one provider entry is required.');
       return;
+    }
+    if (moaEnabled) {
+      if (!finalAggregationConfig || finalAggregationConfig.referenceGroupIds.length === 0) {
+        setSaveError('Mixture of Agents requires at least one reference group.');
+        return;
+      }
+      if (!finalAggregationConfig.aggregatorGroupId) {
+        setSaveError('Mixture of Agents requires an aggregator group.');
+        return;
+      }
+      if (finalAggregationConfig.aggregatorGroupId === currentGroupId) {
+        setSaveError('A Mixture of Agents group cannot use itself as the aggregator.');
+        return;
+      }
+      const invalidTarget = [...finalAggregationConfig.referenceGroupIds, finalAggregationConfig.aggregatorGroupId]
+        .map((id) => groups.find((g) => g.id === id))
+        .find((g) => g?.aggregationConfig?.enabled);
+      if (invalidTarget) {
+        setSaveError('Nested Mixture of Agents groups are not supported yet.');
+        return;
+      }
     }
 
     setSaving(true);
@@ -796,6 +885,7 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
         displayName: displayName.trim(),
         entries: entries.map((entry, idx) => ({ ...entry, priority: idx + 1 })),
         failoverConfig,
+        ...(finalAggregationConfig ? { aggregationConfig: finalAggregationConfig } : {}),
       };
       await onSave(groupObj);
     } catch (err: unknown) {
@@ -813,7 +903,7 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
 
   return (
     <Dialog open onOpenChange={(open) => { if (!open) onClose(); }}>
-      <DialogContent className="max-w-2xl bg-zinc-900 border-zinc-800 text-zinc-100">
+      <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto bg-zinc-900 border-zinc-800 text-zinc-100">
         <DialogHeader>
           <DialogTitle>{isEditing ? 'Edit Group' : 'Create Group'}</DialogTitle>
         </DialogHeader>
@@ -850,10 +940,135 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
             </div>
           </div>
 
+          {/* Routing strategy */}
+          <div className="rounded-md border border-zinc-800 p-4">
+            <label className="mb-2 block text-sm font-medium text-zinc-300">Routing Strategy</label>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => setAggregationConfig((config) => ({ ...config, enabled: false }))}
+                className={`rounded-md border px-3 py-2 text-sm transition-colors ${
+                  !aggregationConfig.enabled
+                    ? 'border-emerald-600 bg-emerald-600/10 text-emerald-300'
+                    : 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                }`}
+              >
+                Priority failover
+              </button>
+              <button
+                type="button"
+                onClick={() => setAggregationConfig((config) => ({ ...config, enabled: true }))}
+                className={`rounded-md border px-3 py-2 text-sm transition-colors ${
+                  aggregationConfig.enabled
+                    ? 'border-purple-600 bg-purple-600/10 text-purple-300'
+                    : 'border-zinc-700 bg-zinc-800 text-zinc-300 hover:bg-zinc-700'
+                }`}
+              >
+                Mixture of agents
+              </button>
+            </div>
+
+            {aggregationConfig.enabled && (
+              <div className="mt-4 flex flex-col gap-4 border-t border-zinc-800 pt-4">
+                <div className="rounded-md border border-purple-700/40 bg-purple-950/20 px-3 py-2 text-xs text-purple-200">
+                  MoA makes one upstream call per reference group, then one final aggregator call. This can increase latency and cost.
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-xs font-medium text-zinc-400">Aggregator Group</label>
+                  <SearchableSelect
+                    value={aggregationConfig.aggregatorGroupId ?? ''}
+                    onChange={(value) => setAggregationConfig((config) => ({ ...config, aggregatorGroupId: value || null }))}
+                    placeholder="Select aggregator group…"
+                    disabled={moaCandidateGroups.length === 0}
+                    options={moaCandidateGroups.map((candidate) => ({
+                      value: candidate.id,
+                      label: `${candidate.displayName} (${candidate.alias})`,
+                    }))}
+                  />
+                </div>
+
+                <div>
+                  <label className="mb-2 block text-xs font-medium text-zinc-400">Reference Groups</label>
+                  {moaCandidateGroups.length === 0 ? (
+                    <p className="rounded-md border border-dashed border-zinc-700 py-4 text-center text-xs text-zinc-500">
+                      Create at least one normal failover group before configuring MoA.
+                    </p>
+                  ) : (
+                    <div className="grid max-h-40 grid-cols-1 gap-2 overflow-auto rounded-md border border-zinc-800 p-2 sm:grid-cols-2">
+                      {moaCandidateGroups.map((candidate) => (
+                        <label
+                          key={candidate.id}
+                          className="flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-sm text-zinc-300 hover:bg-zinc-800"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={aggregationConfig.referenceGroupIds.includes(candidate.id)}
+                            onChange={() => toggleReferenceGroup(candidate.id)}
+                            className="h-4 w-4 rounded border-zinc-700 bg-zinc-800 text-purple-600 focus:ring-purple-500"
+                          />
+                          <span className="min-w-0 truncate">
+                            {candidate.displayName} <span className="text-xs text-zinc-500">({candidate.alias})</span>
+                          </span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-zinc-400">Reference Temperature</label>
+                    <input
+                      type="number"
+                      value={aggregationConfig.referenceTemperature ?? ''}
+                      onChange={(e) => setAggregationConfig((config) => ({
+                        ...config,
+                        referenceTemperature: e.target.value === '' ? null : Number(e.target.value),
+                      }))}
+                      placeholder="default"
+                      className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                      min="0"
+                      max="2"
+                      step="0.1"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-zinc-400">Aggregator Temperature</label>
+                    <input
+                      type="number"
+                      value={aggregationConfig.aggregatorTemperature ?? ''}
+                      onChange={(e) => setAggregationConfig((config) => ({
+                        ...config,
+                        aggregatorTemperature: e.target.value === '' ? null : Number(e.target.value),
+                      }))}
+                      placeholder="default"
+                      className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                      min="0"
+                      max="2"
+                      step="0.1"
+                    />
+                  </div>
+                </div>
+
+                <ToggleRow
+                  label="Require all references to succeed"
+                  checked={aggregationConfig.requireAllReferences}
+                  onChange={(value) => setAggregationConfig((config) => ({ ...config, requireAllReferences: value }))}
+                />
+              </div>
+            )}
+          </div>
+
           {/* Provider entries */}
           <div>
             <div className="mb-2 flex items-center justify-between">
-              <label className="text-sm font-medium text-zinc-300">Provider Entries</label>
+              <div>
+                <label className="text-sm font-medium text-zinc-300">Provider Entries</label>
+                {aggregationConfig.enabled && (
+                  <p className="mt-0.5 text-xs text-zinc-500">Optional for MoA groups; referenced groups provide failover.</p>
+                )}
+              </div>
               <button
                 type="button"
                 onClick={() => setShowAddEntry(true)}

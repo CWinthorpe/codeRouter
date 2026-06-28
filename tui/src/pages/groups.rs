@@ -8,6 +8,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 use tui_textarea::TextArea;
 
+use coderouter_proxy::config::models::validate_group_aggregation;
 use coderouter_proxy::config::models::{FailoverConfig, Group, GroupEntry, Provider};
 use coderouter_proxy::config::store;
 use coderouter_proxy::proxy::router::{EntryStatusResponse, RouterStatusResponse};
@@ -92,7 +93,11 @@ impl GroupFormState {
 
     fn prev_field(&mut self) {
         self.save_current_numeric();
-        self.focused = if self.focused == 0 { 10 } else { self.focused - 1 };
+        self.focused = if self.focused == 0 {
+            10
+        } else {
+            self.focused - 1
+        };
     }
 
     fn toggle(&mut self) {
@@ -324,10 +329,17 @@ impl GroupsListState {
     }
 
     fn reload_detail(&mut self) {
-        if let GroupsMode::Detail(idx) | GroupsMode::AddEntryForm(idx) | GroupsMode::FailoverConfigEdit(idx) = self.mode {
+        if let GroupsMode::Detail(idx)
+        | GroupsMode::AddEntryForm(idx)
+        | GroupsMode::FailoverConfigEdit(idx) = self.mode
+        {
             if let Some(g) = &self.detail_group {
                 let gid = g.id.clone();
-                if let Some(fresh) = store::load_groups().unwrap_or_default().into_iter().find(|g| g.id == gid) {
+                if let Some(fresh) = store::load_groups()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|g| g.id == gid)
+                {
                     let mut fresh = fresh;
                     fresh.entries.sort_by_key(|e| e.priority);
                     self.detail_group = Some(fresh);
@@ -336,7 +348,11 @@ impl GroupsListState {
             }
             if idx < self.groups.len() {
                 let gid = self.groups[idx].id.clone();
-                if let Some(fresh) = store::load_groups().unwrap_or_default().into_iter().find(|g| g.id == gid) {
+                if let Some(fresh) = store::load_groups()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|g| g.id == gid)
+                {
                     let mut fresh = fresh;
                     fresh.entries.sort_by_key(|e| e.priority);
                     self.detail_group = Some(fresh);
@@ -350,12 +366,18 @@ impl GroupsListState {
             return;
         }
         let idx = match self.mode {
-            GroupsMode::Detail(i) | GroupsMode::AddEntryForm(i) | GroupsMode::FailoverConfigEdit(i) => i,
+            GroupsMode::Detail(i)
+            | GroupsMode::AddEntryForm(i)
+            | GroupsMode::FailoverConfigEdit(i) => i,
             _ => return,
         };
         if idx < self.groups.len() {
             let gid = self.groups[idx].id.clone();
-            if let Some(g) = store::load_groups().unwrap_or_default().into_iter().find(|g| g.id == gid) {
+            if let Some(g) = store::load_groups()
+                .unwrap_or_default()
+                .into_iter()
+                .find(|g| g.id == gid)
+            {
                 let mut g = g;
                 g.entries.sort_by_key(|e| e.priority);
                 self.detail_group = Some(g);
@@ -495,7 +517,11 @@ fn get_status_for_entry(group_alias: &str, entry_index: usize) -> Option<EntrySt
         .cloned()
 }
 
-fn fmt_status(status: &str, reason: Option<&str>, cooldown_until: Option<chrono::DateTime<chrono::Utc>>) -> String {
+fn fmt_status(
+    status: &str,
+    reason: Option<&str>,
+    cooldown_until: Option<chrono::DateTime<chrono::Utc>>,
+) -> String {
     match status {
         "active" => "Active".to_string(),
         "cooldown" => {
@@ -579,12 +605,14 @@ fn save_group_to_store(group: &Group) -> Result<(), String> {
     } else {
         groups.push(group.clone());
     }
+    validate_group_aggregation(&groups)?;
     store::save_groups(&groups).map_err(|e| e.to_string())
 }
 
 fn delete_group_from_store(group_id: &str) -> Result<(), String> {
     let mut groups = store::load_groups().map_err(|e| e.to_string())?;
     groups.retain(|g| g.id != group_id);
+    validate_group_aggregation(&groups)?;
     store::save_groups(&groups).map_err(|e| e.to_string())
 }
 
@@ -614,9 +642,7 @@ fn fo_summary(fc: &FailoverConfig) -> String {
 pub fn render(app: &App, frame: &mut Frame, area: Rect) {
     ensure_loaded();
     CACHED_STATUS.get_or_init(|| Mutex::new(None));
-    LAST_POLL_TIME.get_or_init(|| {
-        Mutex::new(Instant::now() - std::time::Duration::from_secs(10))
-    });
+    LAST_POLL_TIME.get_or_init(|| Mutex::new(Instant::now() - std::time::Duration::from_secs(10)));
 
     poll_status();
 
@@ -714,11 +740,13 @@ fn render_loading(frame: &mut Frame, area: Rect) {
 
 fn render_list(frame: &mut Frame, area: Rect, state: &mut GroupsListState) {
     let header_cells = ["Alias", "Display Name", "Entries", "Active", "Status"];
-    let header = Row::new(
-        header_cells
-            .iter()
-            .map(|h| Cell::from(*h).style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))),
-    )
+    let header = Row::new(header_cells.iter().map(|h| {
+        Cell::from(*h).style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+    }))
     .bottom_margin(1);
 
     let rows: Vec<Row> = state
@@ -755,7 +783,9 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut GroupsListState) {
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
                 " Groups ",
-                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
             )),
     )
     .row_highlight_style(
@@ -772,7 +802,12 @@ fn render_list(frame: &mut Frame, area: Rect, state: &mut GroupsListState) {
         " j/k:Nav  a:Add  e:Edit  d:Del  Enter:Detail  ?:Help "
     };
     let hint = Paragraph::new(Span::styled(hints, Style::default().fg(Color::DarkGray)));
-    let hint_area = Rect::new(area.x, area.y + area.height.saturating_sub(1), area.width, 1);
+    let hint_area = Rect::new(
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        area.width,
+        1,
+    );
     frame.render_widget(hint, hint_area);
 }
 
@@ -828,8 +863,11 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &mut GroupsListState, app
         ["Pri", "Provider", "Model", "Status", "On"]
             .iter()
             .map(|h| {
-                Cell::from(*h)
-                    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                Cell::from(*h).style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
             }),
     )
     .bottom_margin(1);
@@ -858,8 +896,13 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &mut GroupsListState, app
                 Cell::from(e.provider_id.as_str()).style(Style::default().fg(Color::White)),
                 Cell::from(e.model_id.as_str()).style(Style::default().fg(Color::White)),
                 Cell::from(status_text).style(Style::default().fg(status_col)),
-                Cell::from(if e.enabled { "Yes" } else { "No" })
-                    .style(Style::default().fg(if e.enabled { Color::Green } else { Color::DarkGray })),
+                Cell::from(if e.enabled { "Yes" } else { "No" }).style(Style::default().fg(
+                    if e.enabled {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    },
+                )),
             ])
         })
         .collect();
@@ -881,7 +924,9 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &mut GroupsListState, app
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
                 " Entries ",
-                Style::default().add_modifier(Modifier::BOLD).fg(Color::Cyan),
+                Style::default()
+                    .add_modifier(Modifier::BOLD)
+                    .fg(Color::Cyan),
             )),
     )
     .row_highlight_style(
@@ -951,7 +996,11 @@ fn render_detail(frame: &mut Frame, area: Rect, state: &mut GroupsListState, app
 
 fn render_group_form(frame: &mut Frame, area: Rect, state: &mut GroupsListState) {
     let is_add = matches!(state.mode, GroupsMode::AddGroupForm);
-    let title = if is_add { " Add Group " } else { " Edit Group " };
+    let title = if is_add {
+        " Add Group "
+    } else {
+        " Edit Group "
+    };
 
     let form_width = 64.min(area.width);
     let form_height = 22.min(area.height);
@@ -1184,8 +1233,18 @@ fn render_entry_form(frame: &mut Frame, area: Rect, state: &mut GroupsListState)
         Style::default().fg(Color::White)
     };
     let prov_p = Paragraph::new(Line::from(vec![
-        Span::styled(" Provider: ", Style::default().fg(if focused == 0 { Color::Cyan } else { Color::DarkGray })),
-        Span::styled(format!("{} [{}/{}]", prov_display, ef.prov_idx + 1, providers.len()), prov_style),
+        Span::styled(
+            " Provider: ",
+            Style::default().fg(if focused == 0 {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            format!("{} [{}/{}]", prov_display, ef.prov_idx + 1, providers.len()),
+            prov_style,
+        ),
     ]));
     frame.render_widget(prov_p, layout[0]);
 
@@ -1197,17 +1256,36 @@ fn render_entry_form(frame: &mut Frame, area: Rect, state: &mut GroupsListState)
         Style::default().fg(Color::White)
     };
     let model_p = Paragraph::new(Line::from(vec![
-        Span::styled(" Model: ", Style::default().fg(if focused == 1 { Color::Cyan } else { Color::DarkGray })),
-        Span::styled(format!("{} [{}/{}]", model_display, ef.model_idx + 1, models.len()), model_style),
+        Span::styled(
+            " Model: ",
+            Style::default().fg(if focused == 1 {
+                Color::Cyan
+            } else {
+                Color::DarkGray
+            }),
+        ),
+        Span::styled(
+            format!("{} [{}/{}]", model_display, ef.model_idx + 1, models.len()),
+            model_style,
+        ),
     ]));
     frame.render_widget(model_p, layout[1]);
 
     let hint_spans = if focused <= 1 {
-        Span::styled(" j/k:Select  Tab:Next  Esc:Cancel ", Style::default().fg(Color::DarkGray))
+        Span::styled(
+            " j/k:Select  Tab:Next  Esc:Cancel ",
+            Style::default().fg(Color::DarkGray),
+        )
     } else {
-        Span::styled(" Tab:Next  Enter:Save  Esc:Cancel ", Style::default().fg(Color::DarkGray))
+        Span::styled(
+            " Tab:Next  Enter:Save  Esc:Cancel ",
+            Style::default().fg(Color::DarkGray),
+        )
     };
-    frame.render_widget(Paragraph::new(Line::from(hint_spans)).alignment(Alignment::Center), layout[2]);
+    frame.render_widget(
+        Paragraph::new(Line::from(hint_spans)).alignment(Alignment::Center),
+        layout[2],
+    );
 
     frame.render_widget(Paragraph::new(""), layout[3]);
 
@@ -1370,11 +1448,8 @@ fn handle_list_key(_app: &mut App, key: KeyEvent, state: &mut GroupsListState) {
             if let Some(i) = state.table_state.selected() {
                 if i < state.groups.len() {
                     let g = &state.groups[i];
-                    state.form = GroupFormState::with_values(
-                        &g.alias,
-                        &g.display_name,
-                        &g.failover_config,
-                    );
+                    state.form =
+                        GroupFormState::with_values(&g.alias, &g.display_name, &g.failover_config);
                     state.mode = GroupsMode::EditGroupForm(i);
                 }
             }
@@ -1448,10 +1523,7 @@ fn handle_detail_key(app: &mut App, key: KeyEvent, state: &mut GroupsListState) 
                 } else {
                     "disabled"
                 };
-                app.toast = Some(ToastMessage::new(format!(
-                    "Entry {}",
-                    label
-                )));
+                app.toast = Some(ToastMessage::new(format!("Entry {}", label)));
             }
         }
         KeyCode::Char('d') => {
@@ -1555,6 +1627,7 @@ fn submit_group_form(app: &mut App, state: &mut GroupsListState) {
                             display_name,
                             entries: vec![],
                             failover_config: fc,
+                            aggregation_config: None,
                         };
                         save_group_to_store(&group)
                     }
@@ -1568,7 +1641,8 @@ fn submit_group_form(app: &mut App, state: &mut GroupsListState) {
                             g.display_name = display_name;
                             g.failover_config = fc;
                         }
-                        store::save_groups(&groups).map_err(|e| e.to_string())
+                        validate_group_aggregation(&groups)
+                            .and_then(|_| store::save_groups(&groups).map_err(|e| e.to_string()))
                     } else {
                         Err("Invalid selection".into())
                     }

@@ -6,7 +6,7 @@
 //! `kill_sidecar`).
 
 use chrono::NaiveDate;
-use coderouter_proxy::config::models::{AppConfig, Group, Provider};
+use coderouter_proxy::config::models::{validate_group_aggregation, AppConfig, Group, Provider};
 use coderouter_proxy::config::store;
 use coderouter_proxy::credentials::keychain;
 use coderouter_proxy::metrics::db;
@@ -388,6 +388,8 @@ pub async fn save_group(group: Group) -> Result<(), String> {
         groups.push(group);
     }
 
+    validate_group_aggregation(&groups)?;
+
     store::save_groups(&groups).map_err(|e| e.to_string())?;
     notify_sidecar_config_reload().await;
     reinject_opencode_provider_if_enabled().await;
@@ -405,6 +407,7 @@ pub async fn save_group(group: Group) -> Result<(), String> {
 pub async fn delete_group(group_id: String) -> Result<(), String> {
     let mut groups = store::load_groups().map_err(|e| e.to_string())?;
     groups.retain(|g| g.id != group_id);
+    validate_group_aggregation(&groups)?;
     store::save_groups(&groups).map_err(|e| e.to_string())?;
     notify_sidecar_config_reload().await;
     reinject_opencode_provider_if_enabled().await;

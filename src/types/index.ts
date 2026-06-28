@@ -94,6 +94,22 @@ export interface FailoverConfig {
   maxResponseDurationMs: number;
 }
 
+/** Optional group-level Mixture of Agents routing configuration. */
+export interface AggregationConfig {
+  /** Whether this group routes via Mixture of Agents instead of direct failover. */
+  enabled: boolean;
+  /** Group IDs used for advisory reference calls. */
+  referenceGroupIds: string[];
+  /** Group ID used for the final aggregator call. */
+  aggregatorGroupId: string | null;
+  /** Optional temperature override for reference calls. */
+  referenceTemperature?: number | null;
+  /** Optional temperature override for the aggregator call. */
+  aggregatorTemperature?: number | null;
+  /** Fail the request if any reference group fails. */
+  requireAllReferences: boolean;
+}
+
 /** A routing group that maps an alias to an ordered list of provider entries with failover rules. */
 export interface Group {
   /** Unique identifier for the group. */
@@ -106,6 +122,8 @@ export interface Group {
   entries: GroupEntry[];
   /** Failover rules applied when an entry becomes unavailable. */
   failoverConfig: FailoverConfig;
+  /** Optional Mixture of Agents routing configuration. */
+  aggregationConfig?: AggregationConfig;
 }
 
 /** Application-level configuration persisted to disk. */

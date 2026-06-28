@@ -35,13 +35,15 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::config::{
-    models::{AppConfig, Group, Provider},
+    models::{validate_group_aggregation, AppConfig, Group, Provider},
     store::{load_app_config, load_groups, load_providers},
 };
 
 /// Maximum time (ms) to wait between SSE chunks before declaring a timeout.
 /// Long timeout accounts for models that "think" (reasoning) before emitting tokens.
 const STREAM_INTER_CHUNK_TIMEOUT_MS: u64 = 120_000;
+const MAX_MOA_REFERENCE_CONCURRENCY: usize = 4;
+const MAX_MOA_REFERENCE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 use crate::credentials::keychain::get_credential;
 use crate::metrics::db as metrics_db;
 use crate::metrics::recorder::{MetricsRecorder, RequestEvent};
@@ -250,57 +252,73 @@ struct ModelObject {
 
 /// `GET /v1/models` — lists groups as OpenAI model objects.
 ///
-/// Only groups that have at least one **active, under-quota** entry are
-/// included. Context-window and max-output-token metadata are taken from
-/// the highest-priority active entry's provider model definition.
+/// Normal groups are included when they have at least one **active,
+/// under-quota** entry. MoA groups are included when their aggregator and
+/// required references have available failover entries. Context-window and
+/// max-output-token metadata are taken from the active group's provider model
+/// definitions, using the aggregator group for MoA aliases.
 async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse> {
     let providers = state.providers.read().unwrap();
     let router_state = state.router_state.lock().unwrap();
     let groups = state.groups.read().unwrap();
+    let aggregation_config_valid = validate_group_aggregation(groups.as_ref()).is_ok();
     let data = groups
         .iter()
         .filter(|g| {
-            g.entries.iter().enumerate().any(|(idx, e)| {
-                if !e.enabled {
+            if let Some(config) = g.aggregation_config.as_ref().filter(|c| c.enabled) {
+                if !aggregation_config_valid {
                     return false;
                 }
-                let key = format!("{}:{}", e.provider_id, idx);
-                if let Some(entry_state) = router_state.entries.get(&key) {
-                    if entry_state.status != router::EntryStatus::Active {
-                        return false;
-                    }
-                    let effective_quota = e.daily_token_quota_override.or_else(|| {
-                        providers
-                            .iter()
-                            .find(|p| p.id == e.provider_id)
-                            .and_then(|p| p.daily_token_quota)
-                    });
-                    if let Some(quota) = effective_quota {
-                        if entry_state.daily_tokens_used >= quota {
-                            return false;
-                        }
-                    }
-                    let effective_request_quota = providers
-                        .iter()
-                        .find(|p| p.id == e.provider_id)
-                        .and_then(|p| p.daily_request_quota);
-                    if let Some(quota) = effective_request_quota {
-                        if entry_state.daily_requests_used >= quota {
-                            return false;
-                        }
-                    }
-                    true
-                } else {
-                    true
+                let aggregator_available = config
+                    .aggregator_group_id
+                    .as_deref()
+                    .and_then(|id| groups.iter().find(|candidate| candidate.id == id))
+                    .map(|candidate| {
+                        group_has_available_entry(candidate, &providers, &router_state)
+                    })
+                    .unwrap_or(false);
+                if !aggregator_available {
+                    return false;
                 }
-            })
+
+                if config.require_all_references {
+                    config.reference_group_ids.iter().all(|id| {
+                        groups
+                            .iter()
+                            .find(|candidate| candidate.id == *id)
+                            .map(|candidate| {
+                                group_has_available_entry(candidate, &providers, &router_state)
+                            })
+                            .unwrap_or(false)
+                    })
+                } else {
+                    config.reference_group_ids.iter().any(|id| {
+                        groups
+                            .iter()
+                            .find(|candidate| candidate.id == *id)
+                            .map(|candidate| {
+                                group_has_available_entry(candidate, &providers, &router_state)
+                            })
+                            .unwrap_or(false)
+                    })
+                }
+            } else {
+                group_has_available_entry(g, &providers, &router_state)
+            }
         })
         .map(|g| {
+            let metadata_group = g
+                .aggregation_config
+                .as_ref()
+                .filter(|c| c.enabled)
+                .and_then(|config| config.aggregator_group_id.as_deref())
+                .and_then(|id| groups.iter().find(|candidate| candidate.id == id))
+                .unwrap_or(g);
             let (context_window, max_output_tokens) = {
                 let mut resolved_context: Option<u64> = None;
                 let mut resolved_max_output: Option<u64> = None;
 
-                let mut sorted_entries: Vec<_> = g
+                let mut sorted_entries: Vec<_> = metadata_group
                     .entries
                     .iter()
                     .enumerate()
@@ -352,6 +370,47 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
     Json(ModelResponse {
         object: "list".to_string(),
         data,
+    })
+}
+
+fn group_has_available_entry(
+    group: &Group,
+    providers: &[Provider],
+    router_state: &router::RouterState,
+) -> bool {
+    group.entries.iter().enumerate().any(|(idx, entry)| {
+        if !entry.enabled {
+            return false;
+        }
+        let key = format!("{}:{}", entry.provider_id, idx);
+        if let Some(entry_state) = router_state.entries.get(&key) {
+            if entry_state.status != router::EntryStatus::Active {
+                return false;
+            }
+            let effective_quota = entry.daily_token_quota_override.or_else(|| {
+                providers
+                    .iter()
+                    .find(|p| p.id == entry.provider_id)
+                    .and_then(|p| p.daily_token_quota)
+            });
+            if let Some(quota) = effective_quota {
+                if entry_state.daily_tokens_used >= quota {
+                    return false;
+                }
+            }
+            let effective_request_quota = providers
+                .iter()
+                .find(|p| p.id == entry.provider_id)
+                .and_then(|p| p.daily_request_quota);
+            if let Some(quota) = effective_request_quota {
+                if entry_state.daily_requests_used >= quota {
+                    return false;
+                }
+            }
+            true
+        } else {
+            true
+        }
     })
 }
 
@@ -407,18 +466,11 @@ async fn route_request(
     body: Value,
     endpoint: &str,
 ) -> Result<Response, AppError> {
-    let start = Instant::now();
-
     let model = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| AppError::BadRequest("missing model field".into()))?
         .to_string();
-
-    let stream = body
-        .get("stream")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
 
     let group = {
         let groups = state
@@ -431,6 +483,27 @@ async fn route_request(
             .cloned()
             .ok_or_else(|| AppError::NotFound(format!("no group found for model '{model}'")))?
     };
+
+    if group.aggregation_enabled() {
+        return route_moa_request(state, body, endpoint, group).await;
+    }
+
+    route_failover_request(state, body, endpoint, group, &model).await
+}
+
+async fn route_failover_request(
+    state: &AppState,
+    body: Value,
+    endpoint: &str,
+    group: Group,
+    response_alias: &str,
+) -> Result<Response, AppError> {
+    let start = Instant::now();
+
+    let stream = body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let providers = {
         let guard = state
@@ -574,7 +647,7 @@ async fn route_request(
                 process_response(
                     resp,
                     stream,
-                    &group.alias,
+                    response_alias,
                     is_anthropic,
                     is_codex,
                     timeout_ms,
@@ -837,10 +910,13 @@ async fn route_request(
     }
 
     // All entries exhausted — return 503
-    let mut exhausted_body = router::build_exhausted_response(&model);
+    let mut exhausted_body = router::build_exhausted_response(&group.alias);
     let detail = last_error
         .unwrap_or_else(|| "no eligible provider entries were active for this model".to_string());
-    eprintln!("all providers exhausted for model {model}: {detail}");
+    eprintln!(
+        "all providers exhausted for model {}: {detail}",
+        group.alias
+    );
     {
         if let Some(error) = exhausted_body
             .get_mut("error")
@@ -854,6 +930,405 @@ async fn route_request(
         }
     }
     Ok((StatusCode::SERVICE_UNAVAILABLE, Json(exhausted_body)).into_response())
+}
+
+async fn route_moa_request(
+    state: &AppState,
+    body: Value,
+    endpoint: &str,
+    group: Group,
+) -> Result<Response, AppError> {
+    if endpoint != "chat/completions" {
+        return Err(AppError::BadRequest(
+            "Mixture of Agents groups only support /v1/chat/completions".to_string(),
+        ));
+    }
+
+    if body
+        .get("stream")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return Err(AppError::BadRequest(
+            "Mixture of Agents streaming is not supported yet; send stream:false".to_string(),
+        ));
+    }
+
+    let groups = {
+        let guard = state
+            .groups
+            .read()
+            .map_err(|_| AppError::InternalError("groups lock poisoned".into()))?;
+        guard.clone()
+    };
+    validate_group_aggregation(groups.as_ref()).map_err(AppError::BadRequest)?;
+
+    let config = group
+        .aggregation_config
+        .clone()
+        .filter(|c| c.enabled)
+        .ok_or_else(|| {
+            AppError::InternalError(format!(
+                "group '{}' was routed as MoA without enabled aggregation config",
+                group.alias
+            ))
+        })?;
+
+    let aggregator_group_id = config.aggregator_group_id.clone().ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "MoA group '{}' must have an aggregator group",
+            group.alias
+        ))
+    })?;
+
+    let aggregator_group = groups
+        .iter()
+        .find(|g| g.id == aggregator_group_id)
+        .cloned()
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "MoA group '{}' uses missing aggregator group id '{}'",
+                group.alias, aggregator_group_id
+            ))
+        })?;
+
+    let mut reference_groups = Vec::new();
+    for reference_group_id in &config.reference_group_ids {
+        let reference_group = groups
+            .iter()
+            .find(|g| g.id == *reference_group_id)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::BadRequest(format!(
+                    "MoA group '{}' references missing group id '{}'",
+                    group.alias, reference_group_id
+                ))
+            })?;
+        reference_groups.push(reference_group);
+    }
+
+    let reference_temperature = config.reference_temperature;
+    let reference_results: Vec<Result<MoaReferenceOutput, String>> =
+        futures::stream::iter(reference_groups.into_iter().map(|reference_group| {
+            let body = body.clone();
+            async move {
+                run_moa_reference_request(state, body, reference_group, reference_temperature).await
+            }
+        }))
+        .buffer_unordered(MAX_MOA_REFERENCE_CONCURRENCY)
+        .collect()
+        .await;
+
+    let mut references = Vec::new();
+    let mut failures = Vec::new();
+    for result in reference_results {
+        match result {
+            Ok(reference) => references.push(reference),
+            Err(error) => failures.push(error),
+        }
+    }
+
+    if config.require_all_references && !failures.is_empty() {
+        return Err(AppError::ServiceUnavailable(format!(
+            "MoA reference failure(s) for group '{}': {}",
+            group.alias,
+            failures.join("; ")
+        )));
+    }
+
+    if references.is_empty() {
+        let detail = if failures.is_empty() {
+            "no reference groups were configured".to_string()
+        } else {
+            failures.join("; ")
+        };
+        return Err(AppError::ServiceUnavailable(format!(
+            "All MoA references failed for group '{}': {}",
+            group.alias, detail
+        )));
+    }
+
+    let aggregator_body = build_moa_aggregator_request(
+        &body,
+        &aggregator_group.alias,
+        &references,
+        config.aggregator_temperature,
+    )
+    .map_err(AppError::BadRequest)?;
+
+    route_failover_request(
+        state,
+        aggregator_body,
+        endpoint,
+        aggregator_group,
+        &group.alias,
+    )
+    .await
+}
+
+#[derive(Clone, Debug)]
+struct MoaReferenceOutput {
+    group_alias: String,
+    display_name: String,
+    content: String,
+}
+
+async fn run_moa_reference_request(
+    state: &AppState,
+    body: Value,
+    reference_group: Group,
+    reference_temperature: Option<f64>,
+) -> Result<MoaReferenceOutput, String> {
+    let alias = reference_group.alias.clone();
+    let display_name = reference_group.display_name.clone();
+    let request_body = build_moa_reference_request(&body, &alias, reference_temperature)?;
+    let response = route_failover_request(
+        state,
+        request_body,
+        "chat/completions",
+        reference_group,
+        &alias,
+    )
+    .await
+    .map_err(app_error_message)?;
+    let json = response_to_json_value(response, &alias).await?;
+    let content = extract_assistant_text(&json)
+        .filter(|text| !text.trim().is_empty())
+        .ok_or_else(|| format!("reference group '{}' returned no assistant content", alias))?;
+
+    Ok(MoaReferenceOutput {
+        group_alias: alias,
+        display_name,
+        content,
+    })
+}
+
+fn build_moa_reference_request(
+    body: &Value,
+    reference_alias: &str,
+    temperature: Option<f64>,
+) -> Result<Value, String> {
+    let messages = body
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "MoA requests require a messages array".to_string())?;
+
+    let sanitized_messages: Vec<Value> = messages
+        .iter()
+        .filter_map(sanitize_reference_message)
+        .collect();
+    if sanitized_messages.is_empty() {
+        return Err(
+            "MoA reference request has no text messages after stripping tool messages".into(),
+        );
+    }
+
+    let mut request = body.clone();
+    let obj = request
+        .as_object_mut()
+        .ok_or_else(|| "MoA request body must be a JSON object".to_string())?;
+    obj.insert(
+        "model".to_string(),
+        Value::String(reference_alias.to_string()),
+    );
+    obj.insert("stream".to_string(), Value::Bool(false));
+    obj.insert("messages".to_string(), Value::Array(sanitized_messages));
+    for key in [
+        "tools",
+        "tool_choice",
+        "parallel_tool_calls",
+        "functions",
+        "function_call",
+    ] {
+        obj.remove(key);
+    }
+    set_temperature(obj, temperature)?;
+
+    Ok(request)
+}
+
+fn sanitize_reference_message(message: &Value) -> Option<Value> {
+    let role = message.get("role").and_then(|v| v.as_str())?;
+    if !matches!(role, "system" | "user" | "assistant") {
+        return None;
+    }
+
+    let content = message.get("content").map(content_value_to_text)?;
+    if content.trim().is_empty() {
+        return None;
+    }
+
+    Some(serde_json::json!({
+        "role": role,
+        "content": content,
+    }))
+}
+
+fn build_moa_aggregator_request(
+    body: &Value,
+    aggregator_alias: &str,
+    references: &[MoaReferenceOutput],
+    temperature: Option<f64>,
+) -> Result<Value, String> {
+    let mut request = body.clone();
+    let obj = request
+        .as_object_mut()
+        .ok_or_else(|| "MoA request body must be a JSON object".to_string())?;
+    obj.insert(
+        "model".to_string(),
+        Value::String(aggregator_alias.to_string()),
+    );
+    obj.insert("stream".to_string(), Value::Bool(false));
+    set_temperature(obj, temperature)?;
+
+    let summary = build_moa_reference_summary(references);
+    let messages = obj
+        .get_mut("messages")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| "MoA requests require a messages array".to_string())?;
+    let user_index = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(|v| v.as_str()) == Some("user"))
+        .ok_or_else(|| "MoA requests require at least one user message".to_string())?;
+    append_text_to_message_content(&mut messages[user_index], &summary)?;
+
+    Ok(request)
+}
+
+fn build_moa_reference_summary(references: &[MoaReferenceOutput]) -> String {
+    let mut summary =
+        String::from("Mixture of Agents reference outputs (advisory; use only if helpful):");
+    for (idx, reference) in references.iter().enumerate() {
+        summary.push_str("\n\n");
+        summary.push_str(&format!(
+            "[Reference {}: {} ({})]\n{}",
+            idx + 1,
+            reference.display_name,
+            reference.group_alias,
+            reference.content.trim()
+        ));
+    }
+    summary
+}
+
+fn append_text_to_message_content(message: &mut Value, text: &str) -> Result<(), String> {
+    let obj = message
+        .as_object_mut()
+        .ok_or_else(|| "message must be a JSON object".to_string())?;
+
+    match obj.get_mut("content") {
+        Some(Value::String(existing)) => {
+            if existing.trim().is_empty() {
+                *existing = text.to_string();
+            } else {
+                existing.push_str("\n\n");
+                existing.push_str(text);
+            }
+        }
+        Some(Value::Array(parts)) => {
+            parts.push(serde_json::json!({ "type": "text", "text": text }));
+        }
+        Some(other) => {
+            let existing = content_value_to_text(other);
+            let content = if existing.trim().is_empty() {
+                text.to_string()
+            } else {
+                format!("{}\n\n{}", existing, text)
+            };
+            obj.insert("content".to_string(), Value::String(content));
+        }
+        None => {
+            obj.insert("content".to_string(), Value::String(text.to_string()));
+        }
+    }
+
+    Ok(())
+}
+
+fn content_value_to_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                if let Some(text) = part.as_str() {
+                    Some(text.to_string())
+                } else {
+                    part.get("text")
+                        .or_else(|| part.get("input_text"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(obj) => obj
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn set_temperature(
+    obj: &mut serde_json::Map<String, Value>,
+    temperature: Option<f64>,
+) -> Result<(), String> {
+    if let Some(temperature) = temperature {
+        let number = serde_json::Number::from_f64(temperature)
+            .ok_or_else(|| "temperature must be a finite number".to_string())?;
+        obj.insert("temperature".to_string(), Value::Number(number));
+    }
+    Ok(())
+}
+
+async fn response_to_json_value(response: Response, group_alias: &str) -> Result<Value, String> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), MAX_MOA_REFERENCE_RESPONSE_BYTES)
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to read response from group '{}': {}",
+                group_alias, e
+            )
+        })?;
+
+    if !status.is_success() {
+        let body = String::from_utf8_lossy(&bytes);
+        return Err(format!(
+            "group '{}' returned HTTP {}: {}",
+            group_alias,
+            status.as_u16(),
+            sanitize_upstream_error(&body)
+        ));
+    }
+
+    serde_json::from_slice(&bytes)
+        .map_err(|e| format!("group '{}' returned invalid JSON: {}", group_alias, e))
+}
+
+fn extract_assistant_text(json: &Value) -> Option<String> {
+    json.get("choices")
+        .and_then(|v| v.as_array())?
+        .iter()
+        .filter_map(|choice| {
+            choice
+                .get("message")
+                .and_then(|message| message.get("content"))
+                .map(content_value_to_text)
+        })
+        .find(|content| !content.trim().is_empty())
+}
+
+fn app_error_message(error: AppError) -> String {
+    match error {
+        AppError::BadRequest(message)
+        | AppError::NotFound(message)
+        | AppError::InternalError(message)
+        | AppError::ServiceUnavailable(message) => message,
+    }
 }
 
 fn sanitize_upstream_error(message: &str) -> String {
@@ -1608,6 +2083,7 @@ async fn handle_health(State(state): State<Arc<AppState>>) -> Json<serde_json::V
 enum AppError {
     BadRequest(String),
     NotFound(String),
+    ServiceUnavailable(String),
     InternalError(String),
 }
 
@@ -1618,6 +2094,7 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
+            AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
             AppError::InternalError(msg) => {
                 eprintln!("internal error: {msg}");
                 (StatusCode::INTERNAL_SERVER_ERROR, msg)
@@ -2073,6 +2550,107 @@ data: {"type":"response.completed"}
             r#"{"q":"rust"}"#
         );
         assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn test_moa_reference_request_strips_tools_and_forces_non_streaming() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "stream": true,
+            "temperature": 0.9,
+            "tools": [{"type": "function", "function": {"name": "lookup"}}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": true,
+            "messages": [
+                {"role": "system", "content": "system text"},
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1"}]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "tool result"},
+                {"role": "assistant", "content": "answer so far", "tool_calls": [{"id": "call_2"}]}
+            ]
+        });
+
+        let request = build_moa_reference_request(&body, "reference", Some(0.2)).unwrap();
+
+        assert_eq!(request["model"], "reference");
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["temperature"], 0.2);
+        assert!(request.get("tools").is_none());
+        assert!(request.get("tool_choice").is_none());
+        assert!(request.get("parallel_tool_calls").is_none());
+
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "answer so far");
+        assert!(messages[2].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn test_moa_aggregator_request_augments_latest_user_message() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "messages": [
+                {"role": "user", "content": "first question"},
+                {"role": "assistant", "content": "context"},
+                {"role": "user", "content": "final question"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "lookup"}}]
+        });
+        let references = vec![
+            MoaReferenceOutput {
+                group_alias: "code-large".to_string(),
+                display_name: "Code Large".to_string(),
+                content: "reference answer".to_string(),
+            },
+            MoaReferenceOutput {
+                group_alias: "deep".to_string(),
+                display_name: "Deep".to_string(),
+                content: "second answer".to_string(),
+            },
+        ];
+
+        let request =
+            build_moa_aggregator_request(&body, "aggregator", &references, Some(0.4)).unwrap();
+
+        assert_eq!(request["model"], "aggregator");
+        assert_eq!(request["stream"], false);
+        assert_eq!(request["temperature"], 0.4);
+        assert!(request.get("tools").is_some());
+        assert_eq!(request["messages"][0]["content"], "first question");
+
+        let latest_user = request["messages"][2]["content"].as_str().unwrap();
+        assert!(latest_user.contains("final question"));
+        assert!(latest_user.contains("Mixture of Agents reference outputs"));
+        assert!(latest_user.contains("Code Large (code-large)"));
+        assert!(latest_user.contains("reference answer"));
+        assert!(latest_user.contains("Deep (deep)"));
+        assert!(latest_user.contains("second answer"));
+    }
+
+    #[test]
+    fn test_moa_aggregator_request_appends_text_part_to_array_content() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "messages": [{
+                "role": "user",
+                "content": [{"type": "text", "text": "question"}]
+            }]
+        });
+        let references = vec![MoaReferenceOutput {
+            group_alias: "ref".to_string(),
+            display_name: "Ref".to_string(),
+            content: "output".to_string(),
+        }];
+
+        let request = build_moa_aggregator_request(&body, "aggregator", &references, None).unwrap();
+        let parts = request["messages"][0]["content"].as_array().unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[1]["type"], "text");
+        assert!(parts[1]["text"].as_str().unwrap().contains("output"));
     }
 
     #[test]

@@ -181,62 +181,9 @@ pub fn inject_provider(
     let mut models = serde_json::Map::new();
 
     for group in groups {
-        // Find the highest-priority enabled entry whose status is "active"
-        // (or absent from the status map, which defaults to active).
-        let highest_active = group
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(idx, e)| {
-                if !e.enabled {
-                    return false;
-                }
-                let key = format!("{}:{}", e.provider_id, idx);
-                entry_statuses
-                    .get(&key)
-                    .map(|s| s == "active")
-                    .unwrap_or(true)
-            })
-            .min_by_key(|(_, e)| e.priority)
-            .map(|(_, e)| e);
-
-        if let Some(_entry) = highest_active {
-            let mut model_obj = serde_json::Map::new();
-            model_obj.insert("name".to_string(), json_str(&group.display_name));
-
-            let mut resolved_context: Option<u64> = None;
-            let mut resolved_max_output: Option<u64> = None;
-
-            let mut sorted_entries: Vec<_> = group.entries.iter().filter(|e| e.enabled).collect();
-            sorted_entries.sort_by_key(|e| e.priority);
-
-            for ent in &sorted_entries {
-                if resolved_context.is_some() && resolved_max_output.is_some() {
-                    break;
-                }
-                if let Some(provider) = providers.iter().find(|p| p.id == ent.provider_id) {
-                    if let Some((ctx, max_out)) = provider.resolve_model_meta(&ent.model_id) {
-                        if resolved_context.is_none() {
-                            resolved_context = ctx;
-                        }
-                        if resolved_max_output.is_none() {
-                            resolved_max_output = max_out;
-                        }
-                    }
-                }
-            }
-
-            let mut limit = serde_json::Map::new();
-            if let Some(ctx) = resolved_context {
-                limit.insert("context".to_string(), json_num(ctx));
-            }
-            if let Some(out) = resolved_max_output {
-                limit.insert("output".to_string(), json_num(out));
-            }
-            if !limit.is_empty() {
-                model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
-            }
-
+        let source_group = model_source_group(group, groups);
+        if group_has_active_entry(source_group, entry_statuses) {
+            let model_obj = build_model_object(group, source_group, providers);
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
         }
     }
@@ -518,62 +465,9 @@ pub fn preview_opencode_config(
     let mut models = serde_json::Map::new();
 
     for group in groups {
-        // Find the highest-priority enabled entry whose status is "active"
-        // (or absent from the status map, which defaults to active).
-        let highest_active = group
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(idx, e)| {
-                if !e.enabled {
-                    return false;
-                }
-                let key = format!("{}:{}", e.provider_id, idx);
-                entry_statuses
-                    .get(&key)
-                    .map(|s| s == "active")
-                    .unwrap_or(true)
-            })
-            .min_by_key(|(_, e)| e.priority)
-            .map(|(_, e)| e);
-
-        if let Some(_entry) = highest_active {
-            let mut model_obj = serde_json::Map::new();
-            model_obj.insert("name".to_string(), json_str(&group.display_name));
-
-            let mut resolved_context: Option<u64> = None;
-            let mut resolved_max_output: Option<u64> = None;
-
-            let mut sorted_entries: Vec<_> = group.entries.iter().filter(|e| e.enabled).collect();
-            sorted_entries.sort_by_key(|e| e.priority);
-
-            for ent in &sorted_entries {
-                if resolved_context.is_some() && resolved_max_output.is_some() {
-                    break;
-                }
-                if let Some(provider) = providers.iter().find(|p| p.id == ent.provider_id) {
-                    if let Some((ctx, max_out)) = provider.resolve_model_meta(&ent.model_id) {
-                        if resolved_context.is_none() {
-                            resolved_context = ctx;
-                        }
-                        if resolved_max_output.is_none() {
-                            resolved_max_output = max_out;
-                        }
-                    }
-                }
-            }
-
-            let mut limit = serde_json::Map::new();
-            if let Some(ctx) = resolved_context {
-                limit.insert("context".to_string(), json_num(ctx));
-            }
-            if let Some(out) = resolved_max_output {
-                limit.insert("output".to_string(), json_num(out));
-            }
-            if !limit.is_empty() {
-                model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
-            }
-
+        let source_group = model_source_group(group, groups);
+        if group_has_active_entry(source_group, entry_statuses) {
+            let model_obj = build_model_object(group, source_group, providers);
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
         }
     }
@@ -794,6 +688,78 @@ pub fn get_current_agent_mapping(config_path: &Path) -> Result<AgentMapping> {
     Ok(mapping)
 }
 
+fn model_source_group<'a>(group: &'a Group, groups: &'a [Group]) -> &'a Group {
+    group
+        .aggregation_config
+        .as_ref()
+        .filter(|config| config.enabled)
+        .and_then(|config| config.aggregator_group_id.as_deref())
+        .and_then(|group_id| groups.iter().find(|candidate| candidate.id == group_id))
+        .unwrap_or(group)
+}
+
+fn group_has_active_entry(group: &Group, entry_statuses: &HashMap<String, String>) -> bool {
+    group
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.enabled)
+        .any(|(idx, entry)| {
+            let key = format!("{}:{}", entry.provider_id, idx);
+            entry_statuses
+                .get(&key)
+                .map(|status| status == "active")
+                .unwrap_or(true)
+        })
+}
+
+fn build_model_object(
+    display_group: &Group,
+    source_group: &Group,
+    providers: &[Provider],
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut model_obj = serde_json::Map::new();
+    model_obj.insert("name".to_string(), json_str(&display_group.display_name));
+
+    let mut resolved_context: Option<u64> = None;
+    let mut resolved_max_output: Option<u64> = None;
+    let mut sorted_entries: Vec<_> = source_group
+        .entries
+        .iter()
+        .filter(|entry| entry.enabled)
+        .collect();
+    sorted_entries.sort_by_key(|entry| entry.priority);
+
+    for entry in &sorted_entries {
+        if resolved_context.is_some() && resolved_max_output.is_some() {
+            break;
+        }
+        if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id) {
+            if let Some((ctx, max_out)) = provider.resolve_model_meta(&entry.model_id) {
+                if resolved_context.is_none() {
+                    resolved_context = ctx;
+                }
+                if resolved_max_output.is_none() {
+                    resolved_max_output = max_out;
+                }
+            }
+        }
+    }
+
+    let mut limit = serde_json::Map::new();
+    if let Some(ctx) = resolved_context {
+        limit.insert("context".to_string(), json_num(ctx));
+    }
+    if let Some(out) = resolved_max_output {
+        limit.insert("output".to_string(), json_num(out));
+    }
+    if !limit.is_empty() {
+        model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
+    }
+
+    model_obj
+}
+
 /// Wraps a string slice as a JSON string value.
 fn json_str(s: &str) -> serde_json::Value {
     serde_json::Value::String(s.to_string())
@@ -860,6 +826,7 @@ mod tests {
                 consecutive_error_cooldown_ms: 600000,
                 max_response_duration_ms: 1_200_000,
             },
+            aggregation_config: None,
         }
     }
 

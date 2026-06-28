@@ -134,6 +134,34 @@ fn default_active_status() -> String {
     "active".to_string()
 }
 
+/// Optional group-level Mixture of Agents configuration.
+///
+/// When enabled, a group fans out non-streaming advisory requests to
+/// `reference_group_ids`, then routes a final aggregator request through
+/// `aggregator_group_id`. The referenced and aggregator groups still use the
+/// normal priority/failover routing path.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AggregationConfig {
+    /// Enables MoA routing for the parent group. Missing config defaults to normal failover.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Group IDs used for advisory reference calls.
+    #[serde(default, rename = "referenceGroupIds")]
+    pub reference_group_ids: Vec<String>,
+    /// Group ID used for the final aggregator call.
+    #[serde(default, rename = "aggregatorGroupId")]
+    pub aggregator_group_id: Option<String>,
+    /// Optional temperature override for reference calls.
+    #[serde(default, rename = "referenceTemperature")]
+    pub reference_temperature: Option<f64>,
+    /// Optional temperature override for the aggregator call.
+    #[serde(default, rename = "aggregatorTemperature")]
+    pub aggregator_temperature: Option<f64>,
+    /// If true, any reference failure fails the full MoA request.
+    #[serde(default, rename = "requireAllReferences")]
+    pub require_all_references: bool,
+}
+
 /// Controls when and how the proxy fails over to the next [`GroupEntry`].
 ///
 /// Each trigger has an independent flag and associated cooldown/timeout
@@ -177,7 +205,10 @@ pub struct FailoverConfig {
     /// If the response stream exceeds this duration from first byte received,
     /// the stream is terminated and failover is triggered.
     /// Defaults to 1_200_000 (20 minutes).
-    #[serde(default = "default_max_response_duration_ms", rename = "maxResponseDurationMs")]
+    #[serde(
+        default = "default_max_response_duration_ms",
+        rename = "maxResponseDurationMs"
+    )]
     pub max_response_duration_ms: u64,
 }
 
@@ -220,6 +251,99 @@ pub struct Group {
     /// Failover rules shared by all entries in this group.
     #[serde(rename = "failoverConfig")]
     pub failover_config: FailoverConfig,
+    /// Optional Mixture of Agents routing configuration.
+    #[serde(
+        default,
+        rename = "aggregationConfig",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub aggregation_config: Option<AggregationConfig>,
+}
+
+impl Group {
+    /// Returns true only when an aggregation config exists and is enabled.
+    pub fn aggregation_enabled(&self) -> bool {
+        self.aggregation_config
+            .as_ref()
+            .map(|c| c.enabled)
+            .unwrap_or(false)
+    }
+}
+
+/// Validates all enabled group-level MoA configs in a group list.
+///
+/// This is intentionally small and strict for the MVP: referenced and
+/// aggregator groups must exist and must be normal failover groups.
+pub fn validate_group_aggregation(groups: &[Group]) -> Result<(), String> {
+    for group in groups {
+        let Some(config) = group.aggregation_config.as_ref().filter(|c| c.enabled) else {
+            continue;
+        };
+
+        if config.reference_group_ids.is_empty() {
+            return Err(format!(
+                "MoA group '{}' must reference at least one group",
+                group.alias
+            ));
+        }
+
+        let aggregator_group_id = config
+            .aggregator_group_id
+            .as_deref()
+            .ok_or_else(|| format!("MoA group '{}' must have an aggregator group", group.alias))?;
+
+        if aggregator_group_id == group.id {
+            return Err(format!(
+                "MoA group '{}' cannot use itself as the aggregator",
+                group.alias
+            ));
+        }
+
+        for reference_group_id in &config.reference_group_ids {
+            if reference_group_id == &group.id {
+                return Err(format!(
+                    "MoA group '{}' cannot reference itself",
+                    group.alias
+                ));
+            }
+
+            let reference_group = groups
+                .iter()
+                .find(|g| g.id == *reference_group_id)
+                .ok_or_else(|| {
+                    format!(
+                        "MoA group '{}' references missing group id '{}'",
+                        group.alias, reference_group_id
+                    )
+                })?;
+
+            if reference_group.aggregation_enabled() {
+                return Err(format!(
+                    "MoA group '{}' cannot reference MoA-enabled group '{}'",
+                    group.alias, reference_group.alias
+                ));
+            }
+        }
+
+        let aggregator_group = groups
+            .iter()
+            .find(|g| g.id == aggregator_group_id)
+            .ok_or_else(|| {
+                format!(
+                    "MoA group '{}' uses missing aggregator group id '{}'",
+                    group.alias, aggregator_group_id
+                )
+            })?;
+
+        if aggregator_group.aggregation_enabled() {
+            return Err(format!(
+                "MoA group '{}' cannot use MoA-enabled aggregator group '{}'",
+                group.alias, aggregator_group.alias
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Top-level application configuration stored in `~/.config/coderouter/config.json`.
@@ -271,5 +395,136 @@ impl Default for AppConfig {
             opencode_config_path: None,
             onboarding_dismissed: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn failover_config() -> FailoverConfig {
+        FailoverConfig {
+            on_429: true,
+            on_quota_exhausted: true,
+            on_consecutive_errors: true,
+            consecutive_error_threshold: 5,
+            on_latency_timeout: true,
+            latency_timeout_ms: 90000,
+            latency_timeout_cooldown_ms: 60000,
+            consecutive_error_cooldown_ms: 600000,
+            max_response_duration_ms: 1_200_000,
+        }
+    }
+
+    fn group(id: &str, aggregation_config: Option<AggregationConfig>) -> Group {
+        Group {
+            id: id.to_string(),
+            alias: id.to_string(),
+            display_name: id.to_string(),
+            entries: vec![],
+            failover_config: failover_config(),
+            aggregation_config,
+        }
+    }
+
+    #[test]
+    fn test_group_deserializes_without_aggregation_config() {
+        let json = serde_json::json!({
+            "id": "plain",
+            "alias": "plain",
+            "displayName": "Plain",
+            "entries": [],
+            "failoverConfig": {
+                "on429": true,
+                "onQuotaExhausted": true,
+                "onConsecutiveErrors": true,
+                "consecutiveErrorThreshold": 5,
+                "onLatencyTimeout": true,
+                "latencyTimeoutMs": 90000,
+                "latencyTimeoutCooldownMs": 60000,
+                "consecutiveErrorCooldownMs": 600000,
+                "maxResponseDurationMs": 1200000
+            }
+        });
+
+        let group: Group = serde_json::from_value(json).unwrap();
+        assert!(group.aggregation_config.is_none());
+        assert!(!group.aggregation_enabled());
+    }
+
+    #[test]
+    fn test_aggregation_config_nested_defaults() {
+        let json = serde_json::json!({ "enabled": true });
+        let config: AggregationConfig = serde_json::from_value(json).unwrap();
+
+        assert!(config.enabled);
+        assert!(config.reference_group_ids.is_empty());
+        assert!(config.aggregator_group_id.is_none());
+        assert!(config.reference_temperature.is_none());
+        assert!(config.aggregator_temperature.is_none());
+        assert!(!config.require_all_references);
+    }
+
+    #[test]
+    fn test_validate_group_aggregation_rejects_self_reference() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["moa".to_string()],
+                aggregator_group_id: Some("ref".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![moa, group("ref", None)];
+
+        assert!(validate_group_aggregation(&groups)
+            .unwrap_err()
+            .contains("cannot reference itself"));
+    }
+
+    #[test]
+    fn test_validate_group_aggregation_rejects_missing_group() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["missing".to_string()],
+                aggregator_group_id: Some("ref".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![moa, group("ref", None)];
+
+        assert!(validate_group_aggregation(&groups)
+            .unwrap_err()
+            .contains("missing group"));
+    }
+
+    #[test]
+    fn test_validate_group_aggregation_rejects_nested_moa() {
+        let nested = group(
+            "nested",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("ref".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["nested".to_string()],
+                aggregator_group_id: Some("ref".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![moa, nested, group("ref", None)];
+
+        assert!(validate_group_aggregation(&groups)
+            .unwrap_err()
+            .contains("MoA-enabled group"));
     }
 }

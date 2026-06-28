@@ -361,6 +361,7 @@ mod tests {
                 consecutive_error_cooldown_ms: 600000,
                 max_response_duration_ms: 1_200_000,
             },
+            aggregation_config: None,
         }
     }
 
