@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "coderouter"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "chrono",
  "coderouter-proxy",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "coderouter-proxy"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "coderouter-tui"
-version = "0.1.40"
+version = "0.1.41"
 dependencies = [
  "anyhow",
  "chrono",

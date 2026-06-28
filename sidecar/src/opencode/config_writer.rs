@@ -152,18 +152,21 @@ pub fn save_opencode_config_path(path: &str) -> Result<()> {
 
 /// Injects the CodeRouter provider into the OpenCode configuration file.
 ///
-/// For each group, the highest-priority active entry is selected (respecting
-/// the `entry_statuses` map and `enabled` flag). The provider entry includes
-/// the base URL pointing at the local proxy, an API key placeholder, model
-/// metadata (name, context/output limits), and is written under the
-/// `provider.coderouter` key. Existing config keys are preserved.
+/// For each group, configured enabled entries are used to expose stable model
+/// aliases. Temporary router states like cooldown or quota exhaustion are not
+/// allowed to remove models from OpenCode; request-time routing handles those.
+/// The provider entry includes the base URL pointing at the local proxy, an API
+/// key placeholder, model metadata (name, context/output limits), and is
+/// written under the `provider.coderouter` key. Existing config keys are
+/// preserved.
 ///
 /// # Arguments
 /// * `config_path` - Path to the OpenCode JSON config file.
 /// * `groups` - The router group definitions.
 /// * `providers` - Provider configs used to look up model metadata.
 /// * `proxy_port` - The local port the CodeRouter proxy listens on.
-/// * `entry_statuses` - Map of `"provider_id:idx"` → `"active"`/`"cooldown"` strings.
+/// * `_entry_statuses` - Legacy runtime status map. OpenCode model export uses
+///   configured enabled entries only, so temporary cooldowns do not remove models.
 ///
 /// # Errors
 /// Returns an error if the config cannot be read, written, or cached.
@@ -172,7 +175,7 @@ pub fn inject_provider(
     groups: &[Group],
     providers: &[Provider],
     proxy_port: u16,
-    entry_statuses: &HashMap<String, String>,
+    _entry_statuses: &HashMap<String, String>,
 ) -> Result<()> {
     let mut config = read_config(config_path)?;
 
@@ -182,7 +185,7 @@ pub fn inject_provider(
 
     for group in groups {
         let source_group = model_source_group(group, groups);
-        if group_has_active_entry(source_group, entry_statuses) {
+        if group_has_enabled_entry(source_group) {
             let model_obj = build_model_object(group, source_group, providers);
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
         }
@@ -444,7 +447,8 @@ pub fn remove_agent_models(config_path: &Path) -> Result<()> {
 /// * `providers` - Provider configs used to look up model metadata.
 /// * `proxy_port` - The local port the CodeRouter proxy listens on.
 /// * `mapping` - Optional agent mapping to include in the preview.
-/// * `entry_statuses` - Map of `"provider_id:idx"` → `"active"`/`"cooldown"`.
+/// * `_entry_statuses` - Legacy runtime status map. OpenCode model export uses
+///   configured enabled entries only, so temporary cooldowns do not remove models.
 ///
 /// # Returns
 /// A pretty-printed JSON string of the merged configuration.
@@ -456,7 +460,7 @@ pub fn preview_opencode_config(
     providers: &[Provider],
     proxy_port: u16,
     mapping: Option<&AgentMapping>,
-    entry_statuses: &HashMap<String, String>,
+    _entry_statuses: &HashMap<String, String>,
 ) -> Result<String> {
     let mut config = read_config_or_empty()?;
 
@@ -466,7 +470,7 @@ pub fn preview_opencode_config(
 
     for group in groups {
         let source_group = model_source_group(group, groups);
-        if group_has_active_entry(source_group, entry_statuses) {
+        if group_has_enabled_entry(source_group) {
             let model_obj = build_model_object(group, source_group, providers);
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
         }
@@ -698,19 +702,8 @@ fn model_source_group<'a>(group: &'a Group, groups: &'a [Group]) -> &'a Group {
         .unwrap_or(group)
 }
 
-fn group_has_active_entry(group: &Group, entry_statuses: &HashMap<String, String>) -> bool {
-    group
-        .entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.enabled)
-        .any(|(idx, entry)| {
-            let key = format!("{}:{}", entry.provider_id, idx);
-            entry_statuses
-                .get(&key)
-                .map(|status| status == "active")
-                .unwrap_or(true)
-        })
+fn group_has_enabled_entry(group: &Group) -> bool {
+    group.entries.iter().any(|entry| entry.enabled)
 }
 
 fn build_model_object(
@@ -773,7 +766,7 @@ fn json_num(n: u64) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::models::{FailoverConfig, GroupEntry, ProviderModel};
+    use crate::config::models::{AggregationConfig, FailoverConfig, GroupEntry, ProviderModel};
     use std::fs;
 
     fn test_dir() -> PathBuf {
@@ -1539,6 +1532,54 @@ mod tests {
         let limit = glm_model.get("limit").unwrap().as_object().unwrap();
         assert_eq!(limit.get("context").unwrap().as_u64().unwrap(), 64000);
         assert_eq!(limit.get("output").unwrap().as_u64().unwrap(), 4096);
+
+        cleanup_test_dir(&test_dir);
+    }
+
+    #[test]
+    fn test_inject_provider_keeps_moa_group_when_aggregator_status_is_not_active() {
+        let test_dir = setup_test_dir();
+        let config_path = test_dir.join("opencode.json");
+
+        let mut aggregator = test_group();
+        aggregator.id = "aggregator".to_string();
+        aggregator.alias = "aggregator".to_string();
+        aggregator.display_name = "Aggregator".to_string();
+
+        let moa_group = Group {
+            id: "moa-group".to_string(),
+            alias: "moa-group".to_string(),
+            display_name: "MoA Group".to_string(),
+            entries: vec![],
+            failover_config: aggregator.failover_config.clone(),
+            aggregation_config: Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["aggregator".to_string()],
+                aggregator_group_id: Some("aggregator".to_string()),
+                ..AggregationConfig::default()
+            }),
+        };
+        let groups = vec![moa_group, aggregator];
+        let providers = vec![test_provider()];
+        let entry_statuses =
+            HashMap::from([("test-provider:0".to_string(), "cooldown".to_string())]);
+
+        inject_provider(&config_path, &groups, &providers, 4141, &entry_statuses).unwrap();
+
+        let contents = fs::read_to_string(&config_path).unwrap();
+        let config: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let models = config
+            .get("provider")
+            .unwrap()
+            .get("coderouter")
+            .unwrap()
+            .get("models")
+            .unwrap()
+            .as_object()
+            .unwrap();
+
+        assert!(models.contains_key("moa-group"));
+        assert_eq!(models["moa-group"]["name"], "MoA Group");
 
         cleanup_test_dir(&test_dir);
     }
