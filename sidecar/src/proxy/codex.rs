@@ -1027,6 +1027,37 @@ where
                 Ok(Some(output))
             }
 
+            event_type if is_reasoning_text_delta(event_type) => {
+                let delta_text = event.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+
+                let mut output = String::new();
+                if !self.has_sent_role {
+                    output.push_str(&build_openai_chunk(
+                        &self.chat_id,
+                        &self.group_alias,
+                        Some("assistant"),
+                        None,
+                        None,
+                    ));
+                    self.has_sent_role = true;
+                }
+
+                if delta_text.is_empty() {
+                    return if output.is_empty() {
+                        Ok(None)
+                    } else {
+                        Ok(Some(output))
+                    };
+                }
+
+                output.push_str(&build_openai_reasoning_chunk(
+                    &self.chat_id,
+                    &self.group_alias,
+                    delta_text,
+                ));
+                Ok(Some(output))
+            }
+
             "response.output_item.done" => {
                 let item = event.get("item");
                 if let Some(func_name) = item.and_then(|i| i.get("name")).and_then(|v| v.as_str()) {
@@ -1174,6 +1205,29 @@ fn apply_sse_event_type(data: &str, event_type: &str) -> String {
         }
         Err(_) => serde_json::json!({ "type": event_type, "data": data }).to_string(),
     }
+}
+
+fn is_reasoning_text_delta(event_type: &str) -> bool {
+    event_type.ends_with(".delta")
+        && (event_type.contains("reasoning_summary_text") || event_type.contains("reasoning_text"))
+}
+
+fn build_openai_reasoning_chunk(chat_id: &str, model: &str, reasoning_content: &str) -> String {
+    let chunk = serde_json::json!({
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"reasoning_content": reasoning_content},
+            "finish_reason": null,
+        }]
+    });
+
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&chunk).unwrap_or_default()
+    )
 }
 
 fn build_openai_chunk(
@@ -1822,6 +1876,19 @@ mod tests {
         let result = streamer.translate_event(data).unwrap().unwrap();
         assert!(result.contains("chat.completion.chunk"));
         assert!(result.contains("Hello"));
+    }
+
+    #[test]
+    fn test_codex_stream_translation_reasoning_delta() {
+        let mut streamer = make_streamer();
+        let data = r#"{"type":"response.reasoning_summary_text.delta","delta":"thinking"}"#;
+        let result = streamer.translate_event(data).unwrap().unwrap();
+
+        assert!(result.contains("chat.completion.chunk"));
+        assert!(result.contains("assistant"));
+        assert!(result.contains("reasoning_content"));
+        assert!(result.contains("thinking"));
+        assert!(!result.contains("\"content\":\"thinking\""));
     }
 
     #[test]

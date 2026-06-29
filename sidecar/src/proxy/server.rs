@@ -44,6 +44,12 @@ use crate::config::{
 const STREAM_INTER_CHUNK_TIMEOUT_MS: u64 = 120_000;
 const MAX_MOA_REFERENCE_CONCURRENCY: usize = 4;
 const MAX_MOA_REFERENCE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MOA_REFERENCE_SYSTEM_PROMPT: &str = concat!(
+    "You are an advisory reference model in a Mixture of Agents request. ",
+    "Provide concise guidance for the final aggregator. ",
+    "You do not have tools, file access, or authority to act directly; ",
+    "do not request or attempt tool calls, and do not mention missing tools."
+);
 use crate::credentials::keychain::get_credential;
 use crate::metrics::db as metrics_db;
 use crate::metrics::recorder::{MetricsRecorder, RequestEvent};
@@ -1135,11 +1141,12 @@ fn build_moa_reference_request(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "MoA requests require a messages array".to_string())?;
 
-    let sanitized_messages: Vec<Value> = messages
-        .iter()
-        .filter_map(sanitize_reference_message)
-        .collect();
-    if sanitized_messages.is_empty() {
+    let mut sanitized_messages = vec![serde_json::json!({
+        "role": "system",
+        "content": MOA_REFERENCE_SYSTEM_PROMPT,
+    })];
+    sanitized_messages.extend(messages.iter().filter_map(sanitize_reference_message));
+    if sanitized_messages.len() == 1 {
         return Err(
             "MoA reference request has no text messages after stripping tool messages".into(),
         );
@@ -1161,6 +1168,11 @@ fn build_moa_reference_request(
         "parallel_tool_calls",
         "functions",
         "function_call",
+        "reasoning",
+        "reasoning_effort",
+        "reasoning_summary",
+        "include",
+        "text",
     ] {
         obj.remove(key);
     }
@@ -1172,7 +1184,7 @@ fn build_moa_reference_request(
 
 fn sanitize_reference_message(message: &Value) -> Option<Value> {
     let role = message.get("role").and_then(|v| v.as_str())?;
-    if !matches!(role, "system" | "user" | "assistant") {
+    if !matches!(role, "user" | "assistant") {
         return None;
     }
 
@@ -2615,6 +2627,11 @@ data: {"type":"response.completed"}
             "model": "moa",
             "stream": true,
             "temperature": 0.9,
+            "reasoning": {"summary": "auto", "effort": "medium"},
+            "reasoning_effort": "medium",
+            "reasoning_summary": "auto",
+            "include": ["reasoning.encrypted_content"],
+            "text": {"verbosity": "low"},
             "tools": [{"type": "function", "function": {"name": "lookup"}}],
             "tool_choice": "auto",
             "parallel_tool_calls": true,
@@ -2635,10 +2652,20 @@ data: {"type":"response.completed"}
         assert!(request.get("tools").is_none());
         assert!(request.get("tool_choice").is_none());
         assert!(request.get("parallel_tool_calls").is_none());
+        assert!(request.get("reasoning").is_none());
+        assert!(request.get("reasoning_effort").is_none());
+        assert!(request.get("reasoning_summary").is_none());
+        assert!(request.get("include").is_none());
+        assert!(request.get("text").is_none());
 
         let messages = request["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0]["role"], "system");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("advisory reference model"));
+        assert_ne!(messages[0]["content"], "system text");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[2]["role"], "assistant");
         assert_eq!(messages[2]["content"], "answer so far");
@@ -2658,8 +2685,7 @@ data: {"type":"response.completed"}
         assert_eq!(request["model"], "reference");
         assert_eq!(request["stream"], false);
         assert_eq!(request["reasoning_effort"], "high");
-        assert_eq!(request["reasoning"]["effort"], "high");
-        assert_eq!(request["reasoning"]["summary"], "auto");
+        assert!(request.get("reasoning").is_none());
     }
 
     #[test]
