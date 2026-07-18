@@ -15,7 +15,7 @@ use serde_json::Value;
 const CODEX_AUTH_ISSUER: &str = "https://auth.openai.com";
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_DEVICE_EXPIRES_IN_SECONDS: u64 = 15 * 60;
-pub const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.135.0";
+pub const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.144.5";
 const CODEX_ORIGINATOR: &str = "opencode";
 
 // ── Codex auth types ──
@@ -1207,7 +1207,7 @@ fn apply_sse_event_type(data: &str, event_type: &str) -> String {
     }
 }
 
-fn is_reasoning_text_delta(event_type: &str) -> bool {
+pub(crate) fn is_reasoning_text_delta(event_type: &str) -> bool {
     event_type.ends_with(".delta")
         && (event_type.contains("reasoning_summary_text") || event_type.contains("reasoning_text"))
 }
@@ -1784,10 +1784,13 @@ mod tests {
             "top_p": 0.9
         });
 
-        let result = openai_to_codex_request(&openai_req, "gpt-5.5");
+        for model in ["gpt-5.5", "gpt-5.6-sol"] {
+            let result = openai_to_codex_request(&openai_req, model);
 
-        assert!(result.get("temperature").is_none());
-        assert!(result.get("top_p").is_none());
+            assert!(result.get("temperature").is_none());
+            assert!(result.get("top_p").is_none());
+            assert_eq!(result["model"], model);
+        }
     }
 
     #[test]

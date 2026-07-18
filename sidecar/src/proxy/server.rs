@@ -313,55 +313,9 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
             }
         })
         .map(|g| {
-            let metadata_group = g
-                .aggregation_config
-                .as_ref()
-                .filter(|c| c.enabled)
-                .and_then(|config| config.aggregator_group_id.as_deref())
-                .and_then(|id| groups.iter().find(|candidate| candidate.id == id))
-                .unwrap_or(g);
-            let (context_window, max_output_tokens) = {
-                let mut resolved_context: Option<u64> = None;
-                let mut resolved_max_output: Option<u64> = None;
-
-                let mut sorted_entries: Vec<_> = metadata_group
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.enabled)
-                    .collect();
-                sorted_entries.sort_by_key(|(_, e)| e.priority);
-
-                for (idx, entry) in &sorted_entries {
-                    if resolved_context.is_some() && resolved_max_output.is_some() {
-                        break;
-                    }
-                    let key =
-                        router::entry_key(&metadata_group.id, &entry.provider_id, *idx as u32);
-                    let is_active = router_state
-                        .entries
-                        .get(&key)
-                        .map(|es| es.status == router::EntryStatus::Active)
-                        .unwrap_or(true);
-
-                    if is_active {
-                        if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id)
-                        {
-                            if let Some((ctx, max_out)) =
-                                provider.resolve_model_meta(&entry.model_id)
-                            {
-                                if resolved_context.is_none() {
-                                    resolved_context = ctx;
-                                }
-                                if resolved_max_output.is_none() {
-                                    resolved_max_output = max_out;
-                                }
-                            }
-                        }
-                    }
-                }
-                (resolved_context, resolved_max_output)
-            };
+            let metadata_group = metadata_group_for_model(g, groups.as_ref());
+            let (context_window, max_output_tokens) =
+                resolve_group_model_metadata(metadata_group, &providers, &router_state);
 
             ModelObject {
                 id: g.alias.clone(),
@@ -380,45 +334,99 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
     })
 }
 
+fn metadata_group_for_model<'a>(group: &'a Group, groups: &'a [Group]) -> &'a Group {
+    group
+        .aggregation_config
+        .as_ref()
+        .filter(|c| c.enabled)
+        .and_then(|config| config.aggregator_group_id.as_deref())
+        .and_then(|id| groups.iter().find(|candidate| candidate.id == id))
+        .unwrap_or(group)
+}
+
+fn resolve_group_model_metadata(
+    group: &Group,
+    providers: &[Provider],
+    router_state: &router::RouterState,
+) -> (Option<u64>, Option<u64>) {
+    let mut resolved_context: Option<u64> = None;
+    let mut resolved_max_output: Option<u64> = None;
+
+    let mut sorted_entries: Vec<_> = group.entries.iter().enumerate().collect();
+    sorted_entries.sort_by_key(|(_, entry)| entry.priority);
+
+    for (idx, entry) in sorted_entries {
+        if resolved_context.is_some() && resolved_max_output.is_some() {
+            break;
+        }
+        if !entry_is_available(group, entry, idx as u32, providers, router_state) {
+            continue;
+        }
+        if let Some(provider) = providers.iter().find(|p| p.id == entry.provider_id) {
+            if let Some((ctx, max_out)) = provider.resolve_model_meta(&entry.model_id) {
+                if resolved_context.is_none() {
+                    resolved_context = ctx;
+                }
+                if resolved_max_output.is_none() {
+                    resolved_max_output = max_out;
+                }
+            }
+        }
+    }
+
+    (resolved_context, resolved_max_output)
+}
+
 fn group_has_available_entry(
     group: &Group,
     providers: &[Provider],
     router_state: &router::RouterState,
 ) -> bool {
-    group.entries.iter().enumerate().any(|(idx, entry)| {
-        if !entry.enabled {
+    group
+        .entries
+        .iter()
+        .enumerate()
+        .any(|(idx, entry)| entry_is_available(group, entry, idx as u32, providers, router_state))
+}
+
+fn entry_is_available(
+    group: &Group,
+    entry: &crate::config::models::GroupEntry,
+    idx: u32,
+    providers: &[Provider],
+    router_state: &router::RouterState,
+) -> bool {
+    if !entry.enabled {
+        return false;
+    }
+    let key = router::entry_key(&group.id, &entry.provider_id, idx);
+    if let Some(entry_state) = router_state.entries.get(&key) {
+        if entry_state.status != router::EntryStatus::Active {
             return false;
         }
-        let key = router::entry_key(&group.id, &entry.provider_id, idx as u32);
-        if let Some(entry_state) = router_state.entries.get(&key) {
-            if entry_state.status != router::EntryStatus::Active {
-                return false;
-            }
-            let effective_quota = entry.daily_token_quota_override.or_else(|| {
-                providers
-                    .iter()
-                    .find(|p| p.id == entry.provider_id)
-                    .and_then(|p| p.daily_token_quota)
-            });
-            if let Some(quota) = effective_quota {
-                if entry_state.daily_tokens_used >= quota {
-                    return false;
-                }
-            }
-            let effective_request_quota = providers
+        let effective_quota = entry.daily_token_quota_override.or_else(|| {
+            providers
                 .iter()
                 .find(|p| p.id == entry.provider_id)
-                .and_then(|p| p.daily_request_quota);
-            if let Some(quota) = effective_request_quota {
-                if entry_state.daily_requests_used >= quota {
-                    return false;
-                }
+                .and_then(|p| p.daily_token_quota)
+        });
+        if let Some(quota) = effective_quota {
+            if entry_state.daily_tokens_used >= quota {
+                return false;
             }
-            true
-        } else {
-            true
         }
-    })
+        let effective_request_quota = providers
+            .iter()
+            .find(|p| p.id == entry.provider_id)
+            .and_then(|p| p.daily_request_quota);
+        if let Some(quota) = effective_request_quota {
+            if entry_state.daily_requests_used >= quota {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// `POST /v1/chat/completions` — OpenAI-compatible chat completion endpoint.
@@ -1173,6 +1181,8 @@ fn build_moa_reference_request(
         "reasoning_summary",
         "include",
         "text",
+        "response_format",
+        "stream_options",
     ] {
         obj.remove(key);
     }
@@ -1694,6 +1704,7 @@ where
 {
     use futures::StreamExt;
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     let mut tool_calls = Vec::new();
     let mut finish_reason = "stop".to_string();
     let mut buffer = String::new();
@@ -1702,6 +1713,7 @@ where
     fn handle_codex_aggregate_event(
         data: &str,
         content: &mut String,
+        reasoning_content: &mut String,
         tool_calls: &mut Vec<Value>,
         finish_reason: &mut String,
         token_counts: &Arc<std::sync::Mutex<translator::StreamTokenCounts>>,
@@ -1714,7 +1726,8 @@ where
             return Ok(());
         };
 
-        match event.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+        let event_type = event.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match event_type {
             "response.failed" | "error" => {
                 return Err(RequestError::ServerError(
                     "codex upstream response failed".to_string(),
@@ -1760,7 +1773,11 @@ where
         }
 
         if let Some(delta) = event.get("delta").and_then(|v| v.as_str()) {
-            content.push_str(delta);
+            if crate::proxy::codex::is_reasoning_text_delta(event_type) {
+                reasoning_content.push_str(delta);
+            } else {
+                content.push_str(delta);
+            }
         }
 
         // Usage is nested under `event.response.usage` in Codex
@@ -1795,6 +1812,7 @@ where
                         handle_codex_aggregate_event(
                             data,
                             &mut content,
+                            &mut reasoning_content,
                             &mut tool_calls,
                             &mut finish_reason,
                             &token_counts,
@@ -1817,6 +1835,7 @@ where
             handle_codex_aggregate_event(
                 data,
                 &mut content,
+                &mut reasoning_content,
                 &mut tool_calls,
                 &mut finish_reason,
                 &token_counts,
@@ -1835,41 +1854,38 @@ where
         .unwrap_or_default()
         .as_secs();
 
-    let chat_response = if tool_calls.is_empty() {
-        serde_json::json!({
-            "id": id,
-            "object": "chat.completion",
-            "created": created,
-            "model": group_alias,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content},
-                "finish_reason": finish_reason
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": prompt_tokens + output_tokens
-            }
-        })
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), Value::String("assistant".to_string()));
+    message.insert("content".to_string(), Value::String(content));
+    if !reasoning_content.trim().is_empty() {
+        message.insert(
+            "reasoning_content".to_string(),
+            Value::String(reasoning_content),
+        );
+    }
+    let response_finish_reason = if tool_calls.is_empty() {
+        finish_reason
     } else {
-        serde_json::json!({
-            "id": id,
-            "object": "chat.completion",
-            "created": created,
-            "model": group_alias,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": content, "tool_calls": tool_calls},
-                "finish_reason": "tool_calls"
-            }],
-            "usage": {
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": output_tokens,
-                "total_tokens": prompt_tokens + output_tokens
-            }
-        })
+        message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        "tool_calls".to_string()
     };
+
+    let chat_response = serde_json::json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": group_alias,
+        "choices": [{
+            "index": 0,
+            "message": Value::Object(message),
+            "finish_reason": response_finish_reason
+        }],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": output_tokens,
+            "total_tokens": prompt_tokens + output_tokens
+        }
+    });
 
     Ok(StreamProcessResult::NonStreaming(
         Json(chat_response).into_response(),
@@ -2343,7 +2359,7 @@ async fn handle_internal_config_reload(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::models::ProviderModel;
+    use crate::config::models::{AggregationConfig, FailoverConfig, GroupEntry, ProviderModel};
     use bytes::Bytes;
     use futures::stream::StreamExt;
     use std::sync::{Arc, Mutex};
@@ -2366,6 +2382,108 @@ mod tests {
             .await
             .unwrap();
         serde_json::from_slice(&body).unwrap()
+    }
+
+    fn test_failover_config() -> FailoverConfig {
+        FailoverConfig {
+            on_429: true,
+            on_quota_exhausted: true,
+            on_consecutive_errors: true,
+            consecutive_error_threshold: 5,
+            on_latency_timeout: true,
+            latency_timeout_ms: 90_000,
+            latency_timeout_cooldown_ms: 60_000,
+            consecutive_error_cooldown_ms: 600_000,
+            max_response_duration_ms: 1_200_000,
+        }
+    }
+
+    fn test_group_with_entry(
+        id: &str,
+        alias: &str,
+        provider_id: &str,
+        model_id: &str,
+        priority: u32,
+    ) -> Group {
+        Group {
+            id: id.to_string(),
+            alias: alias.to_string(),
+            display_name: alias.to_string(),
+            entries: vec![GroupEntry {
+                provider_id: provider_id.to_string(),
+                model_id: model_id.to_string(),
+                priority,
+                daily_token_quota_override: None,
+                enabled: true,
+                status: "active".to_string(),
+                cooldown_until: None,
+            }],
+            failover_config: test_failover_config(),
+            aggregation_config: None,
+        }
+    }
+
+    fn test_provider_with_model(
+        provider_id: &str,
+        model_id: &str,
+        context_window: u64,
+        max_output_tokens: u64,
+    ) -> Provider {
+        Provider {
+            id: provider_id.to_string(),
+            name: provider_id.to_string(),
+            protocol: "openai".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            credential_key: provider_id.to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![ProviderModel {
+                id: model_id.to_string(),
+                context_window: Some(context_window),
+                max_output_tokens: Some(max_output_tokens),
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }],
+            model_overrides: None,
+        }
+    }
+
+    #[test]
+    fn test_moa_model_metadata_uses_aggregator_limits() {
+        let reference = test_group_with_entry("ref", "ref", "ref-provider", "ref-model", 1);
+        let aggregator =
+            test_group_with_entry("aggregator", "aggregator", "agg-provider", "agg-model", 1);
+        let moa = Group {
+            id: "moa".to_string(),
+            alias: "gable".to_string(),
+            display_name: "Gable".to_string(),
+            entries: vec![],
+            failover_config: test_failover_config(),
+            aggregation_config: Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("aggregator".to_string()),
+                ..AggregationConfig::default()
+            }),
+        };
+        let groups = vec![moa, reference, aggregator];
+        let providers = vec![
+            test_provider_with_model("ref-provider", "ref-model", 16_000, 4_000),
+            test_provider_with_model("agg-provider", "agg-model", 272_000, 128_000),
+        ];
+        let router_state = router::init_router_state(&groups, &providers);
+        let guard = router_state.lock().unwrap();
+
+        let metadata_group = metadata_group_for_model(&groups[0], &groups);
+        let (context, output) = resolve_group_model_metadata(metadata_group, &providers, &guard);
+
+        assert_eq!(metadata_group.id, "aggregator");
+        assert_eq!(context, Some(272_000));
+        assert_eq!(output, Some(128_000));
     }
 
     #[tokio::test]
@@ -2621,6 +2739,26 @@ data: {"type":"response.completed"}
         assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
     }
 
+    #[tokio::test]
+    async fn test_aggregate_codex_stream_collects_reasoning_content() {
+        let json = codex_aggregate_json(vec![Ok(Bytes::from(
+            r#"data: {"type":"response.reasoning_summary_text.delta","delta":"thinking "}
+
+data: {"type":"response.reasoning_summary_text.delta","delta":"summary"}
+
+data: {"type":"response.output_text.delta","delta":"final"}
+
+data: {"type":"response.completed"}
+
+"#,
+        ))])
+        .await;
+
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["content"], "final");
+        assert_eq!(message["reasoning_content"], "thinking summary");
+    }
+
     #[test]
     fn test_moa_reference_request_strips_tools_and_forces_non_streaming() {
         let body = serde_json::json!({
@@ -2632,6 +2770,8 @@ data: {"type":"response.completed"}
             "reasoning_summary": "auto",
             "include": ["reasoning.encrypted_content"],
             "text": {"verbosity": "low"},
+            "response_format": {"type": "json_object"},
+            "stream_options": {"include_usage": true},
             "tools": [{"type": "function", "function": {"name": "lookup"}}],
             "tool_choice": "auto",
             "parallel_tool_calls": true,
@@ -2657,6 +2797,8 @@ data: {"type":"response.completed"}
         assert!(request.get("reasoning_summary").is_none());
         assert!(request.get("include").is_none());
         assert!(request.get("text").is_none());
+        assert!(request.get("response_format").is_none());
+        assert!(request.get("stream_options").is_none());
 
         let messages = request["messages"].as_array().unwrap();
         assert_eq!(messages.len(), 3);

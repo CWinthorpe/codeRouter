@@ -1580,6 +1580,13 @@ mod tests {
 
         assert!(models.contains_key("moa-group"));
         assert_eq!(models["moa-group"]["name"], "MoA Group");
+        let limit = models["moa-group"]
+            .get("limit")
+            .unwrap()
+            .as_object()
+            .unwrap();
+        assert_eq!(limit.get("context").unwrap().as_u64().unwrap(), 128000);
+        assert_eq!(limit.get("output").unwrap().as_u64().unwrap(), 8192);
 
         cleanup_test_dir(&test_dir);
     }

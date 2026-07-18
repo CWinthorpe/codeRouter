@@ -281,24 +281,28 @@ fn positive_i64_to_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|v| u64::try_from(v).ok()).filter(|v| *v > 0)
 }
 
+fn codex_model_is_user_facing(entry: &CodexModelEntry, has_listed_models: bool) -> bool {
+    entry.slug != "codex-auto-review"
+        && (!has_listed_models
+            || entry.visibility.as_deref() == Some("list")
+            || entry.slug.starts_with("gpt-"))
+}
+
 fn parse_codex_models_response(text: &str, now: &str) -> Result<Vec<ProviderModel>> {
     let mut entries: Vec<CodexModelEntry> =
         serde_json::from_str::<CodexModelsResponse>(text)?.models;
     entries.sort_by_key(|entry| entry.priority.unwrap_or(i64::MAX));
-
-    let listed_count = entries
+    let has_listed_models = entries
         .iter()
-        .filter(|entry| entry.visibility.as_deref() == Some("list"))
-        .count();
-    let prefer_listed = listed_count > 0;
+        .any(|entry| entry.visibility.as_deref() == Some("list"));
 
     let models = entries
         .into_iter()
-        .filter(|entry| !prefer_listed || entry.visibility.as_deref() == Some("list"))
+        .filter(|entry| codex_model_is_user_facing(entry, has_listed_models))
         .map(|entry| ProviderModel {
             id: entry.slug,
-            context_window: positive_i64_to_u64(entry.max_context_window)
-                .or_else(|| positive_i64_to_u64(entry.context_window)),
+            context_window: positive_i64_to_u64(entry.context_window)
+                .or_else(|| positive_i64_to_u64(entry.max_context_window)),
             max_output_tokens: positive_i64_to_u64(entry.max_output_tokens)
                 .or_else(|| positive_i64_to_u64(entry.max_completion_tokens))
                 .or(Some(DEFAULT_CODEX_MAX_OUTPUT_TOKENS)),
@@ -674,9 +678,9 @@ fn get_codex_models(provider: &Provider) -> Vec<ProviderModel> {
 
 /// Known Codex model catalogue.
 fn codex_hardcoded_models(now: &str) -> Vec<ProviderModel> {
-    let codex_model = |id: &str| ProviderModel {
+    let codex_model = |id: &str, context_window: u64| ProviderModel {
         id: id.to_string(),
-        context_window: Some(400_000),
+        context_window: Some(context_window),
         max_output_tokens: Some(DEFAULT_CODEX_MAX_OUTPUT_TOKENS),
         input_cost_per_1m: Some(0.0),
         output_cost_per_1m: Some(0.0),
@@ -685,17 +689,20 @@ fn codex_hardcoded_models(now: &str) -> Vec<ProviderModel> {
     };
 
     vec![
-        codex_model("gpt-5.5"),
-        codex_model("gpt-5.4"),
-        codex_model("gpt-5.4-mini"),
-        codex_model("gpt-5.3-codex"),
-        codex_model("gpt-5.3-codex-spark"),
-        codex_model("gpt-5.2"),
-        codex_model("gpt-5.2-codex"),
-        codex_model("gpt-5.1-codex"),
-        codex_model("gpt-5.1-codex-mini"),
-        codex_model("gpt-5.1-codex-max"),
-        codex_model("gpt-5-codex"),
+        codex_model("gpt-5.6-sol", 272_000),
+        codex_model("gpt-5.6-terra", 272_000),
+        codex_model("gpt-5.6-luna", 272_000),
+        codex_model("gpt-5.5", 272_000),
+        codex_model("gpt-5.4", 272_000),
+        codex_model("gpt-5.4-mini", 272_000),
+        codex_model("gpt-5.3-codex", 400_000),
+        codex_model("gpt-5.3-codex-spark", 128_000),
+        codex_model("gpt-5.2", 400_000),
+        codex_model("gpt-5.2-codex", 400_000),
+        codex_model("gpt-5.1-codex", 400_000),
+        codex_model("gpt-5.1-codex-mini", 400_000),
+        codex_model("gpt-5.1-codex-max", 400_000),
+        codex_model("gpt-5-codex", 400_000),
     ]
 }
 
@@ -972,43 +979,55 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_codex_models_prefers_list_visibility_and_priority() {
+    fn test_parse_codex_models_keeps_user_facing_models_by_priority() {
         let json = r#"{
             "models": [
                 {
-                    "slug": "hidden-model",
-                    "visibility": "hidden",
+                    "slug": "codex-auto-review",
+                    "visibility": "hide",
                     "priority": 0,
-                    "max_context_window": 800000
+                    "context_window": 272000
                 },
                 {
-                    "slug": "gpt-5.5",
+                    "slug": "gpt-5.6-sol",
                     "visibility": "list",
-                    "priority": 2,
-                    "context_window": 400000,
-                    "max_completion_tokens": 64000
+                    "priority": 1,
+                    "context_window": 272000,
+                    "max_context_window": 272000
                 },
                 {
                     "slug": "gpt-5.4",
+                    "visibility": "hide",
+                    "priority": 2,
+                    "context_window": 272000,
+                    "max_context_window": 1000000
+                },
+                {
+                    "slug": "gpt-5.3-codex-spark",
                     "visibility": "list",
-                    "priority": 1,
-                    "max_context_window": 500000,
-                    "context_window": 400000,
-                    "max_output_tokens": 128000
+                    "priority": 3,
+                    "context_window": 128000
+                },
+                {
+                    "slug": "hidden-model",
+                    "visibility": "hide",
+                    "priority": 4,
+                    "context_window": 800000
                 }
             ]
         }"#;
 
         let models = parse_codex_models_response(json, "2026-01-01T00:00:00Z").unwrap();
 
-        assert_eq!(models.len(), 2);
-        assert_eq!(models[0].id, "gpt-5.4");
-        assert_eq!(models[0].context_window, Some(500000));
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models[0].context_window, Some(272000));
         assert_eq!(models[0].max_output_tokens, Some(128000));
         assert_eq!(models[0].input_cost_per_1m, Some(0.0));
         assert_eq!(models[0].output_cost_per_1m, Some(0.0));
-        assert_eq!(models[1].id, "gpt-5.5");
-        assert_eq!(models[1].max_output_tokens, Some(64000));
+        assert_eq!(models[1].id, "gpt-5.4");
+        assert_eq!(models[1].context_window, Some(272000));
+        assert_eq!(models[2].id, "gpt-5.3-codex-spark");
         assert!(models.iter().all(|m| m.last_refreshed.is_some()));
     }
 
@@ -1051,10 +1070,12 @@ mod tests {
     }
 
     #[test]
-    fn test_codex_fallback_models_include_gpt_5_5_with_zero_cost() {
+    fn test_codex_fallback_models_include_gpt_5_6_sol_with_zero_cost() {
         let models = codex_hardcoded_models("2026-01-01T00:00:00Z");
-        let model = models.iter().find(|m| m.id == "gpt-5.5").unwrap();
+        let model = models.iter().find(|m| m.id == "gpt-5.6-sol").unwrap();
 
+        assert_eq!(models.first().unwrap().id, "gpt-5.6-sol");
+        assert_eq!(model.context_window, Some(272_000));
         assert_eq!(model.input_cost_per_1m, Some(0.0));
         assert_eq!(model.output_cost_per_1m, Some(0.0));
         assert_eq!(
