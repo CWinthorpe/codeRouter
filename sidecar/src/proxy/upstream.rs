@@ -185,7 +185,7 @@ fn requires_default_sampling(model: &str, url: &str) -> bool {
     let model = model.to_ascii_lowercase();
     let url = url.to_ascii_lowercase();
     url.contains("opencode.ai/zen/go")
-        && (model.contains("kimi-k2.7") || model.contains("kimi-k2-7"))
+        && (model.contains("kimi-k2.7") || model.contains("kimi-k2-7") || model.contains("kimi-k3"))
 }
 
 /// Sends a request with an optional wall-clock latency timeout.
@@ -239,23 +239,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_openai_body_drops_sampling_for_kimi_k2_7() {
+    fn test_openai_body_drops_sampling_for_opencode_kimi_models() {
         let body = serde_json::json!({
-            "model": "kimi-k2-7",
+            "model": "alias",
             "messages": [{"role": "user", "content": "hello"}],
             "temperature": 0.3,
             "top_p": 0.9
         });
 
-        let result = build_openai_compatible_body(
-            &body,
-            "kimi-k2.7-code",
-            "https://opencode.ai/zen/go/v1/chat/completions",
-        );
+        for model in ["kimi-k2.7-code", "kimi-k3"] {
+            let result = build_openai_compatible_body(
+                &body,
+                model,
+                "https://opencode.ai/zen/go/v1/chat/completions",
+            );
 
-        assert_eq!(result["model"], "kimi-k2.7-code");
-        assert!(result.get("temperature").is_none());
-        assert!(result.get("top_p").is_none());
+            assert_eq!(result["model"], model);
+            assert!(result.get("temperature").is_none());
+            assert!(result.get("top_p").is_none());
+        }
     }
 
     #[test]
