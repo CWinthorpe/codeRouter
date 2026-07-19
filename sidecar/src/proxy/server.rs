@@ -618,6 +618,12 @@ async fn route_failover_request(
         .get("stream")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let include_usage = stream
+        && body
+            .get("stream_options")
+            .and_then(|options| options.get("include_usage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
     let providers = {
         let guard = state
@@ -756,6 +762,7 @@ async fn route_failover_request(
                     response_alias,
                     is_anthropic,
                     is_codex,
+                    include_usage,
                     timeout_ms,
                     group.failover_config.max_response_duration_ms,
                 )
@@ -1931,6 +1938,7 @@ async fn process_response(
     group_alias: &str,
     is_anthropic: bool,
     is_codex: bool,
+    include_usage: bool,
     _latency_timeout_ms: u64,
     max_response_duration_ms: u64,
 ) -> Result<StreamProcessResult, RequestError> {
@@ -1975,6 +1983,7 @@ async fn process_response(
                 raw_stream,
                 group_alias.to_string(),
                 token_counts,
+                include_usage,
             );
             let stream: Box<
                 dyn Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,

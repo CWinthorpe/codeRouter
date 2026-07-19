@@ -939,6 +939,7 @@ pub struct CodexToOpenAIStream<S> {
     buffer: Vec<u8>,
     state: CodexStreamState,
     token_counts: Arc<Mutex<StreamTokenCounts>>,
+    include_usage: bool,
     has_sent_role: bool,
     pending_event_type: Option<String>,
 }
@@ -953,7 +954,12 @@ impl<S> CodexToOpenAIStream<S>
 where
     S: Stream<Item = Result<Bytes, std::io::Error>>,
 {
-    pub fn new(inner: S, group_alias: String, token_counts: Arc<Mutex<StreamTokenCounts>>) -> Self {
+    pub fn new(
+        inner: S,
+        group_alias: String,
+        token_counts: Arc<Mutex<StreamTokenCounts>>,
+        include_usage: bool,
+    ) -> Self {
         Self {
             inner,
             group_alias,
@@ -961,6 +967,7 @@ where
             buffer: Vec::new(),
             state: CodexStreamState::Waiting,
             token_counts,
+            include_usage,
             has_sent_role: false,
             pending_event_type: None,
         }
@@ -1114,10 +1121,7 @@ where
 
             "response.completed" | "response.incomplete" => {
                 // Usage is nested under `event.response.usage` in Codex Responses
-                let usage = event
-                    .get("response")
-                    .and_then(|r| r.get("usage"))
-                    .or_else(|| event.get("usage"));
+                let usage = codex_response_usage(&event);
                 if let Some(usage) = usage {
                     let mut counts = self.token_counts.lock().unwrap();
                     if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
@@ -1136,6 +1140,15 @@ where
                     None,
                     Some(finish_reason),
                 );
+                if self.include_usage {
+                    if let Some(usage) = usage {
+                        output.push_str(&build_openai_usage_chunk(
+                            &self.chat_id,
+                            &self.group_alias,
+                            usage,
+                        ));
+                    }
+                }
                 output.push_str("data: [DONE]\n\n");
                 self.state = CodexStreamState::Done;
                 Ok(Some(output))
@@ -1165,6 +1178,32 @@ fn codex_finish_reason(event: &Value) -> &'static str {
         Some("content_filter") => "content_filter",
         _ => "stop",
     }
+}
+
+fn codex_response_usage(event: &Value) -> Option<&Value> {
+    let nested = event
+        .get("response")
+        .and_then(|response| response.get("usage"));
+    let top_level = event.get("usage");
+    let has_complete_counts = |usage: &&Value| {
+        usage.get("input_tokens").and_then(Value::as_u64).is_some()
+            && usage.get("output_tokens").and_then(Value::as_u64).is_some()
+    };
+    let has_any_count = |usage: &&Value| {
+        ["input_tokens", "output_tokens", "total_tokens"]
+            .into_iter()
+            .any(|field| usage.get(field).and_then(Value::as_u64).is_some())
+    };
+    [nested, top_level]
+        .into_iter()
+        .flatten()
+        .find(has_complete_counts)
+        .or_else(|| {
+            [nested, top_level]
+                .into_iter()
+                .flatten()
+                .find(has_any_count)
+        })
 }
 
 fn codex_error_message(event: &Value, fallback: &str) -> String {
@@ -1224,6 +1263,57 @@ fn build_openai_reasoning_chunk(chat_id: &str, model: &str, reasoning_content: &
         }]
     });
 
+    format!(
+        "data: {}\n\n",
+        serde_json::to_string(&chunk).unwrap_or_default()
+    )
+}
+
+fn build_openai_usage_chunk(chat_id: &str, model: &str, usage: &Value) -> String {
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    let mut mapped_usage = serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    });
+
+    if let Some(cached_tokens) = usage
+        .get("input_tokens_details")
+        .and_then(|details| details.get("cached_tokens"))
+        .and_then(Value::as_u64)
+    {
+        mapped_usage["prompt_tokens_details"] = serde_json::json!({
+            "cached_tokens": cached_tokens,
+        });
+    }
+    if let Some(reasoning_tokens) = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+    {
+        mapped_usage["completion_tokens_details"] = serde_json::json!({
+            "reasoning_tokens": reasoning_tokens,
+        });
+    }
+
+    let chunk = serde_json::json!({
+        "id": chat_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+        "choices": [],
+        "usage": mapped_usage,
+    });
     format!(
         "data: {}\n\n",
         serde_json::to_string(&chunk).unwrap_or_default()
@@ -1405,11 +1495,13 @@ pub fn translate_codex_stream<S>(
     stream: S,
     group_alias: String,
     token_counts: Arc<Mutex<StreamTokenCounts>>,
+    include_usage: bool,
 ) -> (axum::body::Body, Arc<Mutex<StreamTokenCounts>>)
 where
     S: Stream<Item = Result<Bytes, std::io::Error>> + Send + Unpin + 'static,
 {
-    let translated = CodexToOpenAIStream::new(stream, group_alias, token_counts.clone());
+    let translated =
+        CodexToOpenAIStream::new(stream, group_alias, token_counts.clone(), include_usage);
     let raw_stream = futures::stream::unfold(translated, |mut stream| async move {
         match futures::StreamExt::next(&mut stream).await {
             Some(Ok(bytes)) => Some((Ok::<_, std::io::Error>(bytes), stream)),
@@ -1856,8 +1948,12 @@ mod tests {
             input_tokens: 0,
             output_tokens: 0,
         }));
-        let mut streamer =
-            CodexToOpenAIStream::new(futures::stream::empty(), "test-group".to_string(), counts);
+        let mut streamer = CodexToOpenAIStream::new(
+            futures::stream::empty(),
+            "test-group".to_string(),
+            counts,
+            true,
+        );
         streamer.chat_id = "chatcmpl-test".to_string();
         streamer
     }
@@ -1906,10 +2002,17 @@ mod tests {
     fn test_codex_stream_translation_completed_nested_usage() {
         // Usage under `event.response.usage` — the real Codex shape
         let mut streamer = make_streamer();
-        let data = r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let data = r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":2}}}}"#;
         let result = streamer.translate_event(data).unwrap().unwrap();
         assert!(result.contains("[DONE]"));
         assert!(result.contains("\"finish_reason\":\"stop\""));
+        assert!(result.contains("\"choices\":[]"));
+        assert!(result.contains("\"prompt_tokens\":10"));
+        assert!(result.contains("\"completion_tokens\":5"));
+        assert!(result.contains("\"total_tokens\":15"));
+        assert!(result.contains("\"cached_tokens\":4"));
+        assert!(result.contains("\"reasoning_tokens\":2"));
+        assert!(result.find("\"choices\":[]").unwrap() < result.find("[DONE]").unwrap());
         let counts = streamer.token_counts.lock().unwrap();
         assert_eq!(counts.input_tokens, 10);
         assert_eq!(counts.output_tokens, 5);
@@ -1919,12 +2022,40 @@ mod tests {
     fn test_codex_stream_translation_completed_top_level_usage() {
         // Backward compat: usage at top-level `event.usage`
         let mut streamer = make_streamer();
-        let data = r#"{"type":"response.completed","usage":{"input_tokens":7,"output_tokens":3}}"#;
+        let data = r#"{"type":"response.completed","response":{"usage":{"total_tokens":999}},"usage":{"input_tokens":7,"output_tokens":3}}"#;
         let result = streamer.translate_event(data).unwrap().unwrap();
         assert!(result.contains("[DONE]"));
+        assert!(result.contains("\"prompt_tokens\":7"));
+        assert!(result.contains("\"completion_tokens\":3"));
+        assert!(result.contains("\"total_tokens\":10"));
         let counts = streamer.token_counts.lock().unwrap();
         assert_eq!(counts.input_tokens, 7);
         assert_eq!(counts.output_tokens, 3);
+    }
+
+    #[test]
+    fn test_codex_stream_omits_unrequested_usage() {
+        let counts = Arc::new(Mutex::new(StreamTokenCounts {
+            input_tokens: 0,
+            output_tokens: 0,
+        }));
+        let mut streamer = CodexToOpenAIStream::new(
+            futures::stream::empty(),
+            "test-group".to_string(),
+            counts,
+            false,
+        );
+        streamer.chat_id = "chatcmpl-test".to_string();
+        let data = r#"{"type":"response.completed","response":{"usage":{"input_tokens":10,"output_tokens":5}}}"#;
+
+        let result = streamer.translate_event(data).unwrap().unwrap();
+
+        assert!(!result.contains("\"choices\":[]"));
+        assert!(!result.contains("\"usage\":"));
+        assert!(result.contains("[DONE]"));
+        let counts = streamer.token_counts.lock().unwrap();
+        assert_eq!(counts.input_tokens, 10);
+        assert_eq!(counts.output_tokens, 5);
     }
 
     #[test]
