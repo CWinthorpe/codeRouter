@@ -18,7 +18,7 @@ use std::os::unix::fs::PermissionsExt;
 /// Result type alias for config operations, boxing errors for IO and JSON failures.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-use crate::config::models::{Group, Provider};
+use crate::config::models::{effective_moa_input_tokens, Group, Provider};
 
 /// Maps OpenCode agent roles to CodeRouter group aliases.
 ///
@@ -186,7 +186,7 @@ pub fn inject_provider(
     for group in groups {
         let source_group = model_source_group(group, groups);
         if group_has_enabled_entry(source_group) {
-            let model_obj = build_model_object(group, source_group, providers);
+            let model_obj = build_model_object(group, source_group, groups, providers);
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
         }
     }
@@ -471,7 +471,7 @@ pub fn preview_opencode_config(
     for group in groups {
         let source_group = model_source_group(group, groups);
         if group_has_enabled_entry(source_group) {
-            let model_obj = build_model_object(group, source_group, providers);
+            let model_obj = build_model_object(group, source_group, groups, providers);
             models.insert(group.alias.clone(), serde_json::Value::Object(model_obj));
         }
     }
@@ -709,12 +709,14 @@ fn group_has_enabled_entry(group: &Group) -> bool {
 fn build_model_object(
     display_group: &Group,
     source_group: &Group,
+    groups: &[Group],
     providers: &[Provider],
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut model_obj = serde_json::Map::new();
     model_obj.insert("name".to_string(), json_str(&display_group.display_name));
 
     let mut resolved_context: Option<u64> = None;
+    let mut resolved_input: Option<u64> = None;
     let mut resolved_max_output: Option<u64> = None;
     let mut sorted_entries: Vec<_> = source_group
         .entries
@@ -739,12 +741,20 @@ fn build_model_object(
         }
     }
 
-    let mut limit = serde_json::Map::new();
-    if let Some(ctx) = resolved_context {
-        limit.insert("context".to_string(), json_num(ctx));
+    if display_group.aggregation_enabled() {
+        resolved_input = effective_moa_input_tokens(display_group, groups, providers);
+        resolved_context = resolved_input
+            .zip(resolved_max_output)
+            .and_then(|(input, output)| input.checked_add(output));
     }
-    if let Some(out) = resolved_max_output {
+
+    let mut limit = serde_json::Map::new();
+    if let (Some(ctx), Some(out)) = (resolved_context, resolved_max_output) {
+        limit.insert("context".to_string(), json_num(ctx));
         limit.insert("output".to_string(), json_num(out));
+        if let Some(input) = resolved_input {
+            limit.insert("input".to_string(), json_num(input));
+        }
     }
     if !limit.is_empty() {
         model_obj.insert("limit".to_string(), serde_json::Value::Object(limit));
@@ -1585,7 +1595,8 @@ mod tests {
             .unwrap()
             .as_object()
             .unwrap();
-        assert_eq!(limit.get("context").unwrap().as_u64().unwrap(), 128000);
+        assert_eq!(limit.get("context").unwrap().as_u64().unwrap(), 127188);
+        assert_eq!(limit.get("input").unwrap().as_u64().unwrap(), 118996);
         assert_eq!(limit.get("output").unwrap().as_u64().unwrap(), 8192);
 
         cleanup_test_dir(&test_dir);

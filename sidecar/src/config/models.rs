@@ -18,7 +18,7 @@ const ALLOWED_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "x
 pub struct ProviderModel {
     /// The model identifier as recognised by the upstream provider (e.g. `gpt-4o`).
     pub id: String,
-    /// Maximum number of tokens the model can accept in a single request context.
+    /// Maximum combined input and generated-output tokens in one request context.
     #[serde(default)]
     pub context_window: Option<u64>,
     /// Maximum number of tokens the model can generate in a single response.
@@ -97,6 +97,21 @@ impl Provider {
             (None, None) => None,
         }
     }
+
+    /// Resolves the wire protocol for a model, with local overrides taking precedence.
+    pub fn resolve_model_protocol<'a>(&'a self, model_id: &str) -> &'a str {
+        self.model_overrides
+            .as_ref()
+            .and_then(|overrides| overrides.iter().find(|model| model.id == model_id))
+            .and_then(|model| model.protocol.as_deref())
+            .or_else(|| {
+                self.models
+                    .iter()
+                    .find(|model| model.id == model_id)
+                    .and_then(|model| model.protocol.as_deref())
+            })
+            .unwrap_or(&self.protocol)
+    }
 }
 
 fn default_quota_reset_hour() -> u32 {
@@ -137,13 +152,32 @@ fn default_active_status() -> String {
     "active".to_string()
 }
 
+/// Controls how often MoA reference advisors are refreshed during an agentic turn.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MoaFanoutMode {
+    /// Run advisors once for each user turn and reuse their guidance across tool iterations.
+    UserTurn,
+    /// Refresh advisors whenever their advisory view of the conversation changes.
+    #[default]
+    PerIteration,
+}
+
+fn default_moa_reference_max_tokens() -> Option<u32> {
+    Some(600)
+}
+
+const MOA_REFERENCE_INPUT_OVERHEAD_TOKENS: u64 = 1_024;
+const MOA_SUMMARY_BASE_OVERHEAD_TOKENS: u64 = 128;
+const MOA_SUMMARY_PER_REFERENCE_OVERHEAD_TOKENS: u64 = 64;
+
 /// Optional group-level Mixture of Agents configuration.
 ///
 /// When enabled, a group fans out non-streaming advisory requests to
 /// `reference_group_ids`, then routes a final aggregator request through
 /// `aggregator_group_id`. The referenced and aggregator groups still use the
 /// normal priority/failover routing path.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct AggregationConfig {
     /// Enables MoA routing for the parent group. Missing config defaults to normal failover.
     #[serde(default)]
@@ -154,6 +188,15 @@ pub struct AggregationConfig {
     /// Group ID used for the final aggregator call.
     #[serde(default, rename = "aggregatorGroupId")]
     pub aggregator_group_id: Option<String>,
+    /// Controls whether references run once per user turn or after every tool iteration.
+    #[serde(default)]
+    pub fanout: MoaFanoutMode,
+    /// Optional output-token ceiling for advisory calls on providers that support one.
+    #[serde(
+        default = "default_moa_reference_max_tokens",
+        rename = "referenceMaxTokens"
+    )]
+    pub reference_max_tokens: Option<u32>,
     /// Optional temperature override for reference calls.
     #[serde(default, rename = "referenceTemperature")]
     pub reference_temperature: Option<f64>,
@@ -177,6 +220,23 @@ pub struct AggregationConfig {
     /// If true, any reference failure fails the full MoA request.
     #[serde(default, rename = "requireAllReferences")]
     pub require_all_references: bool,
+}
+
+impl Default for AggregationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reference_group_ids: Vec::new(),
+            aggregator_group_id: None,
+            fanout: MoaFanoutMode::PerIteration,
+            reference_max_tokens: default_moa_reference_max_tokens(),
+            reference_temperature: None,
+            aggregator_temperature: None,
+            reference_reasoning_efforts: HashMap::new(),
+            aggregator_reasoning_effort: None,
+            require_all_references: false,
+        }
+    }
 }
 
 fn validate_reasoning_effort(effort: &str) -> bool {
@@ -316,6 +376,13 @@ pub fn validate_group_aggregation(groups: &[Group]) -> Result<(), String> {
             }
         }
 
+        if config.reference_max_tokens == Some(0) {
+            return Err(format!(
+                "MoA group '{}' reference max tokens must be greater than zero",
+                group.alias
+            ));
+        }
+
         for (reference_group_id, effort) in &config.reference_reasoning_efforts {
             if !validate_reasoning_effort(effort) {
                 return Err(format!(
@@ -392,6 +459,96 @@ pub fn validate_group_aggregation(groups: &[Group]) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Returns a conservative input-context limit for an enabled MoA group.
+///
+/// The client-visible request must fit every configured reference after the
+/// advisory framing is added, and it must fit the aggregator after all
+/// reference outputs are appended. Enabled failover entries are treated as
+/// possible routes, so the smallest per-route input capacity and largest
+/// possible reference output reserves are used.
+pub fn effective_moa_input_tokens(
+    group: &Group,
+    groups: &[Group],
+    providers: &[Provider],
+) -> Option<u64> {
+    let config = group
+        .aggregation_config
+        .as_ref()
+        .filter(|config| config.enabled)?;
+    let aggregator_id = config.aggregator_group_id.as_deref()?;
+    let aggregator = groups
+        .iter()
+        .find(|candidate| candidate.id == aggregator_id)?;
+    let (aggregator_input_capacity, _) =
+        conservative_group_input_capacity(aggregator, providers, None)?;
+
+    let mut summary_reserve = MOA_SUMMARY_BASE_OVERHEAD_TOKENS;
+    let mut reference_budget: Option<u64> = None;
+    for reference_id in &config.reference_group_ids {
+        let reference = groups
+            .iter()
+            .find(|candidate| candidate.id == *reference_id)?;
+        let (input_capacity, output_reserve) = conservative_group_input_capacity(
+            reference,
+            providers,
+            config.reference_max_tokens.map(u64::from),
+        )?;
+        let input_budget = input_capacity.checked_sub(MOA_REFERENCE_INPUT_OVERHEAD_TOKENS)?;
+        reference_budget = Some(
+            reference_budget
+                .map(|current| current.min(input_budget))
+                .unwrap_or(input_budget),
+        );
+
+        let label_reserve = MOA_SUMMARY_PER_REFERENCE_OVERHEAD_TOKENS
+            .checked_add(reference.alias.len() as u64)?
+            .checked_add(reference.display_name.len() as u64)?;
+        summary_reserve = summary_reserve
+            .checked_add(output_reserve)?
+            .checked_add(label_reserve)?;
+    }
+
+    let aggregator_budget = aggregator_input_capacity.checked_sub(summary_reserve)?;
+    Some(aggregator_budget.min(reference_budget?))
+}
+
+fn conservative_group_input_capacity(
+    group: &Group,
+    providers: &[Provider],
+    configured_cap: Option<u64>,
+) -> Option<(u64, u64)> {
+    let mut input_capacity: Option<u64> = None;
+    let mut max_output: Option<u64> = None;
+    for entry in group.entries.iter().filter(|entry| entry.enabled) {
+        let provider = providers
+            .iter()
+            .find(|provider| provider.id == entry.provider_id)?;
+        let (context, model_max_output) = provider.resolve_model_meta(&entry.model_id)?;
+        let context = context?;
+        let protocol = provider.resolve_model_protocol(&entry.model_id);
+        let output = if protocol == "openai-codex" || configured_cap.is_none() {
+            model_max_output?
+        } else {
+            let cap = configured_cap?;
+            model_max_output
+                .map(|model_max| cap.min(model_max))
+                .unwrap_or(cap)
+        };
+        let entry_input_capacity = context.checked_sub(output)?;
+        input_capacity = Some(
+            input_capacity
+                .map(|current| current.min(entry_input_capacity))
+                .unwrap_or(entry_input_capacity),
+        );
+        max_output = Some(
+            max_output
+                .map(|current| current.max(output))
+                .unwrap_or(output),
+        );
+    }
+    Some((input_capacity?, max_output?))
 }
 
 /// Top-level application configuration stored in `~/.config/coderouter/config.json`.
@@ -475,6 +632,44 @@ mod tests {
         }
     }
 
+    fn routed_group(id: &str, provider_id: &str, model_id: &str) -> Group {
+        let mut group = group(id, None);
+        group.entries.push(GroupEntry {
+            provider_id: provider_id.to_string(),
+            model_id: model_id.to_string(),
+            priority: 1,
+            daily_token_quota_override: None,
+            enabled: true,
+            status: "active".to_string(),
+            cooldown_until: None,
+        });
+        group
+    }
+
+    fn provider(id: &str, model_id: &str, context: u64, output: u64, protocol: &str) -> Provider {
+        Provider {
+            id: id.to_string(),
+            name: id.to_string(),
+            protocol: protocol.to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            credential_key: id.to_string(),
+            daily_token_quota: None,
+            daily_request_quota: None,
+            quota_reset_utc_hour: 0,
+            enabled: true,
+            models: vec![ProviderModel {
+                id: model_id.to_string(),
+                context_window: Some(context),
+                max_output_tokens: Some(output),
+                input_cost_per_1m: None,
+                output_cost_per_1m: None,
+                last_refreshed: None,
+                protocol: None,
+            }],
+            model_overrides: None,
+        }
+    }
+
     #[test]
     fn test_group_deserializes_without_aggregation_config() {
         let json = serde_json::json!({
@@ -508,11 +703,183 @@ mod tests {
         assert!(config.enabled);
         assert!(config.reference_group_ids.is_empty());
         assert!(config.aggregator_group_id.is_none());
+        assert_eq!(config.fanout, MoaFanoutMode::PerIteration);
+        assert_eq!(config.reference_max_tokens, Some(600));
         assert!(config.reference_temperature.is_none());
         assert!(config.aggregator_temperature.is_none());
         assert!(config.reference_reasoning_efforts.is_empty());
         assert!(config.aggregator_reasoning_effort.is_none());
         assert!(!config.require_all_references);
+    }
+
+    #[test]
+    fn test_aggregation_config_allows_uncapped_per_iteration_references() {
+        let config: AggregationConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "fanout": "per_iteration",
+            "referenceMaxTokens": null
+        }))
+        .unwrap();
+
+        assert_eq!(config.fanout, MoaFanoutMode::PerIteration);
+        assert_eq!(config.reference_max_tokens, None);
+    }
+
+    #[test]
+    fn test_aggregation_config_allows_explicit_user_turn_fanout() {
+        let config: AggregationConfig = serde_json::from_value(serde_json::json!({
+            "fanout": "user_turn"
+        }))
+        .unwrap();
+
+        assert_eq!(config.fanout, MoaFanoutMode::UserTurn);
+    }
+
+    #[test]
+    fn test_model_protocol_override_takes_precedence() {
+        let mut provider = provider("provider", "model", 100_000, 10_000, "openai");
+        provider.models[0].protocol = Some("anthropic".to_string());
+        provider.model_overrides = Some(vec![ProviderModel {
+            id: "model".to_string(),
+            context_window: None,
+            max_output_tokens: None,
+            input_cost_per_1m: None,
+            output_cost_per_1m: None,
+            last_refreshed: None,
+            protocol: Some("openai-codex".to_string()),
+        }]);
+
+        assert_eq!(provider.resolve_model_protocol("model"), "openai-codex");
+        assert_eq!(provider.resolve_model_protocol("unknown"), "openai");
+    }
+
+    #[test]
+    fn test_effective_moa_input_reserves_reference_summary() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("agg".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![
+            moa,
+            routed_group("agg", "agg-provider", "agg-model"),
+            routed_group("ref", "ref-provider", "ref-model"),
+        ];
+        let providers = vec![
+            provider("agg-provider", "agg-model", 100_000, 10_000, "openai"),
+            provider("ref-provider", "ref-model", 200_000, 4_000, "openai"),
+        ];
+
+        // 100,000 total - 10,000 output - 798 tokens of reference summary framing.
+        assert_eq!(
+            effective_moa_input_tokens(&groups[0], &groups, &providers),
+            Some(89_202)
+        );
+    }
+
+    #[test]
+    fn test_effective_moa_input_honors_reference_context() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("agg".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![
+            moa,
+            routed_group("agg", "agg-provider", "agg-model"),
+            routed_group("ref", "ref-provider", "ref-model"),
+        ];
+        let providers = vec![
+            provider("agg-provider", "agg-model", 100_000, 10_000, "openai"),
+            provider("ref-provider", "ref-model", 20_000, 4_000, "openai"),
+        ];
+
+        assert_eq!(
+            effective_moa_input_tokens(&groups[0], &groups, &providers),
+            Some(18_376)
+        );
+    }
+
+    #[test]
+    fn test_effective_moa_input_pairs_context_and_output_per_route() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("agg".to_string()),
+                ..AggregationConfig::default()
+            }),
+        );
+        let mut aggregator = routed_group("agg", "small-provider", "small-model");
+        aggregator.entries.push(GroupEntry {
+            provider_id: "large-provider".to_string(),
+            model_id: "large-model".to_string(),
+            priority: 2,
+            daily_token_quota_override: None,
+            enabled: true,
+            status: "active".to_string(),
+            cooldown_until: None,
+        });
+        let groups = vec![
+            moa,
+            aggregator,
+            routed_group("ref", "ref-provider", "ref-model"),
+        ];
+        let providers = vec![
+            provider("small-provider", "small-model", 128_000, 8_000, "openai"),
+            provider(
+                "large-provider",
+                "large-model",
+                1_000_000,
+                128_000,
+                "openai",
+            ),
+            provider("ref-provider", "ref-model", 500_000, 4_000, "openai"),
+        ];
+
+        // The two aggregator routes have 120k and 872k input capacity respectively.
+        assert_eq!(
+            effective_moa_input_tokens(&groups[0], &groups, &providers),
+            Some(119_202)
+        );
+    }
+
+    #[test]
+    fn test_effective_moa_input_uses_model_output_when_cap_is_unenforceable() {
+        let moa = group(
+            "moa",
+            Some(AggregationConfig {
+                enabled: true,
+                reference_group_ids: vec!["ref".to_string()],
+                aggregator_group_id: Some("agg".to_string()),
+                reference_max_tokens: Some(600),
+                ..AggregationConfig::default()
+            }),
+        );
+        let groups = vec![
+            moa,
+            routed_group("agg", "agg-provider", "agg-model"),
+            routed_group("ref", "ref-provider", "ref-model"),
+        ];
+        let providers = vec![
+            provider("agg-provider", "agg-model", 100_000, 10_000, "openai"),
+            provider("ref-provider", "ref-model", 200_000, 4_000, "openai-codex"),
+        ];
+
+        // Codex cannot enforce the 600-token cap, so reserve its 4,000-token maximum.
+        assert_eq!(
+            effective_moa_input_tokens(&groups[0], &groups, &providers),
+            Some(85_802)
+        );
     }
 
     #[test]

@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "coderouter"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "chrono",
  "coderouter-proxy",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "coderouter-proxy"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -647,6 +647,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha2",
  "tokio",
  "tokio-util",
  "url",
@@ -655,7 +656,7 @@ dependencies = [
 
 [[package]]
 name = "coderouter-tui"
-version = "0.1.45"
+version = "0.1.46"
 dependencies = [
  "anyhow",
  "chrono",

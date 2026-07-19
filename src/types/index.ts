@@ -102,6 +102,10 @@ export interface AggregationConfig {
   referenceGroupIds: string[];
   /** Group ID used for the final aggregator call. */
   aggregatorGroupId: string | null;
+  /** Whether advisors run once per user turn or refresh after each tool iteration. */
+  fanout: 'user_turn' | 'per_iteration';
+  /** Optional output-token ceiling for advisory calls on compatible providers. */
+  referenceMaxTokens?: number | null;
   /** Optional temperature override for reference calls. */
   referenceTemperature?: number | null;
   /** Optional temperature override for the aggregator call. */

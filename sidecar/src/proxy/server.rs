@@ -6,15 +6,17 @@
 //! client, and records metrics/usage.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::RwLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::response::Response;
 use axum::{
     extract::State,
-    http::{header::CONTENT_TYPE, StatusCode},
+    http::{header::CONTENT_TYPE, HeaderMap, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     response::IntoResponse,
     routing::{get, post},
@@ -26,6 +28,7 @@ use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::convert::Infallible;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -35,15 +38,27 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{broadcast, oneshot};
 
 use crate::config::{
-    models::{validate_group_aggregation, AppConfig, Group, Provider},
+    models::{
+        effective_moa_input_tokens, validate_group_aggregation, AggregationConfig, AppConfig,
+        Group, MoaFanoutMode, Provider,
+    },
     store::{load_app_config, load_groups, load_providers},
 };
 
 /// Maximum time (ms) to wait between SSE chunks before declaring a timeout.
 /// Long timeout accounts for models that "think" (reasoning) before emitting tokens.
 const STREAM_INTER_CHUNK_TIMEOUT_MS: u64 = 120_000;
-const MAX_MOA_REFERENCE_CONCURRENCY: usize = 4;
+const MAX_MOA_REFERENCE_CONCURRENCY: usize = 8;
 const MAX_MOA_REFERENCE_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_MOA_REFERENCE_CACHE_ENTRIES: usize = 64;
+const MAX_MOA_REFERENCE_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MOA_REFERENCE_CACHE_ENTRY_BYTES: usize = 1024 * 1024;
+const MOA_REFERENCE_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
+const MOA_REFERENCE_TOOL_RESULT_MAX_CHARS: usize = 4_000;
+const MOA_ADVISORY_INSTRUCTION: &str = concat!(
+    "The conversation above is the current state of the task. Give your best ",
+    "judgement on what should happen next, including risks or mistakes the acting agent may miss."
+);
 const MOA_REFERENCE_SYSTEM_PROMPT: &str = concat!(
     "You are an advisory reference model in a Mixture of Agents request. ",
     "Provide concise guidance for the final aggregator. ",
@@ -74,6 +89,15 @@ pub struct AppState {
     pub router_state: SharedRouterState,
     pub metrics_recorder: Arc<MetricsRecorder>,
     pub metrics_broadcast: broadcast::Sender<String>,
+    moa_reference_cache: Arc<Mutex<HashMap<String, MoaReferenceCacheEntry>>>,
+    moa_reference_cache_generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+#[derive(Clone)]
+struct MoaReferenceCacheEntry {
+    created_at: Instant,
+    size_bytes: usize,
+    references: Vec<MoaReferenceOutput>,
 }
 
 /// Unix epoch timestamp recorded at server start, used to compute uptime.
@@ -126,7 +150,22 @@ pub async fn start_server() -> anyhow::Result<()> {
         router_state,
         metrics_recorder: metrics_recorder.clone(),
         metrics_broadcast: metrics_broadcast_tx,
+        moa_reference_cache: Arc::new(Mutex::new(HashMap::new())),
+        moa_reference_cache_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
     };
+
+    let moa_reference_cache = state.moa_reference_cache.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(5 * 60));
+        interval.tick().await;
+        loop {
+            interval.tick().await;
+            moa_reference_cache
+                .lock()
+                .unwrap()
+                .retain(|_, entry| entry.created_at.elapsed() < MOA_REFERENCE_CACHE_TTL);
+        }
+    });
 
     let scheduler_groups = state.groups.clone();
     let scheduler_client = state.client.clone();
@@ -253,6 +292,8 @@ struct ModelObject {
     #[serde(skip_serializing_if = "Option::is_none")]
     context_window: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    max_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_output_tokens: Option<u64>,
 }
 
@@ -313,9 +354,13 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
             }
         })
         .map(|g| {
-            let metadata_group = metadata_group_for_model(g, groups.as_ref());
-            let (context_window, max_output_tokens) =
-                resolve_group_model_metadata(metadata_group, &providers, &router_state);
+            let (context_window, max_input_tokens, max_output_tokens) =
+                resolve_model_metadata_for_group(
+                    g,
+                    groups.as_ref(),
+                    providers.as_ref(),
+                    &router_state,
+                );
 
             ModelObject {
                 id: g.alias.clone(),
@@ -323,6 +368,7 @@ async fn handle_models(State(state): State<Arc<AppState>>) -> Json<ModelResponse
                 created: chrono::Utc::now().timestamp() as u64,
                 owned_by: "coderouter".to_string(),
                 context_window,
+                max_input_tokens,
                 max_output_tokens,
             }
         })
@@ -342,6 +388,24 @@ fn metadata_group_for_model<'a>(group: &'a Group, groups: &'a [Group]) -> &'a Gr
         .and_then(|config| config.aggregator_group_id.as_deref())
         .and_then(|id| groups.iter().find(|candidate| candidate.id == id))
         .unwrap_or(group)
+}
+
+fn resolve_model_metadata_for_group(
+    group: &Group,
+    groups: &[Group],
+    providers: &[Provider],
+    router_state: &router::RouterState,
+) -> (Option<u64>, Option<u64>, Option<u64>) {
+    let metadata_group = metadata_group_for_model(group, groups);
+    let (context, output) = resolve_group_model_metadata(metadata_group, providers, router_state);
+    if group.aggregation_enabled() {
+        let input = effective_moa_input_tokens(group, groups, providers);
+        let total = input
+            .zip(output)
+            .and_then(|(input, output)| input.checked_add(output));
+        return (total, input.filter(|_| total.is_some()), output);
+    }
+    (context, None, output)
 }
 
 fn resolve_group_model_metadata(
@@ -435,6 +499,7 @@ fn entry_is_available(
 /// [`route_request`].
 async fn handle_chat_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     if !body.is_object() {
@@ -442,7 +507,8 @@ async fn handle_chat_completions(
             "request body must be a JSON object".into(),
         ));
     }
-    route_request(&state, body, "chat/completions").await
+    let session_id = request_session_id(&headers, &body);
+    route_request(&state, body, "chat/completions", session_id.as_deref()).await
 }
 
 /// `POST /v1/completions` — OpenAI-compatible legacy completion endpoint.
@@ -452,6 +518,7 @@ async fn handle_chat_completions(
 /// endpoint because Anthropic has no `/completions` equivalent.
 async fn handle_completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Response, AppError> {
     if !body.is_object() {
@@ -459,7 +526,26 @@ async fn handle_completions(
             "request body must be a JSON object".into(),
         ));
     }
-    route_request(&state, body, "completions").await
+    let session_id = request_session_id(&headers, &body);
+    route_request(&state, body, "completions", session_id.as_deref()).await
+}
+
+fn request_session_id(headers: &HeaderMap, body: &Value) -> Option<String> {
+    for name in ["x-session-id", "x-session-affinity", "x-opencode-session"] {
+        let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) else {
+            continue;
+        };
+        let value = value.trim();
+        if !value.is_empty() && value.len() <= 256 && value.is_ascii() {
+            return Some(value.to_string());
+        }
+    }
+
+    body.get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.len() <= 256 && value.is_ascii())
+        .map(str::to_string)
 }
 
 /// Core request routing logic shared by both chat and legacy completions.
@@ -480,7 +566,9 @@ async fn route_request(
     state: &AppState,
     body: Value,
     endpoint: &str,
+    session_id: Option<&str>,
 ) -> Result<Response, AppError> {
+    let moa_cache_generation = state.moa_reference_cache_generation.load(Ordering::Acquire);
     let model = body
         .get("model")
         .and_then(|v| v.as_str())
@@ -500,10 +588,18 @@ async fn route_request(
     };
 
     if group.aggregation_enabled() {
-        return route_moa_request(state, body, endpoint, group).await;
+        return route_moa_request(
+            state,
+            body,
+            endpoint,
+            group,
+            session_id,
+            moa_cache_generation,
+        )
+        .await;
     }
 
-    route_failover_request(state, body, endpoint, group, &model).await
+    route_failover_request(state, body, endpoint, group, &model, session_id, None).await
 }
 
 async fn route_failover_request(
@@ -512,8 +608,11 @@ async fn route_failover_request(
     endpoint: &str,
     group: Group,
     response_alias: &str,
+    session_id: Option<&str>,
+    output_token_limit: Option<u32>,
 ) -> Result<Response, AppError> {
     let start = Instant::now();
+    let output_token_limit = output_token_limit.or_else(|| body_output_token_limit(&body));
 
     let stream = body
         .get("stream")
@@ -560,24 +659,14 @@ async fn route_failover_request(
                 AppError::InternalError("upstream provider configuration error".to_string())
             })?;
 
-        // Determine protocol: per-model override takes precedence over provider default
-        let model_protocol = provider
-            .models
-            .iter()
-            .find(|m| m.id == entry.model_id)
-            .and_then(|m| m.protocol.clone())
-            .or_else(|| {
-                provider.model_overrides.as_ref().and_then(|overrides| {
-                    overrides
-                        .iter()
-                        .find(|m| m.id == entry.model_id)
-                        .and_then(|m| m.protocol.clone())
-                })
-            });
-        let effective_protocol = model_protocol.as_deref().unwrap_or(&provider.protocol);
+        let effective_protocol = provider.resolve_model_protocol(&entry.model_id);
         let is_anthropic = effective_protocol == "anthropic";
         let is_codex = effective_protocol == "openai-codex";
         let upstream_model = entry.model_id.clone();
+        let model_max_output = provider
+            .resolve_model_meta(&entry.model_id)
+            .and_then(|(_, output)| output);
+        let output_token_limit = clamp_output_token_limit(output_token_limit, model_max_output);
 
         ssrf::validate_base_url(&provider.base_url).map_err(|e| {
             eprintln!("SSRF validation failed for provider {}: {}", provider.id, e);
@@ -648,6 +737,8 @@ async fn route_failover_request(
                 &url,
                 is_anthropic,
                 codex_token_refs,
+                session_id,
+                output_token_limit,
             )
         };
 
@@ -959,17 +1050,36 @@ async fn route_failover_request(
     Ok((StatusCode::SERVICE_UNAVAILABLE, Json(exhausted_body)).into_response())
 }
 
+fn clamp_output_token_limit(requested: Option<u32>, model_max: Option<u64>) -> Option<u32> {
+    requested.map(|requested| {
+        model_max
+            .map(|model_max| requested.min(model_max.min(u32::MAX as u64) as u32))
+            .unwrap_or(requested)
+    })
+}
+
+fn body_output_token_limit(body: &Value) -> Option<u32> {
+    ["max_completion_tokens", "max_tokens"]
+        .into_iter()
+        .filter_map(|field| body.get(field).and_then(Value::as_u64))
+        .min()
+        .map(|limit| limit.min(u32::MAX as u64) as u32)
+}
+
 async fn route_moa_request(
     state: &AppState,
     body: Value,
     endpoint: &str,
     group: Group,
+    session_id: Option<&str>,
+    cache_generation: u64,
 ) -> Result<Response, AppError> {
     if endpoint != "chat/completions" {
         return Err(AppError::BadRequest(
             "Mixture of Agents groups only support /v1/chat/completions".to_string(),
         ));
     }
+    let body = Arc::new(body);
 
     let groups = {
         let guard = state
@@ -1024,28 +1134,58 @@ async fn route_moa_request(
         reference_groups.push(reference_group);
     }
 
+    let cache_key = cache_generation
+        .is_multiple_of(2)
+        .then(|| {
+            build_moa_reference_cache_key(
+                session_id,
+                cache_generation,
+                &group.id,
+                &body,
+                &config,
+                &reference_groups,
+            )
+        })
+        .flatten();
+    let cached_references = cache_key
+        .as_deref()
+        .and_then(|key| get_cached_moa_references(state, key));
+    let references_from_cache = cached_references.is_some();
+
     let reference_temperature = config.reference_temperature;
+    let reference_max_tokens = config.reference_max_tokens;
+    let reference_fanout = config.fanout;
     let reference_reasoning_efforts = config.reference_reasoning_efforts.clone();
     let reference_results: Vec<Result<MoaReferenceOutput, String>> =
-        futures::stream::iter(reference_groups.into_iter().map(|reference_group| {
-            let body = body.clone();
-            let reasoning_effort = reference_reasoning_efforts
-                .get(&reference_group.id)
-                .cloned();
-            async move {
-                run_moa_reference_request(
-                    state,
-                    body,
-                    reference_group,
-                    reference_temperature,
-                    reasoning_effort,
-                )
-                .await
-            }
-        }))
-        .buffer_unordered(MAX_MOA_REFERENCE_CONCURRENCY)
-        .collect()
-        .await;
+        if let Some(references) = cached_references {
+            references.into_iter().map(Ok).collect()
+        } else {
+            collect_moa_reference_results(reference_groups.into_iter().enumerate().map(
+                |(index, reference_group)| {
+                    let body = body.clone();
+                    let reasoning_effort = reference_reasoning_efforts
+                        .get(&reference_group.id)
+                        .cloned();
+                    async move {
+                        (
+                            index,
+                            run_moa_reference_request(
+                                state,
+                                body,
+                                reference_group,
+                                reference_fanout,
+                                reference_temperature,
+                                reference_max_tokens,
+                                reasoning_effort,
+                                session_id,
+                            )
+                            .await,
+                        )
+                    }
+                },
+            ))
+            .await
+        };
 
     let mut references = Vec::new();
     let mut failures = Vec::new();
@@ -1076,6 +1216,16 @@ async fn route_moa_request(
         )));
     }
 
+    if !references_from_cache
+        && failures.is_empty()
+        && cache_generation.is_multiple_of(2)
+        && state.moa_reference_cache_generation.load(Ordering::Acquire) == cache_generation
+    {
+        if let Some(cache_key) = cache_key {
+            cache_moa_references(state, cache_key, references.clone());
+        }
+    }
+
     let aggregator_body = build_moa_aggregator_request(
         &body,
         &aggregator_group.alias,
@@ -1091,8 +1241,125 @@ async fn route_moa_request(
         endpoint,
         aggregator_group,
         &group.alias,
+        session_id,
+        None,
     )
     .await
+}
+
+async fn collect_moa_reference_results<I, F, T>(futures: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = (usize, T)>,
+{
+    let mut results: Vec<_> = futures::stream::iter(futures)
+        .buffer_unordered(MAX_MOA_REFERENCE_CONCURRENCY)
+        .collect()
+        .await;
+    results.sort_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
+}
+
+fn build_moa_reference_cache_key(
+    session_id: Option<&str>,
+    cache_generation: u64,
+    group_id: &str,
+    body: &Value,
+    config: &AggregationConfig,
+    reference_groups: &[Group],
+) -> Option<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(cache_generation.to_le_bytes());
+    hasher.update((reference_groups.len() as u64).to_le_bytes());
+    hasher.update(
+        config
+            .reference_max_tokens
+            .unwrap_or_default()
+            .to_le_bytes(),
+    );
+    update_moa_cache_hash(&mut hasher, session_id.unwrap_or_default().as_bytes());
+    update_moa_cache_hash(&mut hasher, group_id.as_bytes());
+
+    for reference_group in reference_groups {
+        let request = build_moa_reference_request(
+            body,
+            &reference_group.alias,
+            config.fanout,
+            config.reference_temperature,
+            config
+                .reference_reasoning_efforts
+                .get(&reference_group.id)
+                .map(String::as_str),
+        )
+        .ok()?;
+        let serialized = serde_json::to_vec(&request).ok()?;
+        update_moa_cache_hash(&mut hasher, &serialized);
+    }
+
+    let digest = hasher.finalize();
+    Some(digest.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn update_moa_cache_hash(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_le_bytes());
+    hasher.update(value);
+}
+
+fn get_cached_moa_references(state: &AppState, key: &str) -> Option<Vec<MoaReferenceOutput>> {
+    let mut cache = state.moa_reference_cache.lock().unwrap();
+    cache.retain(|_, entry| entry.created_at.elapsed() < MOA_REFERENCE_CACHE_TTL);
+    cache.get(key).map(|entry| entry.references.clone())
+}
+
+fn cache_moa_references(state: &AppState, key: String, references: Vec<MoaReferenceOutput>) {
+    let size_bytes = references
+        .iter()
+        .map(|reference| {
+            reference.group_alias.len() + reference.display_name.len() + reference.content.len()
+        })
+        .sum();
+    if size_bytes > MAX_MOA_REFERENCE_CACHE_ENTRY_BYTES {
+        return;
+    }
+
+    let mut cache = state.moa_reference_cache.lock().unwrap();
+    cache.retain(|_, entry| entry.created_at.elapsed() < MOA_REFERENCE_CACHE_TTL);
+    cache.remove(&key);
+    while cache.len() >= MAX_MOA_REFERENCE_CACHE_ENTRIES
+        || cache.values().map(|entry| entry.size_bytes).sum::<usize>() + size_bytes
+            > MAX_MOA_REFERENCE_CACHE_BYTES
+    {
+        if let Some(oldest_key) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.created_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&oldest_key);
+        } else {
+            break;
+        }
+    }
+    cache.insert(
+        key,
+        MoaReferenceCacheEntry {
+            created_at: Instant::now(),
+            size_bytes,
+            references,
+        },
+    );
+}
+
+fn begin_moa_reference_cache_invalidation(state: &AppState) {
+    state
+        .moa_reference_cache_generation
+        .fetch_add(1, Ordering::AcqRel);
+    state.moa_reference_cache.lock().unwrap().clear();
+}
+
+fn finish_moa_reference_cache_invalidation(state: &AppState) {
+    state
+        .moa_reference_cache_generation
+        .fetch_add(1, Ordering::Release);
 }
 
 #[derive(Clone, Debug)]
@@ -1104,16 +1371,20 @@ struct MoaReferenceOutput {
 
 async fn run_moa_reference_request(
     state: &AppState,
-    body: Value,
+    body: Arc<Value>,
     reference_group: Group,
+    reference_fanout: MoaFanoutMode,
     reference_temperature: Option<f64>,
+    reference_max_tokens: Option<u32>,
     reasoning_effort: Option<String>,
+    session_id: Option<&str>,
 ) -> Result<MoaReferenceOutput, String> {
     let alias = reference_group.alias.clone();
     let display_name = reference_group.display_name.clone();
     let request_body = build_moa_reference_request(
         &body,
         &alias,
+        reference_fanout,
         reference_temperature,
         reasoning_effort.as_deref(),
     )?;
@@ -1123,6 +1394,8 @@ async fn run_moa_reference_request(
         "chat/completions",
         reference_group,
         &alias,
+        session_id,
+        reference_max_tokens,
     )
     .await
     .map_err(app_error_message)?;
@@ -1141,6 +1414,7 @@ async fn run_moa_reference_request(
 fn build_moa_reference_request(
     body: &Value,
     reference_alias: &str,
+    fanout: MoaFanoutMode,
     temperature: Option<f64>,
     reasoning_effort: Option<&str>,
 ) -> Result<Value, String> {
@@ -1153,10 +1427,10 @@ fn build_moa_reference_request(
         "role": "system",
         "content": MOA_REFERENCE_SYSTEM_PROMPT,
     })];
-    sanitized_messages.extend(messages.iter().filter_map(sanitize_reference_message));
+    sanitized_messages.extend(build_moa_advisory_messages(messages, fanout));
     if sanitized_messages.len() == 1 {
         return Err(
-            "MoA reference request has no text messages after stripping tool messages".into(),
+            "MoA reference request has no text messages after building advisory context".into(),
         );
     }
 
@@ -1183,6 +1457,11 @@ fn build_moa_reference_request(
         "text",
         "response_format",
         "stream_options",
+        "max_tokens",
+        "max_completion_tokens",
+        "n",
+        "logprobs",
+        "top_logprobs",
     ] {
         obj.remove(key);
     }
@@ -1192,21 +1471,150 @@ fn build_moa_reference_request(
     Ok(request)
 }
 
-fn sanitize_reference_message(message: &Value) -> Option<Value> {
-    let role = message.get("role").and_then(|v| v.as_str())?;
-    if !matches!(role, "user" | "assistant") {
-        return None;
+fn build_moa_advisory_messages(messages: &[Value], fanout: MoaFanoutMode) -> Vec<Value> {
+    let end = match fanout {
+        MoaFanoutMode::UserTurn => messages
+            .iter()
+            .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .map(|index| index + 1)
+            .unwrap_or(messages.len()),
+        MoaFanoutMode::PerIteration => messages.len(),
+    };
+    let mut rendered = Vec::new();
+
+    for message in &messages[..end] {
+        let Some(role) = message.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+        match role {
+            "user" => {
+                let mut text = message
+                    .get("content")
+                    .map(content_value_to_text)
+                    .unwrap_or_default();
+                if text.trim().is_empty()
+                    && message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .is_some_and(|parts| !parts.is_empty())
+                {
+                    text = "[user sent non-text content]".to_string();
+                }
+                push_moa_advisory_message(&mut rendered, "user", &text);
+            }
+            "assistant" => {
+                let mut parts = Vec::new();
+                let text = message
+                    .get("content")
+                    .map(content_value_to_text)
+                    .unwrap_or_default();
+                if !text.trim().is_empty() {
+                    parts.push(text.trim().to_string());
+                }
+                let tool_calls = render_moa_tool_calls(message.get("tool_calls"));
+                if !tool_calls.is_empty() {
+                    parts.push(tool_calls);
+                }
+                push_moa_advisory_message(&mut rendered, "assistant", &parts.join("\n"));
+            }
+            "tool" => {
+                let text = message
+                    .get("content")
+                    .map(content_value_to_text)
+                    .unwrap_or_default();
+                let text = truncate_moa_advisory_text(&text, MOA_REFERENCE_TOOL_RESULT_MAX_CHARS);
+                push_moa_advisory_message(
+                    &mut rendered,
+                    "assistant",
+                    &format!("[tool result: {text}]"),
+                );
+            }
+            _ => {}
+        }
     }
 
-    let content = message.get("content").map(content_value_to_text)?;
-    if content.trim().is_empty() {
-        return None;
+    if rendered
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("assistant")
+    {
+        rendered.push(serde_json::json!({
+            "role": "user",
+            "content": MOA_ADVISORY_INSTRUCTION,
+        }));
     }
+    rendered
+}
 
-    Some(serde_json::json!({
+fn push_moa_advisory_message(messages: &mut Vec<Value>, role: &str, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    if let Some(existing) = messages
+        .last_mut()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some(role))
+    {
+        if let Some(Value::String(content)) = existing.get_mut("content") {
+            content.push_str("\n\n");
+            content.push_str(text.trim());
+            return;
+        }
+    }
+    messages.push(serde_json::json!({
         "role": role,
-        "content": content,
-    }))
+        "content": text.trim(),
+    }));
+}
+
+fn render_moa_tool_calls(tool_calls: Option<&Value>) -> String {
+    tool_calls
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|tool_call| {
+            let function = tool_call.get("function");
+            let name = function
+                .and_then(|value| value.get("name"))
+                .or_else(|| tool_call.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            let arguments = function
+                .and_then(|value| value.get("arguments"))
+                .or_else(|| tool_call.get("arguments"))
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_default();
+            let arguments =
+                truncate_moa_advisory_text(&arguments, MOA_REFERENCE_TOOL_RESULT_MAX_CHARS);
+            if arguments.is_empty() {
+                format!("[called tool: {name}]")
+            } else {
+                format!("[called tool: {name}({arguments})]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_moa_advisory_text(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let half = max_chars / 2;
+    let head: String = text.chars().take(half).collect();
+    let mut tail: Vec<char> = text.chars().rev().take(half).collect();
+    tail.reverse();
+    format!(
+        "{head}\n[... {} chars omitted ...]\n{}",
+        char_count.saturating_sub(half * 2),
+        tail.into_iter().collect::<String>()
+    )
 }
 
 fn build_moa_aggregator_request(
@@ -1232,11 +1640,28 @@ fn build_moa_aggregator_request(
         .get_mut("messages")
         .and_then(|v| v.as_array_mut())
         .ok_or_else(|| "MoA requests require a messages array".to_string())?;
-    let user_index = messages
+    if !messages
         .iter()
-        .rposition(|message| message.get("role").and_then(|v| v.as_str()) == Some("user"))
-        .ok_or_else(|| "MoA requests require at least one user message".to_string())?;
-    append_text_to_message_content(&mut messages[user_index], &summary)?;
+        .any(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+    {
+        return Err("MoA requests require at least one user message".to_string());
+    }
+
+    if messages
+        .last()
+        .and_then(|message| message.get("role"))
+        .and_then(Value::as_str)
+        == Some("user")
+    {
+        append_text_to_message_content(messages.last_mut().unwrap(), &summary)?;
+    } else {
+        // Keep the original transcript as a stable cacheable prefix. Reference
+        // guidance changes every iteration, so it belongs at the prompt tail.
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": summary,
+        }));
+    }
 
     Ok(request)
 }
@@ -2244,6 +2669,7 @@ async fn handle_internal_router_set_entry(
         req.enabled,
     ) {
         Ok(()) => {
+            begin_moa_reference_cache_invalidation(&state);
             let reloaded =
                 load_groups().unwrap_or_else(|_| state.groups.read().unwrap().as_ref().clone());
             *state.groups.write().unwrap() = Arc::new(reloaded);
@@ -2252,6 +2678,7 @@ async fn handle_internal_router_set_entry(
             let reloaded_providers = load_providers()
                 .unwrap_or_else(|_| state.providers.read().unwrap().as_ref().clone());
             *state.providers.write().unwrap() = Arc::new(reloaded_providers);
+            finish_moa_reference_cache_invalidation(&state);
             Ok(Json(serde_json::json!({ "status": "ok" })))
         }
         Err(e) => Err((
@@ -2310,6 +2737,7 @@ async fn handle_internal_config_reload(
         map
     };
 
+    begin_moa_reference_cache_invalidation(&state);
     *state.config.write().unwrap() = Arc::new(new_config);
     *state.groups.write().unwrap() = Arc::new(new_groups.clone());
     *state.providers.write().unwrap() = Arc::new(new_providers.clone());
@@ -2351,6 +2779,8 @@ async fn handle_internal_config_reload(
             eprintln!("[config-reload] failed to reload daily totals: {e}");
         }
     }
+
+    finish_moa_reference_cache_invalidation(&state);
 
     eprintln!("[config-reload] config reloaded successfully");
     Ok(Json(serde_json::json!({ "status": "ok" })))
@@ -2453,7 +2883,7 @@ mod tests {
     }
 
     #[test]
-    fn test_moa_model_metadata_uses_aggregator_limits() {
+    fn test_moa_model_metadata_uses_effective_context_and_aggregator_output() {
         let reference = test_group_with_entry("ref", "ref", "ref-provider", "ref-model", 1);
         let aggregator =
             test_group_with_entry("aggregator", "aggregator", "agg-provider", "agg-model", 1);
@@ -2478,12 +2908,31 @@ mod tests {
         let router_state = router::init_router_state(&groups, &providers);
         let guard = router_state.lock().unwrap();
 
-        let metadata_group = metadata_group_for_model(&groups[0], &groups);
-        let (context, output) = resolve_group_model_metadata(metadata_group, &providers, &guard);
+        let (context, input, output) =
+            resolve_model_metadata_for_group(&groups[0], &groups, &providers, &guard);
 
-        assert_eq!(metadata_group.id, "aggregator");
-        assert_eq!(context, Some(272_000));
+        assert_eq!(context, Some(142_376));
+        assert_eq!(input, Some(14_376));
         assert_eq!(output, Some(128_000));
+    }
+
+    #[test]
+    fn test_output_token_limit_is_clamped_to_model_maximum() {
+        assert_eq!(clamp_output_token_limit(Some(600), Some(256)), Some(256));
+        assert_eq!(clamp_output_token_limit(Some(600), Some(2_000)), Some(600));
+        assert_eq!(clamp_output_token_limit(Some(600), None), Some(600));
+        assert_eq!(clamp_output_token_limit(None, Some(256)), None);
+    }
+
+    #[test]
+    fn test_body_output_token_limit_uses_smallest_supplied_cap() {
+        let body = serde_json::json!({
+            "max_tokens": 8_000,
+            "max_completion_tokens": 4_000
+        });
+
+        assert_eq!(body_output_token_limit(&body), Some(4_000));
+        assert_eq!(body_output_token_limit(&serde_json::json!({})), None);
     }
 
     #[tokio::test]
@@ -2760,7 +3209,7 @@ data: {"type":"response.completed"}
     }
 
     #[test]
-    fn test_moa_reference_request_strips_tools_and_forces_non_streaming() {
+    fn test_moa_reference_request_flattens_tools_and_forces_non_streaming() {
         let body = serde_json::json!({
             "model": "moa",
             "stream": true,
@@ -2772,6 +3221,11 @@ data: {"type":"response.completed"}
             "text": {"verbosity": "low"},
             "response_format": {"type": "json_object"},
             "stream_options": {"include_usage": true},
+            "max_tokens": 10000,
+            "max_completion_tokens": 9000,
+            "n": 3,
+            "logprobs": true,
+            "top_logprobs": 5,
             "tools": [{"type": "function", "function": {"name": "lookup"}}],
             "tool_choice": "auto",
             "parallel_tool_calls": true,
@@ -2784,7 +3238,14 @@ data: {"type":"response.completed"}
             ]
         });
 
-        let request = build_moa_reference_request(&body, "reference", Some(0.2), None).unwrap();
+        let request = build_moa_reference_request(
+            &body,
+            "reference",
+            MoaFanoutMode::PerIteration,
+            Some(0.2),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(request["model"], "reference");
         assert_eq!(request["stream"], false);
@@ -2799,9 +3260,14 @@ data: {"type":"response.completed"}
         assert!(request.get("text").is_none());
         assert!(request.get("response_format").is_none());
         assert!(request.get("stream_options").is_none());
+        assert!(request.get("max_tokens").is_none());
+        assert!(request.get("max_completion_tokens").is_none());
+        assert!(request.get("n").is_none());
+        assert!(request.get("logprobs").is_none());
+        assert!(request.get("top_logprobs").is_none());
 
         let messages = request["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0]["role"], "system");
         assert!(messages[0]["content"]
             .as_str()
@@ -2810,8 +3276,13 @@ data: {"type":"response.completed"}
         assert_ne!(messages[0]["content"], "system text");
         assert_eq!(messages[1]["role"], "user");
         assert_eq!(messages[2]["role"], "assistant");
-        assert_eq!(messages[2]["content"], "answer so far");
+        let advisory_context = messages[2]["content"].as_str().unwrap();
+        assert!(advisory_context.contains("[called tool:"));
+        assert!(advisory_context.contains("[tool result: tool result]"));
+        assert!(advisory_context.contains("answer so far"));
         assert!(messages[2].get("tool_calls").is_none());
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], MOA_ADVISORY_INSTRUCTION);
     }
 
     #[test]
@@ -2822,12 +3293,185 @@ data: {"type":"response.completed"}
             "messages": [{"role": "user", "content": "question"}]
         });
 
-        let request = build_moa_reference_request(&body, "reference", None, Some("high")).unwrap();
+        let request = build_moa_reference_request(
+            &body,
+            "reference",
+            MoaFanoutMode::UserTurn,
+            None,
+            Some("high"),
+        )
+        .unwrap();
 
         assert_eq!(request["model"], "reference");
         assert_eq!(request["stream"], false);
         assert_eq!(request["reasoning_effort"], "high");
         assert!(request.get("reasoning").is_none());
+        assert!(request.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn test_request_session_id_prefers_opencode_session_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-affinity", "ses_affinity".parse().unwrap());
+        headers.insert("x-session-id", "ses_primary".parse().unwrap());
+        let body = serde_json::json!({ "prompt_cache_key": "body-key" });
+
+        assert_eq!(
+            request_session_id(&headers, &body).as_deref(),
+            Some("ses_primary")
+        );
+        assert_eq!(
+            request_session_id(&HeaderMap::new(), &body).as_deref(),
+            Some("body-key")
+        );
+    }
+
+    #[test]
+    fn test_moa_user_turn_cache_key_ignores_tool_iteration_growth() {
+        let config = AggregationConfig {
+            enabled: true,
+            reference_group_ids: vec!["ref".to_string()],
+            aggregator_group_id: Some("agg".to_string()),
+            fanout: MoaFanoutMode::UserTurn,
+            ..AggregationConfig::default()
+        };
+        let reference_groups = vec![test_group_with_entry("ref", "ref", "provider", "model", 1)];
+        let initial = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "fix it"}
+            ]
+        });
+        let tool_iteration = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "fix it"},
+                {"role": "assistant", "content": "working", "tool_calls": [{"id": "call_1"}]},
+                {"role": "tool", "content": "large tool result"}
+            ]
+        });
+
+        let initial_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            0,
+            "moa",
+            &initial,
+            &config,
+            &reference_groups,
+        )
+        .unwrap();
+        let tool_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            0,
+            "moa",
+            &tool_iteration,
+            &config,
+            &reference_groups,
+        )
+        .unwrap();
+        assert_eq!(initial_key, tool_key);
+
+        let next_turn = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "fix it"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "now test it"}
+            ]
+        });
+        let next_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            0,
+            "moa",
+            &next_turn,
+            &config,
+            &reference_groups,
+        )
+        .unwrap();
+        assert_ne!(initial_key, next_key);
+    }
+
+    #[test]
+    fn test_moa_per_iteration_cache_key_tracks_advisory_changes() {
+        let config = AggregationConfig {
+            fanout: MoaFanoutMode::PerIteration,
+            reference_group_ids: vec!["ref".to_string()],
+            ..AggregationConfig::default()
+        };
+        let reference_groups = vec![test_group_with_entry("ref", "ref", "provider", "model", 1)];
+        let initial = serde_json::json!({
+            "messages": [{"role": "user", "content": "question"}]
+        });
+        let advanced = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "question"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "tool result"}
+            ]
+        });
+
+        let initial_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            0,
+            "moa",
+            &initial,
+            &config,
+            &reference_groups,
+        )
+        .unwrap();
+        let advanced_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            0,
+            "moa",
+            &advanced,
+            &config,
+            &reference_groups,
+        )
+        .unwrap();
+        assert_ne!(initial_key, advanced_key);
+
+        let sampled = serde_json::json!({
+            "messages": [{"role": "user", "content": "question"}],
+            "top_p": 0.5,
+            "stop": ["END"]
+        });
+        let sampled_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            0,
+            "moa",
+            &sampled,
+            &config,
+            &reference_groups,
+        )
+        .unwrap();
+        assert_ne!(initial_key, sampled_key);
+
+        let reloaded_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            1,
+            "moa",
+            &initial,
+            &config,
+            &reference_groups,
+        )
+        .unwrap();
+        assert_ne!(initial_key, reloaded_key);
+
+        let mut uncapped_config = config.clone();
+        uncapped_config.reference_max_tokens = None;
+        let uncapped_key = build_moa_reference_cache_key(
+            Some("ses_1"),
+            0,
+            "moa",
+            &initial,
+            &uncapped_config,
+            &reference_groups,
+        )
+        .unwrap();
+        assert_ne!(initial_key, uncapped_key);
     }
 
     #[test]
@@ -2907,6 +3551,82 @@ data: {"type":"response.completed"}
         assert!(latest_user.contains("reference answer"));
         assert!(latest_user.contains("Deep (deep)"));
         assert!(latest_user.contains("second answer"));
+    }
+
+    #[test]
+    fn test_moa_aggregator_request_appends_guidance_after_tool_history() {
+        let body = serde_json::json!({
+            "model": "moa",
+            "messages": [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": "original task"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "result"}
+            ]
+        });
+        let references = vec![MoaReferenceOutput {
+            group_alias: "ref".to_string(),
+            display_name: "Ref".to_string(),
+            content: "advice".to_string(),
+        }];
+
+        let request =
+            build_moa_aggregator_request(&body, "aggregator", &references, None, None).unwrap();
+        let original_messages = body["messages"].as_array().unwrap();
+        let messages = request["messages"].as_array().unwrap();
+
+        assert_eq!(&messages[..original_messages.len()], original_messages);
+        assert_eq!(messages.last().unwrap()["role"], "user");
+        assert!(messages.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("advice"));
+    }
+
+    #[tokio::test]
+    async fn test_moa_reference_fanout_is_bounded_and_preserves_order() {
+        use tokio::sync::{mpsc, Notify};
+
+        let count = MAX_MOA_REFERENCE_CONCURRENCY + 1;
+        let gates: Vec<_> = (0..count).map(|_| Arc::new(Notify::new())).collect();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let futures: Vec<_> = (0..count)
+            .map(|index| {
+                let started_tx = started_tx.clone();
+                let gate = gates[index].clone();
+                async move {
+                    started_tx.send(index).unwrap();
+                    gate.notified().await;
+                    (index, index)
+                }
+            })
+            .collect();
+        drop(started_tx);
+
+        let task = tokio::spawn(collect_moa_reference_results(futures));
+        let mut active = Vec::new();
+        for _ in 0..MAX_MOA_REFERENCE_CONCURRENCY {
+            active.push(started_rx.recv().await.unwrap());
+        }
+        assert!(started_rx.try_recv().is_err());
+
+        let completed_out_of_order = *active.iter().find(|&&index| index != 0).unwrap();
+        gates[completed_out_of_order].notify_one();
+        let queued = tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued, count - 1);
+
+        for gate in &gates {
+            gate.notify_one();
+        }
+        let results = task.await.unwrap();
+        assert_eq!(results, (0..count).collect::<Vec<_>>());
     }
 
     #[test]

@@ -56,6 +56,8 @@ function defaultAggregationConfig(): AggregationConfig {
     enabled: false,
     referenceGroupIds: [],
     aggregatorGroupId: null,
+    fanout: 'per_iteration',
+    referenceMaxTokens: 600,
     referenceTemperature: null,
     aggregatorTemperature: null,
     referenceReasoningEfforts: {},
@@ -907,6 +909,8 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
           ...aggregationConfig,
           referenceGroupIds,
           aggregatorGroupId: aggregationConfig.aggregatorGroupId || null,
+          fanout: aggregationConfig.fanout ?? 'per_iteration',
+          referenceMaxTokens: aggregationConfig.referenceMaxTokens ?? null,
           referenceTemperature: aggregationConfig.referenceTemperature ?? null,
           aggregatorTemperature: aggregationConfig.aggregatorTemperature ?? null,
           referenceReasoningEfforts: Object.keys(referenceReasoningEfforts).length > 0 ? referenceReasoningEfforts : undefined,
@@ -1088,7 +1092,22 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                   )}
                 </div>
 
-                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-zinc-400">Reference Max Tokens</label>
+                    <input
+                      type="number"
+                      value={aggregationConfig.referenceMaxTokens ?? ''}
+                      onChange={(e) => setAggregationConfig((config) => ({
+                        ...config,
+                        referenceMaxTokens: e.target.value === '' ? null : Number(e.target.value),
+                      }))}
+                      placeholder="unlimited"
+                      className="w-full rounded-md border border-zinc-700 bg-zinc-800 px-3 py-2 text-sm text-zinc-100 placeholder-zinc-600 focus:border-purple-500 focus:outline-none focus:ring-1 focus:ring-purple-500"
+                      min="1"
+                      step="1"
+                    />
+                  </div>
                   <div>
                     <label className="mb-1 block text-xs font-medium text-zinc-400">Reference Temperature</label>
                     <input
@@ -1130,6 +1149,14 @@ const handleDragStart = useCallback((e: React.DragEvent, idx: number) => {
                   </div>
                 </div>
 
+                <ToggleRow
+                  label="Refresh references after each tool step"
+                  checked={aggregationConfig.fanout === 'per_iteration'}
+                  onChange={(value) => setAggregationConfig((config) => ({
+                    ...config,
+                    fanout: value ? 'per_iteration' : 'user_turn',
+                  }))}
+                />
                 <ToggleRow
                   label="Require all references to succeed"
                   checked={aggregationConfig.requireAllReferences}
